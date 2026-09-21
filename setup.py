@@ -34,6 +34,7 @@ setup(
         "pystray>=0.19.0",
         "pyperclip>=1.8.2",
         "bottle>=0.13.0",
+        "websocket-client>=1.8.0",
     ],
     extras_require={
         "hotkey": ["keyboard>=0.13.5"],

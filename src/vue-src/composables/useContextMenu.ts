@@ -19,6 +19,7 @@ export interface MenuTrigger {
   isRecent?: boolean
   isFavorite?: boolean
   isUncategorized?: boolean
+  isCategory?: boolean
 }
 
 const visible = ref(false)

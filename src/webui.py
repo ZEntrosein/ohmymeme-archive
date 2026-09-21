@@ -9,6 +9,7 @@ import socket
 import tempfile
 import threading
 import time
+from contextlib import nullcontext
 from pathlib import Path
 
 # WSL 环境强制软件渲染（必须在导入 webview/GUI 之前设置）
@@ -57,8 +58,18 @@ try:
 except ImportError:
     HAS_BOTTLE = False
 
-from . import adb_util, backup, qqnt_extract, tg_stickers, updater
+from . import (
+    adb_util,
+    backup,
+    notion_import,
+    onebot,
+    qqnt_extract,
+    tg_stickers,
+    updater,
+)
 from . import sync as sync_module
+from .bulk_read import clamp_batch_size, clamp_pause_seconds, guarded_read
+from .category_storage import category_dir, remove_empty_parents, validate_category_name
 from .clipboard_util import (
     _is_animated,
     convert_image_mode_1,
@@ -66,9 +77,17 @@ from .clipboard_util import (
     convert_image_mode_3,
     copy_image_to_clipboard,
 )
-from .config import _IMPORT_MAX_BYTES, _IMPORT_MAX_PX, get_config
-from .database import get_db
+from .config import (
+    _IMPORT_MAX_BYTES,
+    _IMPORT_MAX_PX,
+    CHAT_RECORD_MEDIA_DIRNAME,
+    get_config,
+    resolve_path,
+)
+from .database import _UNSET, get_db
 from .manifest import build as build_manifest
+from .manifest import update_meme_name as update_manifest_meme_name
+from .media_derivative import DAILY_COPY_VERSION, create_daily_copy
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +95,20 @@ logger = logging.getLogger(__name__)
 _LOG_BUFFER = []
 _LOG_LOCK = threading.Lock()
 _LOG_MAX = 5000
+
+
+def _normalize_bulk_read_settings(settings: dict) -> dict:
+    """复制并规范虚拟盘限流设置，避免保存非法/过大的等待参数。"""
+    normalized = dict(settings)
+    if "bulk_read_batch_size" in normalized:
+        normalized["bulk_read_batch_size"] = clamp_batch_size(
+            normalized["bulk_read_batch_size"]
+        )
+    if "bulk_read_pause_seconds" in normalized:
+        normalized["bulk_read_pause_seconds"] = clamp_pause_seconds(
+            normalized["bulk_read_pause_seconds"]
+        )
+    return normalized
 
 # 分页：主窗口单页展示的表情包数量（与前端 index.js MEME_PAGE 保持一致）
 MEME_PAGE = 200
@@ -178,6 +211,21 @@ def _safe_serve_filename(name: str) -> bool:
     )
 
 
+def _valid_editable_filename(name: str) -> bool:
+    """校验用户输入的单个文件名，兼容 Windows 并拒绝路径与保留名。"""
+    if not _safe_serve_filename(name) or len(name) > 255:
+        return False
+    if name.endswith((" ", ".")) or any(ord(char) < 32 for char in name):
+        return False
+    if any(char in '<>:"|?*' for char in name):
+        return False
+    stem = Path(name).stem.rstrip(" .").upper()
+    reserved = {"CON", "PRN", "AUX", "NUL"}
+    reserved.update(f"COM{i}" for i in range(1, 10))
+    reserved.update(f"LPT{i}" for i in range(1, 10))
+    return bool(stem) and stem not in reserved
+
+
 def _host_allowed(host: str, port: int) -> bool:
     """仅接受本地回环 Host，阻断 DNS rebinding / 跨站直连"""
     host = (host or "").strip()
@@ -208,15 +256,15 @@ def _check_connectivity() -> dict:
     return {"ok": False, "latency": ""}
 
 
-def _storage_dir_validation(new_dir, old_dir, protected=()):
+def _storage_dir_validation(new_dir, old_dir, protected=(), allow_unresolved=False):
     # 校验自定义存储目录，返回 (ok, error)
     if not new_dir or not isinstance(new_dir, str):
         return False, "目录不能为空"
     if not os.path.isabs(new_dir):
         return False, "请选择绝对路径"
     try:
-        new = Path(new_dir).resolve()
-        old = Path(old_dir).resolve()
+        new = resolve_path(new_dir, allow_unresolved)
+        old = resolve_path(old_dir, allow_unresolved)
     except OSError:
         return False, "路径无效"
     if new == old:
@@ -227,12 +275,41 @@ def _storage_dir_validation(new_dir, old_dir, protected=()):
         return False, "不能选择当前目录的上级目录"
     for p in protected:
         try:
-            p = Path(p).resolve()
+            p = resolve_path(p, allow_unresolved)
         except OSError:
             continue
         if new == p or new in p.parents or p in new.parents:
             return False, "不能选择应用数据/缩略图目录或其上下级目录"
     return True, ""
+
+
+def _probe_storage_dir(path):
+    """验证目录具备缓存所需的写入、原子替换、读取和删除能力。"""
+    source = None
+    committed = None
+    try:
+        fd, source = tempfile.mkstemp(prefix=".ohmymeme-probe-", dir=str(path))
+        with os.fdopen(fd, "wb") as file:
+            file.write(b"ohmymeme-storage-probe")
+            file.flush()
+        committed = source + ".committed"
+        os.replace(source, committed)
+        source = None
+        with open(committed, "rb") as file:
+            if file.read() != b"ohmymeme-storage-probe":
+                return False, "目标目录读写校验失败"
+        os.unlink(committed)
+        committed = None
+        return True, ""
+    except OSError as exc:
+        return False, f"目标目录不支持必要的文件操作: {exc}"
+    finally:
+        for item in (source, committed):
+            if item:
+                try:
+                    os.unlink(item)
+                except OSError:
+                    pass
 
 
 def _find_hotkey_window_position(cursor, work_area, width, height):
@@ -249,6 +326,61 @@ def _find_hotkey_window_position(cursor, work_area, width, height):
         if left <= x and top <= y and x + width <= right and y + height <= bottom:
             return x, y
     return None
+
+
+def _enable_windows_taskbar_minimize(window) -> bool:
+    """为无边框 Win32 窗口补回任务栏最小化所需的原生样式。"""
+    if platform.system() != "Windows" or window is None:
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        native = getattr(window, "native", None)
+        handle = getattr(native, "Handle", None)
+        if handle is None:
+            return False
+        try:
+            hwnd = handle.ToInt64()
+        except AttributeError:
+            hwnd = int(handle)
+
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        get_style = user32.GetWindowLongPtrW
+        set_style = user32.SetWindowLongPtrW
+        get_style.argtypes = (wintypes.HWND, ctypes.c_int)
+        get_style.restype = ctypes.c_ssize_t
+        set_style.argtypes = (wintypes.HWND, ctypes.c_int, ctypes.c_ssize_t)
+        set_style.restype = ctypes.c_ssize_t
+        user32.SetWindowPos.argtypes = (
+            wintypes.HWND,
+            wintypes.HWND,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            wintypes.UINT,
+        )
+        user32.SetWindowPos.restype = wintypes.BOOL
+
+        gwl_style = -16
+        ws_sysmenu = 0x00080000
+        ws_minimizebox = 0x00020000
+        style = get_style(hwnd, gwl_style)
+        updated = style | ws_sysmenu | ws_minimizebox
+        if updated != style:
+            ctypes.set_last_error(0)
+            previous = set_style(hwnd, gwl_style, updated)
+            if previous == 0 and ctypes.get_last_error():
+                raise ctypes.WinError(ctypes.get_last_error())
+            # 应用新的非客户区样式，但不改变位置、大小、层级或激活状态。
+            flags = 0x0001 | 0x0002 | 0x0004 | 0x0010 | 0x0020
+            if not user32.SetWindowPos(hwnd, None, 0, 0, 0, 0, flags):
+                raise ctypes.WinError(ctypes.get_last_error())
+        return True
+    except Exception:
+        logger.exception("enable Windows taskbar minimize failed")
+        return False
 
 
 def _window_drag_update(win_x, win_y, origin, last_move, dx, dy):
@@ -272,6 +404,9 @@ class JsApi:
         self._db = get_db()
         self._drag_origin = None
         self._drag_last_move = 0.0
+        self._page_cache_lock = threading.Lock()
+        self._page_cache_generation = 0
+        self._page_cache_thread = None
 
     def _dialog(self, kind, **kw):
         """主窗口上下文打开文件对话框（owner 为主窗口，无需焦点恢复）"""
@@ -284,29 +419,25 @@ class JsApi:
             return None
 
     def search_memes(
-        self, keyword="", tags=None, collection_id=None, offset=0, limit=200
+        self,
+        keyword="",
+        tags=None,
+        collection_id=None,
+        offset=0,
+        limit=200,
+        category_id=None,
+        genre=None,
     ):
         """搜索表情，支持 offset/limit 分页"""
-        if tags is not None and len(tags) == 0:
-            tags = None
-        fav_only = collection_id == -2
-        recent_only = collection_id == -3
-        uncategorized = collection_id == -4
-        cid = None if (fav_only or recent_only or uncategorized) else collection_id
-        if recent_only:
-            rows = self._db.get_recent(limit, offset)
-        else:
-            if cid is not None and cid > 0:
-                cid = self._get_collection_ids_recursive(cid)
-            rows = self._db.search(
-                keyword=keyword,
-                tags=tags,
-                collection_id=cid,
-                favorite_only=fav_only,
-                uncategorized_only=uncategorized,
-                offset=offset,
-                limit=limit,
-            )
+        rows = self._search_meme_rows(
+            keyword,
+            tags,
+            collection_id,
+            offset,
+            limit,
+            category_id,
+            genre,
+        )
         favorited_ids = set()
         try:
             conn = self._db._get_conn()
@@ -319,12 +450,13 @@ class JsApi:
         result = []
         for r in rows:
             fname = r["filename"].lower()
-            is_gif = r.get("mime_type", "").endswith("gif") or fname.endswith(".gif")
+            mime_type = str(r.get("mime_type") or "").lower()
+            is_gif = mime_type.endswith("gif") or fname.endswith(".gif")
             # 动画检测：GIF 或 WebP 动图
             if is_gif:
                 is_animated = True
             elif fname.endswith(".webp"):
-                path = self._find_meme_file(r["filename"])
+                path = self._webui._find_meme_file_for_row(r)
                 is_animated = _is_animated(path) if path else False
             else:
                 is_animated = False
@@ -346,32 +478,366 @@ class JsApi:
                     "favorited": r["id"] in favorited_ids,
                     "auto_play_gif": auto_gif,
                     "hover_to_play": hover_play,
+                    "genre": "gif" if is_gif else "image",
                 }
             )
         return result
 
-    def count_memes(self, keyword="", tags=None, collection_id=None) -> int:
-        """统计符合搜索条件（关键字/标签/分组/收藏/最近使用）的表情总数，供分页"""
+    def _search_meme_rows(
+        self,
+        keyword="",
+        tags=None,
+        collection_id=None,
+        offset=0,
+        limit=200,
+        category_id=None,
+        genre=None,
+    ):
+        """返回分页数据库行，不探测图片内容，供网格与后台缓存预热共用。"""
+        if genre == "chat_record":
+            return []
         if tags is not None and len(tags) == 0:
             tags = None
         fav_only = collection_id == -2
         recent_only = collection_id == -3
         uncategorized = collection_id == -4
-        if recent_only:
-            return self._db.count_recent()
+        category_uncategorized = category_id == -4
         cid = None if (fav_only or recent_only or uncategorized) else collection_id
+        catid = None if category_uncategorized else category_id
+        include_description = self._cfg.get("search_description", True) is not False
+        include_ocr_text = self._cfg.get("search_image_text", True) is not False
+        if recent_only:
+            rows = self._db.get_recent(limit, offset, genre=genre)
+        else:
+            if cid is not None and cid > 0:
+                cid = self._get_collection_ids_recursive(cid)
+            if catid is not None and catid > 0:
+                catid = self._get_category_ids_recursive(catid)
+            rows = self._db.search(
+                keyword=keyword,
+                tags=tags,
+                collection_id=cid,
+                favorite_only=fav_only,
+                uncategorized_only=uncategorized,
+                include_description=include_description,
+                include_ocr_text=include_ocr_text,
+                offset=offset,
+                limit=limit,
+                category_id=catid,
+                uncategorized_category=category_uncategorized,
+                genre=genre,
+            )
+        return rows
+
+    def count_memes(
+        self,
+        keyword="",
+        tags=None,
+        collection_id=None,
+        category_id=None,
+        genre=None,
+    ) -> int:
+        """统计符合搜索条件（关键字/标签/分组/收藏/最近使用）的表情总数，供分页"""
+        if genre == "chat_record":
+            return 0
+        if tags is not None and len(tags) == 0:
+            tags = None
+        fav_only = collection_id == -2
+        recent_only = collection_id == -3
+        uncategorized = collection_id == -4
+        category_uncategorized = category_id == -4
+        if recent_only:
+            return self._db.count_recent(genre=genre)
+        cid = None if (fav_only or recent_only or uncategorized) else collection_id
+        catid = None if category_uncategorized else category_id
+        include_description = self._cfg.get("search_description", True) is not False
+        include_ocr_text = self._cfg.get("search_image_text", True) is not False
         if cid is not None and cid > 0:
             cid = self._get_collection_ids_recursive(cid)
+        if catid is not None and catid > 0:
+            catid = self._get_category_ids_recursive(catid)
         return self._db.count(
             keyword=keyword,
             tags=tags,
             collection_id=cid,
             favorite_only=fav_only,
             uncategorized_only=uncategorized,
+            include_description=include_description,
+            include_ocr_text=include_ocr_text,
+            category_id=catid,
+            uncategorized_category=category_uncategorized,
+            genre=genre,
         )
+
+    def search_library(
+        self,
+        keyword="",
+        tags=None,
+        collection_id=None,
+        offset=0,
+        limit=200,
+        category_id=None,
+        genre="all",
+    ) -> dict:
+        """统一分页搜索图片、GIF 和聊天记录。"""
+        genre = str(genre or "all")
+        if genre not in ("all", "image", "gif", "chat_record"):
+            genre = "all"
+        offset = max(0, int(offset or 0))
+        limit = max(1, min(int(limit or MEME_PAGE), 1000))
+        tags = tags or []
+        chat_allowed = (
+            genre in ("all", "chat_record")
+            and not tags
+            and collection_id is None
+            and category_id is None
+        )
+        chat_count = self._db.count_chat_records(keyword) if chat_allowed else 0
+        chat_records = []
+        if chat_allowed and offset < chat_count:
+            chat_records = self._db.list_chat_records(
+                keyword, min(limit, chat_count - offset), offset
+            )
+            for item in chat_records:
+                item["genre"] = "chat_record"
+
+        remaining = limit - len(chat_records)
+        meme_count = 0
+        memes = []
+        if genre != "chat_record":
+            meme_genre = genre if genre in ("image", "gif") else None
+            meme_count = self.count_memes(
+                keyword, tags, collection_id, category_id, meme_genre
+            )
+            if remaining > 0:
+                meme_offset = max(0, offset - chat_count)
+                memes = self.search_memes(
+                    keyword,
+                    tags,
+                    collection_id,
+                    meme_offset,
+                    remaining,
+                    category_id,
+                    meme_genre,
+                )
+        return {
+            "memes": memes,
+            "chat_records": chat_records,
+            "chat_total": chat_count,
+            "total": chat_count + meme_count,
+            "offset": offset,
+            "limit": limit,
+        }
+
+    def count_library(
+        self,
+        keyword="",
+        tags=None,
+        collection_id=None,
+        category_id=None,
+        genre="all",
+    ) -> int:
+        """统计统一内容库结果，供桥接调用和测试。"""
+        result = self.search_library(
+            keyword, tags, collection_id, 0, 1, category_id, genre
+        )
+        return int(result["total"])
+
+    def _ensure_page_cache_state(self):
+        """兼容测试/迁移中通过 ``__new__`` 构造的轻量 JsApi。"""
+        if not hasattr(self, "_page_cache_lock"):
+            self._page_cache_lock = threading.Lock()
+            self._page_cache_generation = 0
+            self._page_cache_thread = None
+
+    def _page_cache_is_current(self, generation: int) -> bool:
+        self._ensure_page_cache_state()
+        with self._page_cache_lock:
+            return generation == self._page_cache_generation
+
+    def cancel_page_cache_warmup(self) -> dict:
+        """使正在运行的后续页预热任务在下一个检查点退出。"""
+        self._ensure_page_cache_state()
+        with self._page_cache_lock:
+            self._page_cache_generation += 1
+        return {"ok": True}
+
+    def start_page_cache_warmup(
+        self,
+        keyword="",
+        tags=None,
+        collection_id=None,
+        current_offset=0,
+        page_size=200,
+        total=0,
+        category_id=None,
+        genre="all",
+    ) -> dict:
+        """后台补建当前查询后续页的日常副本和缩略图。"""
+        self._ensure_page_cache_state()
+        with self._page_cache_lock:
+            self._page_cache_generation += 1
+            generation = self._page_cache_generation
+
+        enabled = self._cfg.get("bulk_read_protection", False) is True
+        prefetch = self._cfg.get("bulk_read_prefetch_pages", False) is True
+        if not enabled or not prefetch:
+            return {"ok": True, "started": False}
+        genre = str(genre or "all")
+        if genre == "chat_record":
+            return {"ok": True, "started": False}
+        page_size = max(1, min(int(page_size or MEME_PAGE), 1000))
+        next_offset = max(0, int(current_offset or 0)) + page_size
+        total = max(0, int(total or 0))
+        if next_offset >= total:
+            return {"ok": True, "started": False}
+
+        args = (
+            generation,
+            str(keyword or ""),
+            list(tags or []),
+            collection_id,
+            next_offset,
+            page_size,
+            total,
+            category_id,
+            genre,
+        )
+        worker = threading.Thread(
+            target=self._run_page_cache_warmup,
+            args=args,
+            name="OhMyMemePageCacheWarmup",
+            daemon=True,
+        )
+        with self._page_cache_lock:
+            self._page_cache_thread = worker
+        worker.start()
+        return {"ok": True, "started": True}
+
+    def _run_page_cache_warmup(
+        self,
+        generation,
+        keyword,
+        tags,
+        collection_id,
+        next_offset,
+        page_size,
+        total,
+        category_id,
+        genre,
+    ):
+        """串行预热；新搜索会递增 generation，让旧任务尽快退出。"""
+        try:
+            # 先给当前页的可见请求留出时间；每 100ms 检查一次取消状态。
+            for _ in range(10):
+                if not self._page_cache_is_current(generation):
+                    return
+                time.sleep(0.1)
+            chat_allowed = (
+                genre == "all"
+                and not tags
+                and collection_id is None
+                and category_id is None
+            )
+            chat_count = self._db.count_chat_records(keyword) if chat_allowed else 0
+            meme_genre = genre if genre in ("image", "gif") else None
+            meme_offset = max(0, int(next_offset) - chat_count)
+            meme_total = self.count_memes(
+                keyword, tags, collection_id, category_id, meme_genre
+            )
+            while meme_offset < meme_total:
+                if not self._page_cache_is_current(generation):
+                    return
+                rows = self._search_meme_rows(
+                    keyword,
+                    tags,
+                    collection_id,
+                    meme_offset,
+                    page_size,
+                    category_id,
+                    meme_genre,
+                )
+                if not rows:
+                    break
+                for row in rows:
+                    if not self._page_cache_is_current(generation):
+                        return
+                    try:
+                        self._webui._get_thumbnail_path(
+                            int(row["id"]), row["filename"]
+                        )
+                    except Exception as cache_error:
+                        logger.warning(
+                            "page cache warmup failed %s: %s",
+                            row.get("filename", ""),
+                            cache_error,
+                        )
+                    # 主动让出执行机会，避免后台任务连续抢在当前页请求前面。
+                    time.sleep(0.02)
+                meme_offset += len(rows)
+            logger.info(
+                "page cache warmup finished: offset=%s total=%s",
+                next_offset,
+                total,
+            )
+        except Exception:
+            logger.exception("page cache warmup failed")
+
+    def get_chat_record_details(self, record_id: int) -> dict:
+        """返回聊天记录来源、统计与可读消息列表。"""
+        entry = self._db.get_chat_record_entry(int(record_id))
+        if not entry:
+            return {"ok": False, "error": "聊天记录不存在"}
+        package = entry.pop("package")
+        summary = package.get("summary")
+        summary = summary if isinstance(summary, dict) else {}
+        source = package.get("source")
+        source = source if isinstance(source, dict) else {}
+        return {
+            "ok": True,
+            **entry,
+            "genre": "chat_record",
+            "genre_label": "聊天记录",
+            "peer_label": {
+                "group": "群聊",
+                "private": "私聊",
+            }.get(entry.get("message_type"), "未知会话"),
+            "captured_at": package.get("captured_at") or "",
+            "media_count": int(summary.get("media_count") or 0),
+            "max_depth": int(summary.get("max_depth") or 0),
+            "sender_name": str(
+                (source.get("sender") or {}).get("nickname")
+                if isinstance(source.get("sender"), dict)
+                else ""
+            ),
+            "messages": onebot.chat_record_view(package),
+            "send_command": (
+                f"{self._cfg.get('napcat_command', '/omm')} send {int(record_id)}"
+            ),
+        }
+
+    def delete_chat_record(self, record_id: int) -> dict:
+        """删除一份聊天记录及其独占媒体目录。"""
+        try:
+            deleted = onebot.delete_chat_record_archive(
+                int(record_id), db=self._db, cfg=self._cfg
+            )
+            return {
+                "ok": deleted,
+                "error": "" if deleted else "聊天记录不存在",
+            }
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "聊天记录 ID 无效"}
+        except Exception as exc:
+            logger.exception("delete chat record failed")
+            return {"ok": False, "error": str(exc)}
 
     def get_tags(self) -> list:
         return self._db.get_all_tags()
+
+    def get_tag_records(self) -> list:
+        """返回含分类信息的标签列表；get_tags 保留给旧版前端。"""
+        return self._db.get_all_tag_records()
 
     def get_meme_tags(self, meme_id):
         """返回某表情的标签列表"""
@@ -380,6 +846,281 @@ class JsApi:
         except Exception as e:
             logger.error(f"get_meme_tags error: {e}")
             return []
+
+    def get_meme_tag_records(self, meme_id):
+        try:
+            return self._db.get_meme_tag_records(meme_id) or []
+        except Exception as e:
+            logger.error(f"get_meme_tag_records error: {e}")
+            return []
+
+    def rename_tag(self, old_name, new_name, category="", new_category=None):
+        """全局修改标签名称/种类，目标存在时合并标签。"""
+        try:
+            if not isinstance(old_name, str) or not isinstance(new_name, str):
+                return {"ok": False, "error": "标签名称无效"}
+            result = self._db.rename_tag(
+                old_name, new_name, category=category, new_category=new_category
+            )
+            if result is None:
+                return {"ok": False, "error": "标签不存在或名称为空"}
+            return {
+                "ok": True,
+                "name": result["name"],
+                "category": result["category"],
+                "merged": result["merged"],
+                "all_tags": self._db.get_all_tags(),
+                "all_tag_records": self._db.get_all_tag_records(),
+            }
+        except Exception as e:
+            logger.error(f"rename_tag error: {e}")
+            return {"ok": False, "error": "标签编辑失败"}
+
+    def get_meme_details(self, meme_id):
+        """按需返回单张表情的可编辑详情和全图库浏览位置"""
+        try:
+            row = self._db.get_by_id(int(meme_id))
+            if not row:
+                return None
+            navigation = self._db.get_meme_navigation(row["id"]) or {}
+            name = row.get("original_name", "") or os.path.splitext(row["filename"])[0]
+            return {
+                "id": row["id"],
+                "filename": row["filename"],
+                "name": name,
+                "width": row.get("width", 0),
+                "height": row.get("height", 0),
+                "file_size": row.get("file_size", 0),
+                "mime_type": row.get("mime_type", ""),
+                "created_at": row.get("created_at", ""),
+                "updated_at": row.get("updated_at", ""),
+                # 中性旧字段保留兼容：优先人工内容，无人工内容时回退 AI。
+                "description": (
+                    row.get("manual_description", "")
+                    or row.get("ai_description", "")
+                    or ""
+                ),
+                "ocr_text": (
+                    row.get("manual_ocr_text", "") or row.get("ai_ocr_text", "") or ""
+                ),
+                "manual_description": row.get("manual_description", "") or "",
+                "manual_ocr_text": row.get("manual_ocr_text", "") or "",
+                "ai_description": row.get("ai_description", "") or "",
+                "ai_ocr_text": row.get("ai_ocr_text", "") or "",
+                "tags": self._db.get_meme_tags(row["id"]),
+                "tag_records": self._db.get_meme_tag_records(row["id"]),
+                "all_tags": self._db.get_all_tags(),
+                "all_tag_records": self._db.get_all_tag_records(),
+                "collections": self._db.get_meme_collections(row["id"]),
+                "all_collections": self._db.get_all_collection_paths(),
+                "category": self._db.get_meme_category(row["id"]),
+                "all_categories": self._build_category_options(),
+                "previous_id": navigation.get("previous_id"),
+                "next_id": navigation.get("next_id"),
+                "position": navigation.get("position", 1),
+                "total": navigation.get("total", 1),
+            }
+        except Exception as e:
+            logger.error(f"get_meme_details error: {e}")
+            return None
+
+    def update_meme_details(self, meme_id, data):
+        """保存标题、文件名、标签、类别及人工/AI 图片文字；路径同步到磁盘。"""
+        old_path = None
+        new_path = None
+        file_moved = False
+        try:
+            if not isinstance(data, dict):
+                return {"ok": False, "error": "详情数据无效"}
+            meme_id = int(meme_id)
+            row = self._db.get_by_id(meme_id)
+            if not row:
+                return {"ok": False, "error": "表情包不存在"}
+            raw_tags = data.get("tags", [])
+            if not isinstance(raw_tags, list):
+                return {"ok": False, "error": "标签数据无效"}
+            tags = [
+                tag
+                for tag in raw_tags
+                if (isinstance(tag, dict) and str(tag.get("name") or "").strip())
+                or (isinstance(tag, str) and tag.strip())
+            ]
+            raw_collection_ids = data.get("collection_ids")
+            if raw_collection_ids is not None and not isinstance(
+                raw_collection_ids, list
+            ):
+                return {"ok": False, "error": "分组数据无效"}
+            collection_ids = None
+            if raw_collection_ids is not None:
+                collection_ids = list(
+                    dict.fromkeys(int(value) for value in raw_collection_ids)
+                )
+                if any(value <= 0 for value in collection_ids):
+                    return {"ok": False, "error": "分组数据无效"}
+            category_supplied = "category_id" in data
+            target_category_id = row.get("category_id")
+            if category_supplied:
+                raw_category_id = data.get("category_id")
+                if raw_category_id in (None, "", 0, "0"):
+                    target_category_id = None
+                else:
+                    try:
+                        target_category_id = int(raw_category_id)
+                    except (TypeError, ValueError):
+                        return {"ok": False, "error": "类别数据无效"}
+                    if target_category_id <= 0 or not self._db.category_exists(
+                        target_category_id
+                    ):
+                        return {"ok": False, "error": "类别不存在"}
+            old_collection_ids = {
+                item["id"] for item in self._db.get_meme_collections(meme_id)
+            }
+            has_split_text = any(
+                key in data
+                for key in (
+                    "manual_description",
+                    "manual_ocr_text",
+                    "ai_description",
+                    "ai_ocr_text",
+                )
+            )
+            if has_split_text:
+                manual_description = str(
+                    data.get("manual_description", row.get("manual_description", ""))
+                    or ""
+                )
+                manual_ocr_text = str(
+                    data.get("manual_ocr_text", row.get("manual_ocr_text", "")) or ""
+                )
+                ai_description = str(
+                    data.get("ai_description", row.get("ai_description", "")) or ""
+                )
+                ai_ocr_text = str(
+                    data.get("ai_ocr_text", row.get("ai_ocr_text", "")) or ""
+                )
+            else:
+                # 旧版调用方的 description/ocr_text 原本直接编辑 AI 字段。
+                manual_description = str(row.get("manual_description", "") or "")
+                manual_ocr_text = str(row.get("manual_ocr_text", "") or "")
+                ai_description = str(
+                    data.get("description", row.get("ai_description", "")) or ""
+                )
+                ai_ocr_text = str(
+                    data.get("ocr_text", row.get("ai_ocr_text", "")) or ""
+                )
+            current_title = (
+                row.get("original_name", "") or os.path.splitext(row["filename"])[0]
+            )
+            title_supplied = "title" in data
+            filename_supplied = "filename" in data
+            title = str(data.get("title", current_title) or "").strip()
+            filename = str(data.get("filename", row["filename"]) or "").strip()
+            if not title:
+                return {"ok": False, "error": "标题不能为空"}
+            if not _valid_editable_filename(filename):
+                return {"ok": False, "error": "文件名包含无效字符或保留名称"}
+            if Path(filename).suffix.lower() != Path(row["filename"]).suffix.lower():
+                return {"ok": False, "error": "不能修改文件扩展名"}
+
+            existing = self._db.get_by_filename(filename)
+            if existing and existing["id"] != meme_id:
+                return {"ok": False, "error": "该文件名已被其他表情包使用"}
+
+            if filename != row["filename"] or target_category_id != row.get(
+                "category_id"
+            ):
+                try:
+                    webui = getattr(self, "_webui", None)
+                    mover = getattr(webui, "_move_meme_file", None)
+                    if callable(mover):
+                        old_path, new_path = mover(row, filename, target_category_id)
+                    elif webui is None and not hasattr(self, "_cfg"):
+                        # 允许脱离窗口的轻量 DB 调用方（例如迁移/测试适配器）
+                        # 只更新元数据；真实 WebUI 始终走上面的物理移动分支。
+                        old_path = new_path = None
+                    else:
+                        source = self._find_meme_file(row["filename"])
+                        if not source:
+                            raise FileNotFoundError("找不到原始图片文件")
+                        old_path = Path(source)
+                        new_path = old_path.with_name(filename)
+                        same_path = old_path == new_path
+                        if new_path.exists() and not same_path:
+                            try:
+                                same_path = os.path.samefile(old_path, new_path)
+                            except OSError:
+                                pass
+                        if new_path.exists() and not same_path:
+                            raise ValueError("目标位置已存在同名文件")
+                        os.replace(str(old_path), str(new_path))
+                    file_moved = (
+                        old_path is not None
+                        and new_path is not None
+                        and old_path != new_path
+                    )
+                except (FileNotFoundError, ValueError) as move_error:
+                    return {"ok": False, "error": str(move_error)}
+
+            ok = self._db.update_meme_details(
+                meme_id,
+                tags,
+                ai_description,
+                ai_ocr_text,
+                title=title if title_supplied else None,
+                filename=filename if filename_supplied else None,
+                collection_ids=collection_ids,
+                manual_description=manual_description,
+                manual_ocr_text=manual_ocr_text,
+                category_id=target_category_id if category_supplied else _UNSET,
+            )
+            if not ok:
+                raise ValueError("表情包不存在")
+            collections_changed = (
+                collection_ids is not None and set(collection_ids) != old_collection_ids
+            )
+            category_changed = category_supplied and target_category_id != row.get(
+                "category_id"
+            )
+            manifest_structure_changed = (
+                filename != row["filename"]
+                or collections_changed
+                or category_changed
+            )
+            if manifest_structure_changed:
+                build_manifest()
+            elif title != current_title and not update_manifest_meme_name(
+                row["filename"], title
+            ):
+                # 首次运行、旧清单损坏或目标缺失时以完整重建恢复一致性。
+                build_manifest()
+            if file_moved:
+                file_cache = getattr(self._webui, "_file_cache", None)
+                if isinstance(file_cache, dict):
+                    file_cache.pop(row["filename"], None)
+                    file_cache.pop(filename, None)
+                    file_cache[filename] = str(new_path)
+            return {
+                "ok": True,
+                "title": title,
+                "filename": filename,
+                "all_tags": self._db.get_all_tags(),
+                "all_tag_records": self._db.get_all_tag_records(),
+                "collections": self._db.get_meme_collections(meme_id),
+                "all_collections": self._db.get_all_collection_paths(),
+                "category": self._db.get_meme_category(meme_id),
+                "all_categories": self._build_category_options(),
+            }
+        except Exception as e:
+            if file_moved and old_path is not None and new_path is not None:
+                try:
+                    if new_path.exists() and not old_path.exists():
+                        old_path.parent.mkdir(parents=True, exist_ok=True)
+                        os.replace(new_path, old_path)
+                except OSError:
+                    logger.exception("failed to roll back meme filename")
+            logger.error(f"update_meme_details error: {e}")
+            error = str(e) if isinstance(e, ValueError) else "保存失败"
+            return {"ok": False, "error": error}
 
     def set_meme_tags(self, meme_id, tags):
         """覆盖式设置某表情的标签"""
@@ -419,7 +1160,7 @@ class JsApi:
             if is_gif:
                 is_animated = True
             elif fname.endswith(".webp"):
-                path = self._find_meme_file(r["filename"])
+                path = self._webui._find_meme_file_for_row(r)
                 is_animated = _is_animated(path) if path else False
             else:
                 is_animated = False
@@ -451,25 +1192,28 @@ class JsApi:
             sys_cols.append(
                 {
                     "id": -4,
-                    "name": "未分类",
+                    "name": "未分组",
                     "count": self._db.count(uncategorized_only=True),
                 }
             )
         collections = sys_cols + self._build_collection_tree()
+        categories = self._build_category_options()
         return {
             "memes": memes,
             "tags": self._db.get_all_tags(),
+            "tag_records": self._db.get_all_tag_records(),
             "collections": collections,
+            "categories": categories,
             "show_startup_animation": self._cfg.get("show_startup_animation", True),
             "startup_bg_color": _STARTUP_BG_COLOR,
         }
 
     def get_meme_path(self, meme_id: int) -> str:
-        """返回表情本地文件路径（供拖拽到外部应用），不存在返回空串"""
+        """返回日常副本路径（供拖拽到外部应用），不存在返回空串。"""
         row = self._db.get_by_id(meme_id)
         if not row:
             return ""
-        return self._find_meme_file(row["filename"])
+        return self._daily_meme_path(row)
 
     def get_meme_paths(self, meme_ids: list) -> dict:
         """批量返回表情本地文件路径 {id: path}，供拖拽到外部应用"""
@@ -478,7 +1222,7 @@ class JsApi:
             try:
                 row = self._db.get_by_id(int(mid))
                 if row:
-                    p = self._find_meme_file(row["filename"])
+                    p = self._daily_meme_path(row)
                     if p:
                         out[int(mid)] = p
             except Exception:
@@ -490,7 +1234,7 @@ class JsApi:
         row = self._db.get_by_id(meme_id)
         if not row:
             return False
-        p = self._find_meme_file(row["filename"])
+        p = self._daily_meme_path(row)
         if not p:
             return False
         try:
@@ -503,12 +1247,81 @@ class JsApi:
         except Exception:
             return False
 
+    def start_chat_record_drag(self, record_id: int) -> dict:
+        """拖到 QQ 当前会话后直接通过 NapCat 发送，不投递命令文本。"""
+        try:
+            record_id = int(record_id)
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "聊天记录 ID 无效"}
+        if not self._db.get_chat_record_entry(record_id):
+            return {"ok": False, "error": "聊天记录不存在"}
+        try:
+            from .native_drag import start_chat_record_target_drag
+            from .qq_drag import resolve_qq_target
+
+            dropped = start_chat_record_target_drag(record_id)
+            if dropped.get("cancelled"):
+                return {"ok": False, "cancelled": True}
+            if not dropped.get("ok"):
+                return {
+                    "ok": False,
+                    "error": dropped.get("error") or "拖拽发送失败",
+                }
+            http_url = self._cfg.get(
+                "napcat_http_url", "http://127.0.0.1:3000"
+            )
+            token = self._cfg.get("napcat_token", "")
+            target = resolve_qq_target(
+                http_url,
+                token,
+                dropped.get("window_handle"),
+                dropped.get("process_name"),
+                dropped.get("x"),
+                dropped.get("y"),
+                self._cfg.get(
+                    "napcat_webui_url", "http://127.0.0.1:6099"
+                ),
+                self._cfg.get("napcat_webui_token", ""),
+            )
+            event = {"message_type": target["message_type"]}
+            if target["message_type"] == "group":
+                event["group_id"] = target["peer_id"]
+            else:
+                event["target_id"] = target["peer_id"]
+            result = onebot.send_chat_record(
+                http_url,
+                token,
+                record_id,
+                event,
+                db=self._db,
+                send_mode=self._cfg.get("napcat_send_mode", "original_native"),
+                webui_url=self._cfg.get(
+                    "napcat_webui_url", "http://127.0.0.1:6099"
+                ),
+                webui_token=self._cfg.get("napcat_webui_token", ""),
+            )
+            self._webui.schedule_hide()
+            return {
+                "ok": True,
+                "target_label": target.get("label") or "当前 QQ 会话",
+                "target_source": target.get("source") or "uia",
+                "source": result.get("source"),
+                "degraded_media_count": int(
+                    result.get("degraded_media_count") or 0
+                ),
+            }
+        except (onebot.OneBotError, ValueError) as exc:
+            return {"ok": False, "error": str(exc)}
+        except Exception:
+            logger.exception("chat record native drag failed")
+            return {"ok": False, "error": "拖拽发送失败，请检查 NapCat 与 QQ"}
+
     def copy_meme(self, meme_id):
         # 复制表情到剪贴板；copy_resize_mode: 0不处理 1webp缩放 2转gif 3转gif隐写原图
         row = self._db.get_by_id(meme_id)
         if not row:
             return {"ok": False, "status": "copy_failed"}
-        path = self._find_meme_file(row["filename"])
+        path = self._daily_meme_path(row)
         if not path:
             return {"ok": False, "status": "copy_failed"}
         resize_mode = int(self._cfg.get("copy_resize_mode", 1) or 0)
@@ -528,6 +1341,34 @@ class JsApi:
         self._webui.schedule_hide()
         return {"ok": True, "status": "copied"}
 
+    def _daily_meme_path(self, row) -> str:
+        finder = getattr(self._webui, "_find_daily_file", None)
+        if callable(finder):
+            try:
+                path = finder(row)
+                if path:
+                    return path
+            except Exception:
+                pass
+        return self._webui._find_meme_file_for_row(row)
+
+    def copy_meme_original(self, meme_id):
+        """复制未经日常压缩处理的原件。"""
+        row = self._db.get_by_id(meme_id)
+        if not row:
+            return {"ok": False, "status": "copy_failed"}
+        path = self._webui._find_meme_file_for_row(row)
+        if not path:
+            return {"ok": False, "status": "copy_failed"}
+        with guarded_read():
+            copied = copy_image_to_clipboard(path)
+        if not copied:
+            return {"ok": False, "status": "copy_failed"}
+        if self._cfg.get("record_recent_use", True):
+            self._db.record_use(meme_id)
+        self._webui.schedule_hide()
+        return {"ok": True, "status": "copied_original"}
+
     def toggle_favorite(self, meme_id: int) -> bool:
         return self._db.toggle_favorite(meme_id)
 
@@ -538,25 +1379,36 @@ class JsApi:
         if not new_name:
             return False
         try:
+            row = self._db.get_by_id(meme_id)
+            if not row:
+                return False
             self._db.update_meme(meme_id, original_name=new_name)
-            build_manifest()
+            if not update_manifest_meme_name(row["filename"], new_name):
+                build_manifest()
             return True
         except Exception as e:
             logging.getLogger(__name__).error(f"rename error: {e}")
             return False
 
     def _delete_meme_files(self, meme_id) -> bool:
-        """删除磁盘原图+缩略图+file_cache 条目；id 不存在返回 False"""
+        """删除磁盘原件、日常副本、缩略图和缓存条目。"""
         import os
 
         row = self._db.get_by_id(meme_id)
         if not row:
             return False
-        file_path = self._find_meme_file(row["filename"])
+        file_path = self._webui._find_meme_file_for_row(row)
         if file_path:
             try:
                 os.remove(file_path)
             except Exception:
+                pass
+        daily_name = row.get("daily_filename", "") or ""
+        if daily_name:
+            daily_path = self._cfg.derivative_dir / daily_name
+            try:
+                daily_path.unlink()
+            except OSError:
                 pass
         thumb_dir = self._cfg.thumbnail_dir
         for f in thumb_dir.glob(f"{meme_id}_*.png"):
@@ -611,6 +1463,145 @@ class JsApi:
             result.append(item)
         return result
 
+    # --- 单归属类别 ---
+
+    def _get_category_ids_recursive(self, category_id):
+        ids = [int(category_id)]
+        children = {}
+        for cid, _name, parent_id, _order in self._db.get_categories():
+            children.setdefault(parent_id, []).append(cid)
+        cursor = 0
+        while cursor < len(ids):
+            ids.extend(children.get(ids[cursor], []))
+            cursor += 1
+        return ids
+
+    def _build_category_tree(self, parent_id=None):
+        raw = self._db.get_categories()
+        result = []
+        for cid, name, pid, _order in raw:
+            if pid != parent_id:
+                continue
+            children = self._build_category_tree(cid)
+            all_ids = self._get_category_ids_recursive(cid)
+            item = {
+                "id": cid,
+                "name": name,
+                "path": self._db.get_category_path(cid),
+                "count": self._db.count(category_id=all_ids),
+            }
+            if children:
+                item["children"] = children
+            result.append(item)
+        return result
+
+    def _build_category_options(self):
+        result = []
+        cfg = getattr(self, "_cfg", None) or get_config()
+        if cfg.get("show_uncategorized", True):
+            result.append(
+                {
+                    "id": -4,
+                    "name": "未分类",
+                    "path": "未分类",
+                    "count": self._db.count(uncategorized_category=True),
+                }
+            )
+        return result + self._build_category_tree()
+
+    def get_categories(self) -> list:
+        return self._build_category_options()
+
+    def search_categories(self, keyword: str = "") -> list:
+        kw = (keyword or "").strip().lower()
+        out = []
+
+        def walk(items, depth=0):
+            for item in items:
+                if item.get("id", 0) > 0:
+                    if (
+                        not kw
+                        or kw in item["name"].lower()
+                        or kw in item.get("path", "").lower()
+                    ):
+                        out.append(
+                            {
+                                "id": item["id"],
+                                "name": item["name"],
+                                "path": item.get("path", item["name"]),
+                                "depth": depth,
+                            }
+                        )
+                walk(item.get("children", []) or [], depth + 1)
+
+        walk(self._build_category_tree())
+        return out[:50]
+
+    def create_category(self, name: str, parent_id=None) -> dict:
+        try:
+            parent = None if parent_id in (None, "", 0, "0") else int(parent_id)
+            cid = self._db.create_category(name, parent)
+            try:
+                category_dir(
+                    (getattr(self, "_cfg", None) or get_config()).cache_dir,
+                    self._db.get_category_path_names(cid),
+                ).mkdir(parents=True, exist_ok=True)
+            except OSError as directory_error:
+                logger.warning("category directory create failed: %s", directory_error)
+            try:
+                build_manifest()
+            except Exception as manifest_error:
+                logger.warning(
+                    "category manifest rebuild failed after create: %s",
+                    manifest_error,
+                )
+            return {"ok": True, "id": cid, "categories": self._build_category_options()}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    def create_subcategory(self, name: str, parent_id: int) -> dict:
+        return self.create_category(name, parent_id)
+
+    def rename_category(self, category_id: int, new_name: str) -> dict:
+        try:
+            category_id = int(category_id)
+            old_parts = self._db.get_category_path_names(category_id)
+            if not old_parts:
+                return {"ok": False, "error": "类别不存在"}
+            parent_id = self._db.get_category(category_id).get("parent_id")
+            new_name = validate_category_name(new_name)
+            parent_parts = self._db.get_category_path_names(parent_id)
+            moved_dirs = self._webui._rename_category_directory(
+                old_parts, parent_parts, new_name
+            )
+            try:
+                self._db.rename_category(category_id, new_name)
+            except Exception:
+                if moved_dirs:
+                    old_dir, new_dir = moved_dirs
+                    if new_dir.exists() and not old_dir.exists():
+                        os.replace(str(new_dir), str(old_dir))
+                raise
+            build_manifest()
+            return {"ok": True, "categories": self._build_category_options()}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    def delete_category(self, category_id: int) -> dict:
+        try:
+            category_id = int(category_id)
+            category = self._db.get_category(category_id)
+            if not category:
+                return {"ok": False, "error": "类别不存在"}
+            parts = self._db.get_category_path_names(category_id)
+            parent_parts = self._db.get_category_path_names(category.get("parent_id"))
+            self._webui._delete_category_directory(parts, parent_parts)
+            self._db.delete_category(category_id)
+            build_manifest()
+            return {"ok": True, "categories": self._build_category_options()}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
     def get_collections(self) -> list:
         top = self._build_collection_tree()
         recent = self._db.get_recent(9999)
@@ -622,7 +1613,7 @@ class JsApi:
             sys_cols.append(
                 {
                     "id": -4,
-                    "name": "未分类",
+                    "name": "未分组",
                     "count": self._db.count(uncategorized_only=True),
                 }
             )
@@ -799,14 +1790,43 @@ class JsApi:
         except Exception:
             return False
 
+    def create_collection(self, name: str, parent_id=None) -> dict:
+        """只创建分组节点，不立即修改任何表情的归属。"""
+        try:
+            name = str(name or "").strip()
+            if not name:
+                return {"ok": False, "error": "分组名为空"}
+            if len(name) > 100:
+                return {"ok": False, "error": "分组名最多 100 个字符"}
+            parent = None if parent_id in (None, "", 0, "0") else int(parent_id)
+            if parent is not None:
+                if not any(row[0] == parent for row in self._db.get_collections()):
+                    return {"ok": False, "error": "父分组不存在"}
+                if self._db.get_collection_depth(parent) >= 1:
+                    return {"ok": False, "error": "最大支持1层小分组"}
+            existed = self._db.collection_exists(name, parent)
+            cid = self._db.create_collection(name, parent_id=parent)
+            if cid < 0:
+                return {"ok": False, "error": "创建分组失败"}
+            # 此时还没有表情成员；manifest 构建会清理空分组，必须等详情保存、
+            # 成员关系写入后再由 update_meme_details 重建。
+            all_collections = self._db.get_all_collection_paths()
+            item = next(
+                (record for record in all_collections if record["id"] == cid),
+                {"id": cid, "name": name, "path": name},
+            )
+            return {
+                "ok": True,
+                "id": cid,
+                "created": not existed,
+                "collection": item,
+                "all_collections": all_collections,
+            }
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
     def create_subcollection(self, name: str, parent_id: int) -> dict:
-        depth = self._db.get_collection_depth(parent_id)
-        if depth >= 1:
-            return {"ok": False, "error": "最大支持1层小分组"}
-        cid = self._db.create_collection(name, parent_id=parent_id)
-        if cid < 0:
-            return {"ok": False}
-        return {"ok": True, "id": cid}
+        return self.create_collection(name, parent_id)
 
     def record_meme_use(self, meme_id: int) -> bool:
         try:
@@ -904,7 +1924,6 @@ class JsApi:
         conn = _check_connectivity()
         if not conn["ok"]:
             return {"ok": False, "error": "无网络连接"}
-        import shutil
         import tempfile
         from urllib.error import URLError
         from urllib.parse import urlparse
@@ -924,6 +1943,13 @@ class JsApi:
         tmp.close()
         try:
             with urlopen(clean_url, timeout=15) as resp:
+                length = resp.headers.get("Content-Length", "")
+                if length and int(length) > _IMPORT_MAX_BYTES:
+                    return {
+                        "ok": False,
+                        "error": "图片超过 %d MiB 原件上限"
+                        % (_IMPORT_MAX_BYTES // (1024 * 1024)),
+                    }
                 if need_type:
                     ct = resp.headers.get("Content-Type", "")
                     content_type = ct.split(";")[0].strip()
@@ -935,8 +1961,20 @@ class JsApi:
                         "image/bmp": ".bmp",
                     }
                     ext = type_map.get(content_type, ".png")
+                total = 0
                 with open(tmp_path, "wb") as f:
-                    shutil.copyfileobj(resp, f)
+                    while True:
+                        chunk = resp.read(64 * 1024)
+                        if not chunk:
+                            break
+                        total += len(chunk)
+                        if total > _IMPORT_MAX_BYTES:
+                            return {
+                                "ok": False,
+                                "error": "图片超过 %d MiB 原件上限"
+                                % (_IMPORT_MAX_BYTES // (1024 * 1024)),
+                            }
+                        f.write(chunk)
             # 重命名为正确扩展名
             final_path = tmp_path + ext
             os.rename(tmp_path, final_path)
@@ -1233,11 +2271,51 @@ class JsApi:
             "show_download_done": d.get("show_download_done", True),
             "show_uncategorized": d.get("show_uncategorized", True),
             "record_recent_use": d.get("record_recent_use", True),
+            "search_description": d.get("search_description", True),
+            "search_image_text": d.get("search_image_text", True),
             "show_startup_animation": d.get("show_startup_animation", True),
+            "virtual_drive_compat": d.get("virtual_drive_compat", False),
+            "bulk_read_protection": d.get("bulk_read_protection", False),
+            "bulk_read_batch_size": clamp_batch_size(
+                d.get("bulk_read_batch_size", 8)
+            ),
+            "bulk_read_pause_seconds": clamp_pause_seconds(
+                d.get("bulk_read_pause_seconds", 1.0)
+            ),
+            "bulk_read_prefetch_pages": d.get("bulk_read_prefetch_pages", False),
+            "notion_token": d.get("notion_token", ""),
+            "notion_database_id": d.get("notion_database_id", ""),
+            "notion_data_source_id": d.get("notion_data_source_id", ""),
+            "notion_media_property": d.get("notion_media_property", ""),
+            "notion_title_property": d.get("notion_title_property", ""),
+            "notion_tags_property": d.get("notion_tags_property", ""),
+            "notion_tag_mappings": d.get("notion_tag_mappings", []),
+            "notion_collection_property": d.get("notion_collection_property", ""),
+            "notion_version": d.get("notion_version", "2026-03-11"),
         }
+
+    def notion_test_connection(self, settings) -> dict:
+        """测试 Notion 连接并返回数据库属性。"""
+        try:
+            return notion_import.test_notion_connection(settings)
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def start_notion_import(self, settings) -> dict:
+        """启动主窗口中的 Notion 数据库只读导入。"""
+        return notion_import.start_notion_import(self._webui, settings)
+
+    def get_notion_import_progress(self) -> dict:
+        """获取 Notion 导入进度。"""
+        return notion_import.get_notion_progress()
+
+    def cancel_notion_import(self):
+        """取消 Notion 导入。"""
+        notion_import.cancel_notion_import()
 
     def save_settings(self, settings: dict):
         if isinstance(settings, dict):
+            settings = _normalize_bulk_read_settings(settings)
             if "auto_start" in settings:
                 from .platform_util import set_auto_start
 
@@ -1249,9 +2327,11 @@ class JsApi:
 
     def reset_settings(self) -> dict:
         prev_cache_dir = self._cfg.get("cache_dir", "")
+        prev_virtual_drive_compat = self._cfg.get("virtual_drive_compat", False) is True
         self._cfg.reset()
         if prev_cache_dir:
             self._cfg.set("cache_dir", prev_cache_dir)
+            self._cfg.set("virtual_drive_compat", prev_virtual_drive_compat)
         self._cfg.save()
         hotkey = self._cfg.get("hotkey", "Ctrl+Alt+N")
         self._webui._on_hotkey_change(hotkey)
@@ -1295,7 +2375,14 @@ class JsApi:
             "show_upload_done": True,
             "show_download_progress": True,
             "show_download_done": True,
+            "search_description": True,
+            "search_image_text": True,
             "show_startup_animation": True,
+            "virtual_drive_compat": self._cfg.get("virtual_drive_compat", False),
+            "bulk_read_protection": False,
+            "bulk_read_batch_size": 8,
+            "bulk_read_pause_seconds": 1.0,
+            "bulk_read_prefetch_pages": False,
         }
 
     def move_window(self, dx: int, dy: int):
@@ -1341,9 +2428,19 @@ class JsApi:
     def hide_window(self):
         self._webui.hide()
 
+    def minimize_window(self):
+        """最小化到任务栏；与隐藏到托盘保持不同语义。"""
+        return self._webui.minimize()
+
     def _find_meme_file(self, filename: str) -> str:
         cache_dir = self._cfg.cache_dir
-        for root, _, files in os.walk(cache_dir):
+        for root, dirs, files in os.walk(cache_dir):
+            if Path(root) == Path(cache_dir):
+                dirs[:] = [
+                    item
+                    for item in dirs
+                    if item.casefold() != CHAT_RECORD_MEDIA_DIRNAME.casefold()
+                ]
             if filename in files:
                 return os.path.join(root, filename)
         return ""
@@ -1508,7 +2605,12 @@ def _backup_worker(kind: str, zip_path: str):
     try:
         if kind == "create":
             result = backup.create_backup(
-                backup.get_backup_dir(cfg), cfg.data_dir, cfg.cache_dir, db, cb
+                backup.get_backup_dir(cfg),
+                cfg.data_dir,
+                cfg.cache_dir,
+                db,
+                cb,
+                allow_unresolved=cfg.get("virtual_drive_compat", False) is True,
             )  # create_backup 内部校验 backup_dir 与 cache_dir 的嵌套关系
         else:
             # 恢复全程持有导入互斥锁：_do_import/同步 pull 走同一把锁，
@@ -1557,12 +2659,15 @@ def _storage_migrate_manifest_path() -> Path:
     return get_config().data_dir / "storage_migration.json"
 
 
-def _write_storage_migration_manifest(old: Path, new: Path):
+def _write_storage_migration_manifest(old: Path, new: Path, virtual_drive_compat=None):
     import json
 
     try:
         with open(_storage_migrate_manifest_path(), "w", encoding="utf-8") as f:
-            json.dump({"old": str(old), "new": str(new)}, f)
+            data = {"old": str(old), "new": str(new)}
+            if virtual_drive_compat is not None:
+                data["virtual_drive_compat"] = bool(virtual_drive_compat)
+            json.dump(data, f)
     except OSError:
         pass
 
@@ -1585,11 +2690,16 @@ def resume_pending_storage_migration():
         with open(manifest, "r", encoding="utf-8") as f:
             data = json.load(f)
         old, new = Path(data["old"]), Path(data["new"])
+        virtual_drive_compat = data.get("virtual_drive_compat")
     except (OSError, ValueError, KeyError) as e:
         logger.warning("storage migration manifest invalid: %s", e)
         _clear_storage_migration_manifest()
         return
-    if not start_storage_migration_thread(new, old_override=old):
+    if not start_storage_migration_thread(
+        new,
+        old_override=old,
+        virtual_drive_compat=virtual_drive_compat,
+    ):
         return
 
     def _watch():
@@ -1605,7 +2715,11 @@ def resume_pending_storage_migration():
     threading.Thread(target=_watch, daemon=True).start()
 
 
-def start_storage_migration_thread(new_dir: Path, old_override: Path = None):
+def start_storage_migration_thread(
+    new_dir: Path,
+    old_override: Path = None,
+    virtual_drive_compat=None,
+):
     """后台迁移 cache_dir 文件到 new_dir，避免阻塞桥接与 UI"""
     global _STORAGE_MIGRATE_THREAD
     old = old_override or get_config().cache_dir
@@ -1623,17 +2737,17 @@ def start_storage_migration_thread(new_dir: Path, old_override: Path = None):
             error="",
             cancel_requested=False,
         )
-    _write_storage_migration_manifest(old, new_dir)
+    _write_storage_migration_manifest(old, new_dir, virtual_drive_compat)
     _STORAGE_MIGRATE_THREAD = threading.Thread(
         target=_storage_migrate_worker,
-        args=(old, new_dir),
+        args=(old, new_dir, virtual_drive_compat),
         daemon=True,
     )
     _STORAGE_MIGRATE_THREAD.start()
     return True
 
 
-def _storage_migrate_worker(old: Path, new: Path):
+def _storage_migrate_worker(old: Path, new: Path, virtual_drive_compat=None):
     """三阶段迁移：复制（源只读）→ 切换配置 → 清理源；全程幂等可续跑
 
     阶段1 只写新目录，崩溃/取消只需清理本次新副本（源完好无分裂）；
@@ -1671,7 +2785,8 @@ def _storage_migrate_worker(old: Path, new: Path):
             if cancel_requested:
                 break
             try:
-                src_size = os.path.getsize(src)
+                with guarded_read():
+                    src_size = os.path.getsize(src)
             except OSError:
                 continue
             dst.parent.mkdir(parents=True, exist_ok=True)
@@ -1693,8 +2808,9 @@ def _storage_migrate_worker(old: Path, new: Path):
                 conflicts.append(dst)
                 continue
             try:
-                with open(src, "rb") as in_f, open(tmp_dst, "wb") as out_f:
-                    shutil.copyfileobj(in_f, out_f)
+                with guarded_read():
+                    with open(src, "rb") as in_f, open(tmp_dst, "wb") as out_f:
+                        shutil.copyfileobj(in_f, out_f)
             except Exception:
                 # 写入中途失败：仅删除本次临时文件，最终路径未触及
                 if tmp_dst.exists():
@@ -1769,8 +2885,11 @@ def _storage_migrate_worker(old: Path, new: Path):
             _clear_storage_migration_manifest()
             return
         # 阶段二：切换配置（唯一危险点，此后新目录已完整）
-        get_config().set("cache_dir", str(new))
-        get_config().save()
+        cfg = get_config()
+        cfg.set("cache_dir", str(new))
+        if virtual_drive_compat is not None:
+            cfg.set("virtual_drive_compat", bool(virtual_drive_compat))
+        cfg.save()
         # 依据磁盘上实际持久化的 cache_dir 判断是否已切换（原子保存保证一致，
         # 但异常路径下以磁盘为准，避免误判为未切换而删除新目录）
         try:
@@ -1828,6 +2947,74 @@ class SettingsApi:
     def check_connectivity(self) -> dict:
         return _check_connectivity()
 
+    def napcat_test_connection(
+        self, http_url: str, ws_url: str = "", token: str = ""
+    ) -> dict:
+        """只读测试 NapCat 的 OneBot 登录态和版本接口。"""
+        try:
+            return onebot.test_connection(http_url, token, ws_url)
+        except onebot.OneBotError as exc:
+            return {"ok": False, "error": str(exc)}
+        except Exception:
+            logger.exception("NapCat 连接测试失败")
+            return {"ok": False, "error": "连接测试失败，请检查 NapCat 配置"}
+
+    def napcat_apply_listener(
+        self,
+        enabled: bool,
+        http_url: str,
+        ws_url: str,
+        token: str = "",
+        command: str = "/omm",
+        send_mode: str = "original_native",
+        webui_url: str = "http://127.0.0.1:6099",
+        webui_token: str = "",
+    ) -> dict:
+        """立即应用 QQ 命令监听配置。"""
+        try:
+            command = onebot.normalize_command(command)
+            send_mode = onebot.normalize_send_mode(send_mode)
+            http_url = onebot.normalize_http_url(http_url)
+            ws_url = onebot.normalize_ws_url(ws_url)
+            webui_url = onebot.normalize_http_url(
+                webui_url or "http://127.0.0.1:6099"
+            )
+            self._cfg.update_from_dict(
+                {
+                    "napcat_enabled": bool(enabled),
+                    "napcat_http_url": http_url,
+                    "napcat_ws_url": ws_url,
+                    "napcat_token": token,
+                    "napcat_webui_url": webui_url,
+                    "napcat_webui_token": webui_token,
+                    "napcat_command": command,
+                    "napcat_send_mode": send_mode,
+                }
+            )
+            self._cfg.save()
+            if not enabled:
+                onebot.stop_command_listener()
+                return {"ok": True, **onebot.get_command_listener_status()}
+            status = onebot.start_command_listener(
+                http_url,
+                ws_url,
+                token,
+                command,
+                send_mode,
+                webui_url,
+                webui_token,
+            )
+            return {"ok": True, **status}
+        except onebot.OneBotError as exc:
+            return {"ok": False, "error": str(exc)}
+        except Exception:
+            logger.exception("NapCat 命令监听应用失败")
+            return {"ok": False, "error": "命令监听启动失败，请检查 NapCat 日志"}
+
+    def napcat_get_listener_status(self) -> dict:
+        """返回不含 Token 的 QQ 命令监听和归档状态。"""
+        return onebot.get_command_listener_status()
+
     def lan_start(self, port: int = None, secret: str = None) -> dict:
         from . import lan
 
@@ -1872,8 +3059,19 @@ class SettingsApi:
             "try_original_image": d.get("try_original_image", False),
             "copy_resize_mode": int(d.get("copy_resize_mode", 1) or 0),
             "cache_dir": str(self._cfg.cache_dir),
+            "virtual_drive_compat": d.get("virtual_drive_compat", False),
             "lan_port": d.get("lan_port", 17852),
             "lan_secret": d.get("lan_secret", ""),
+            "napcat_enabled": d.get("napcat_enabled", False),
+            "napcat_http_url": d.get("napcat_http_url", "http://127.0.0.1:3000"),
+            "napcat_ws_url": d.get("napcat_ws_url", "ws://127.0.0.1:3001"),
+            "napcat_token": d.get("napcat_token", ""),
+            "napcat_webui_url": d.get(
+                "napcat_webui_url", "http://127.0.0.1:6099"
+            ),
+            "napcat_webui_token": d.get("napcat_webui_token", ""),
+            "napcat_command": d.get("napcat_command", "/omm"),
+            "napcat_send_mode": d.get("napcat_send_mode", "original_native"),
             "auto_start": is_auto_start_enabled(),
             "silent_start": d.get("silent_start", False),
             "sync_auto_fetch_index": d.get("sync_auto_fetch_index", False),
@@ -1908,7 +3106,17 @@ class SettingsApi:
             "show_download_done": d.get("show_download_done", True),
             "show_uncategorized": d.get("show_uncategorized", True),
             "record_recent_use": d.get("record_recent_use", True),
+            "search_description": d.get("search_description", True),
+            "search_image_text": d.get("search_image_text", True),
             "show_startup_animation": d.get("show_startup_animation", True),
+            "bulk_read_protection": d.get("bulk_read_protection", False),
+            "bulk_read_batch_size": clamp_batch_size(
+                d.get("bulk_read_batch_size", 8)
+            ),
+            "bulk_read_pause_seconds": clamp_pause_seconds(
+                d.get("bulk_read_pause_seconds", 1.0)
+            ),
+            "bulk_read_prefetch_pages": d.get("bulk_read_prefetch_pages", False),
             "tg_tdata_path": d.get("tg_tdata_path", ""),
             "hover_to_play": d.get("hover_to_play", False),
         }
@@ -1936,6 +3144,41 @@ class SettingsApi:
 
     def save_settings(self, settings: dict):
         if isinstance(settings, dict):
+            settings = _normalize_bulk_read_settings(settings)
+            napcat_changed = any(
+                key in settings
+                for key in (
+                    "napcat_enabled",
+                    "napcat_http_url",
+                    "napcat_ws_url",
+                    "napcat_token",
+                    "napcat_webui_url",
+                    "napcat_webui_token",
+                    "napcat_command",
+                    "napcat_send_mode",
+                )
+            )
+            if "napcat_webui_url" in settings:
+                try:
+                    settings["napcat_webui_url"] = onebot.normalize_http_url(
+                        settings["napcat_webui_url"] or "http://127.0.0.1:6099"
+                    )
+                except onebot.OneBotError as exc:
+                    return {"ok": False, "error": f"NapCat WebUI 地址无效：{exc}"}
+            if "napcat_command" in settings:
+                try:
+                    settings["napcat_command"] = onebot.normalize_command(
+                        settings["napcat_command"]
+                    )
+                except onebot.OneBotError as exc:
+                    return {"ok": False, "error": str(exc)}
+            if "napcat_send_mode" in settings:
+                try:
+                    settings["napcat_send_mode"] = onebot.normalize_send_mode(
+                        settings["napcat_send_mode"]
+                    )
+                except onebot.OneBotError as exc:
+                    return {"ok": False, "error": str(exc)}
             if "auto_start" in settings:
                 from .platform_util import set_auto_start
 
@@ -1944,11 +3187,21 @@ class SettingsApi:
             self._cfg.save()
             if "hotkey" in settings:
                 self._webui._on_hotkey_change(settings["hotkey"])
+            if napcat_changed:
+                try:
+                    onebot.apply_command_listener_config(self._cfg)
+                except onebot.OneBotError as exc:
+                    return {"ok": False, "error": str(exc)}
+                except Exception:
+                    logger.exception("NapCat 命令监听重载失败")
+                    return {"ok": False, "error": "命令监听重载失败"}
             try:
                 if len(webview.windows) > 0:
                     webview.windows[0].evaluate_js("refreshMemes();")
             except Exception:
                 pass
+            return {"ok": True}
+        return {"ok": False, "error": "设置数据无效"}
 
     def reset_settings(self) -> dict:
         prev_cache_dir = self._cfg.get("cache_dir", "")
@@ -1961,6 +3214,7 @@ class SettingsApi:
         from .platform_util import set_auto_start
 
         set_auto_start(False)
+        onebot.stop_command_listener()
         try:
             if len(webview.windows) > 0:
                 webview.windows[0].evaluate_js("refreshMemes();")
@@ -2004,7 +3258,22 @@ class SettingsApi:
             "show_download_progress": True,
             "show_download_done": True,
             "record_recent_use": True,
+            "search_description": True,
+            "search_image_text": True,
             "show_startup_animation": True,
+            "virtual_drive_compat": False,
+            "bulk_read_protection": False,
+            "bulk_read_batch_size": 8,
+            "bulk_read_pause_seconds": 1.0,
+            "bulk_read_prefetch_pages": False,
+            "napcat_enabled": False,
+            "napcat_http_url": "http://127.0.0.1:3000",
+            "napcat_ws_url": "ws://127.0.0.1:3001",
+            "napcat_token": "",
+            "napcat_webui_url": "http://127.0.0.1:6099",
+            "napcat_webui_token": "",
+            "napcat_command": "/omm",
+            "napcat_send_mode": "original_native",
             "tg_tdata_path": self._cfg.get("tg_tdata_path", ""),
             "hover_to_play": self._cfg.get("hover_to_play", False),
         }
@@ -2276,11 +3545,12 @@ class SettingsApi:
                         if d == "thumbnails":
                             dirs.remove(d)
                     for name in files:
-                        count += 1
-                        try:
-                            total += (Path(root) / name).stat().st_size
-                        except OSError:
-                            pass
+                        with guarded_read():
+                            count += 1
+                            try:
+                                total += (Path(root) / name).stat().st_size
+                            except OSError:
+                                pass
         except OSError:
             pass
         return {
@@ -2322,29 +3592,62 @@ class SettingsApi:
         path = result[0] if isinstance(result, (tuple, list)) else result
         return {"ok": True, "path": path}
 
-    def apply_storage_dir(self, path, move_files=False):
+    def apply_storage_dir(self, path, move_files=False, virtual_drive_compat=None):
         """应用新的表情包存储目录；move_files=True 时后台迁移现有文件"""
-        old = self._cfg.cache_dir
+        compat = (
+            bool(virtual_drive_compat)
+            if virtual_drive_compat is not None
+            else self._cfg.get("virtual_drive_compat", False) is True
+        )
+        old_custom = self._cfg.get("cache_dir", "")
+        try:
+            old = (
+                resolve_path(old_custom, compat) if old_custom else self._cfg.cache_dir
+            )
+        except OSError:
+            return {
+                "ok": False,
+                "error": "当前存储目录无法解析，请开启“增强虚拟盘兼容性”后重试",
+            }
         protected = (self._cfg.data_dir, self._cfg.thumbnail_dir)
-        ok, err = _storage_dir_validation(path, str(old), protected)
+        ok, err = _storage_dir_validation(
+            path, str(old), protected, allow_unresolved=compat
+        )
         if not ok:
             return {"ok": False, "error": err}
-        ok, err = backup.validate_backup_dir(path, backup.get_backup_dir(self._cfg))
+        ok, err = backup.validate_backup_dir(
+            path,
+            backup.get_backup_dir(self._cfg),
+            allow_unresolved=compat,
+        )
         if not ok:
             return {"ok": False, "error": f"新存储目录与备份目录冲突: {err}"}
-        new = Path(path).resolve()
+        try:
+            new = resolve_path(path, compat)
+        except OSError:
+            return {"ok": False, "error": "路径无效"}
         try:
             new.mkdir(parents=True, exist_ok=True)
         except OSError as e:
             return {"ok": False, "error": f"创建目录失败: {e}"}
-        if not os.access(new, os.W_OK):
+        if compat:
+            ok, err = _probe_storage_dir(new)
+            if not ok:
+                return {"ok": False, "error": err}
+        elif not os.access(new, os.W_OK):
             return {"ok": False, "error": "目标目录不可写"}
         if not move_files:
             self._cfg.set("cache_dir", str(new))
+            if virtual_drive_compat is not None:
+                self._cfg.set("virtual_drive_compat", compat)
             self._cfg.save()
             self._invalidate_cache_refresh()
             return {"ok": True, "cache_dir": str(new), "moved": 0, "failed": []}
-        started = start_storage_migration_thread(new)
+        started = start_storage_migration_thread(
+            new,
+            old_override=old,
+            virtual_drive_compat=(compat if virtual_drive_compat is not None else None),
+        )
         if not started:
             return {"ok": False, "error": "有迁移任务正在运行"}
         # 后台迁移进行中，前端轮询 get_storage_migration_progress()
@@ -2391,7 +3694,11 @@ class SettingsApi:
             return {"ok": False, "error": f"创建目录失败: {e}"}
         if not os.access(new, os.W_OK):
             return {"ok": False, "error": "目标目录不可写"}
-        ok, err = backup.validate_backup_dir(str(new), self._cfg.cache_dir)
+        ok, err = backup.validate_backup_dir(
+            str(new),
+            self._cfg.cache_dir,
+            allow_unresolved=self._cfg.get("virtual_drive_compat", False) is True,
+        )
         if not ok:
             return {"ok": False, "error": err}
         self._cfg.set("backup_dir", str(new))
@@ -2563,7 +3870,7 @@ class SettingsApi:
             try:
                 if len(webview.windows) > 0:
                     webview.windows[0].evaluate_js(
-                        "refreshMemes();refreshTags();refreshCollections();"
+                        "refreshMemes();refreshTags();refreshCollections();refreshCategories();"
                     )
             except Exception:
                 pass
@@ -2586,13 +3893,20 @@ class SettingsApi:
     def delete_all_local(self) -> dict:
         """删除本地所有表情包"""
         try:
+            import shutil
+
             db = get_db()
             db.delete_all()
             cache = self._cfg.cache_dir
             if cache.exists():
-                for f in cache.iterdir():
-                    if f.is_file():
-                        f.unlink()
+                # 类别原件现在位于 cache_dir 下的多级目录；清空时递归移除
+                # 所有缓存子项，但保留存储根目录本身供后续导入使用。
+                for child in cache.iterdir():
+                    if child.is_dir():
+                        shutil.rmtree(child)
+                    else:
+                        child.unlink()
+            cache.mkdir(parents=True, exist_ok=True)
             thumbs = self._cfg.thumbnail_dir
             if thumbs.exists():
                 for f in thumbs.iterdir():
@@ -2604,7 +3918,7 @@ class SettingsApi:
             try:
                 if len(webview.windows) > 0:
                     webview.windows[0].evaluate_js(
-                        "refreshMemes();refreshTags();refreshCollections();"
+                        "refreshMemes();refreshTags();refreshCollections();refreshCategories();"
                     )
             except Exception:
                 pass
@@ -2667,9 +3981,10 @@ def _file_sha256(path):
     import hashlib
 
     sha = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(65536), b""):
-            sha.update(chunk)
+    with guarded_read():
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                sha.update(chunk)
     return sha.hexdigest()
 
 
@@ -2868,7 +4183,8 @@ def _phash_path_cached(fpath):
         cached = _PHASH_CACHE.get(fpath)
         if cached and cached[0] == key:
             return cached[1]
-    h = _perceptual_hash_path(fpath)
+    with guarded_read():
+        h = _perceptual_hash_path(fpath)
     if h:
         with _PHASH_CACHE_LOCK:
             if len(_PHASH_CACHE) >= 4096:
@@ -2926,11 +4242,12 @@ def _perceptual_hash_path(path) -> int:
     if not HAS_PIL:
         return 0
     try:
-        with PILImage.open(path) as img:
-            # 动画取首帧
-            if getattr(img, "n_frames", 1) > 1:
-                img.seek(0)
-            return _perceptual_hash(img)
+        with guarded_read():
+            with PILImage.open(path) as img:
+                # 动画取首帧
+                if getattr(img, "n_frames", 1) > 1:
+                    img.seek(0)
+                return _perceptual_hash(img)
     except Exception:
         return 0
 
@@ -2983,11 +4300,15 @@ def _pop_pending_similar(token: str) -> dict:
 
 
 def _iter_cache_images(cache_dir):
-    """遍历缓存目录下所有在库图片的 (filename, fullpath)，跳过 thumbnails 与子目录"""
+    """遍历缓存目录下所有在库图片，跳过应用管理的专用目录。"""
     try:
         for root, dirs, files in os.walk(str(cache_dir)):
             for d in list(dirs):
-                if d == "thumbnails":
+                is_chat_media = (
+                    Path(root) == Path(cache_dir)
+                    and d.casefold() == CHAT_RECORD_MEDIA_DIRNAME.casefold()
+                )
+                if d.casefold() == "thumbnails" or is_chat_media:
                     dirs.remove(d)
             for name in files:
                 if _detect_image_ext(os.path.join(root, name)):
@@ -3131,8 +4452,9 @@ def _prepare_image_import(path) -> dict:
         fsize = 0
     if HAS_PIL:
         try:
-            with PILImage.open(path) as img:
-                w, h = img.size
+            with guarded_read():
+                with PILImage.open(path) as img:
+                    w, h = img.size
         except Exception:
             pass
     if fsize > _IMPORT_MAX_BYTES or max(w, h) > _IMPORT_MAX_PX:
@@ -3154,8 +4476,9 @@ def _prepare_image_import(path) -> dict:
 def _detect_image_ext(path):
     """读取文件头魔数识别真实扩展名（QQ 保存常为 .jpg，实为 png/webp 等），未知返回空串"""  # noqa: E501
     try:
-        with open(path, "rb") as f:
-            return adb_util._detect_ext(f.read(16))
+        with guarded_read():
+            with open(path, "rb") as f:
+                return adb_util._detect_ext(f.read(16))
     except OSError:
         return ""
 
@@ -3163,9 +4486,10 @@ def _detect_image_ext(path):
 def _try_decode_stego(gif_path):
     """实验性：检测 GIF 隐写并解码还原原图到临时文件；非隐写/失败返回 None"""
     try:
-        with open(gif_path, "rb") as f:
-            if b"STG3" not in f.read():
-                return None
+        with guarded_read():
+            with open(gif_path, "rb") as f:
+                if b"STG3" not in f.read():
+                    return None
         from .gif_stego import decode as stego_decode
     except Exception as e:
         logger.warning(f"_try_decode_stego detect: {e}")
@@ -3176,7 +4500,8 @@ def _try_decode_stego(gif_path):
         import uuid
 
         base = os.path.join(tempfile.gettempdir(), f"ohmm_dec_{uuid.uuid4().hex}")
-        stego_decode(gif_path, base, quiet=True)
+        with guarded_read():
+            stego_decode(gif_path, base, quiet=True)
         cands = [
             c
             for c in glob.glob(base + "*")
@@ -3205,9 +4530,42 @@ class WebUI:
         self._hotkey_session = False
         self._last_toggle_ms = 0
         self._window_state_lock = threading.Lock()
+        self._library_refresh_lock = threading.Lock()
+        self._library_refresh_timer = None
+        self._library_refresh_kind = "content"
         self._on_hotkey_change_cb = None
         self._update_debug = update_debug
         self._silent_start = silent_start
+        from .library_events import set_change_callback
+
+        set_change_callback(self._on_library_changed)
+
+    def _on_library_changed(self, kind="content"):
+        """合并短时间内的后台入库通知，避免连续触发重复查询。"""
+        with self._library_refresh_lock:
+            if kind == "structure":
+                self._library_refresh_kind = "structure"
+            if self._library_refresh_timer is not None:
+                return
+            timer = threading.Timer(0.12, self._flush_library_refresh)
+            timer.daemon = True
+            self._library_refresh_timer = timer
+            timer.start()
+
+    def _flush_library_refresh(self):
+        with self._library_refresh_lock:
+            kind = self._library_refresh_kind
+            self._library_refresh_kind = "content"
+            self._library_refresh_timer = None
+        window = self._window
+        if window is None:
+            return
+        try:
+            window.evaluate_js(
+                "window.refreshLibrary && window.refreshLibrary(%r)" % kind
+            )
+        except Exception as exc:
+            logger.debug("library refresh notification failed: %s", exc)
 
     def _init_lan(self):
         from . import lan
@@ -3339,6 +4697,22 @@ class WebUI:
         except Exception:
             pass
 
+    def minimize(self) -> bool:
+        """原生最小化到任务栏；窗口仍属于可见会话，可由任务栏恢复。"""
+        if self._window is None:
+            return False
+        with self._window_state_lock:
+            try:
+                self._save_window_position()
+                minimize = getattr(self._window, "minimize", None)
+                if not callable(minimize):
+                    return False
+                minimize()
+                return True
+            except Exception:
+                logger.exception("minimize window failed")
+                return False
+
     def toggle(self):
         with self._window_state_lock:
             visible = self._visible
@@ -3434,14 +4808,20 @@ class WebUI:
         thumb_path = cache_dir / f"{meme_id}_{size}.png"
         if thumb_path.exists():
             return str(thumb_path)
-        meme_path = self._find_meme_file(filename)
+        row = get_db().get_by_id(meme_id)
+        meme_path = self._find_daily_file(row) if row else ""
         if not meme_path or not HAS_PIL:
             return ""
         try:
-            img = PILImage.open(meme_path)
-            img.thumbnail((size, size), PILImage.LANCZOS)
-            buf = io.BytesIO()
-            img.save(buf, "PNG")
+            # 日常副本固定在本地 data_dir，不应消耗虚拟盘读取配额；只有
+            # 日常副本生成失败、回退为原件路径时继续走限流闸门。
+            local_daily = Path(meme_path).parent == self._cfg.derivative_dir
+            read_guard = nullcontext() if local_daily else guarded_read()
+            with read_guard:
+                with PILImage.open(meme_path) as img:
+                    img.thumbnail((size, size), PILImage.LANCZOS)
+                    buf = io.BytesIO()
+                    img.save(buf, "PNG")
             cache_dir.mkdir(parents=True, exist_ok=True)
             # 并发请求同一缩略图时避免交错写同一文件：先写临时文件再原子替换
             fd, tmp_path = tempfile.mkstemp(dir=str(cache_dir), suffix=".tmp")
@@ -3465,7 +4845,7 @@ class WebUI:
             return ""
         cache_dir = self._cfg.cache_dir
         direct = cache_dir / filename
-        if direct.exists():
+        if direct.is_file():
             return str(direct)
         if not hasattr(self, "_file_cache"):
             self._file_cache = {}
@@ -3473,12 +4853,213 @@ class WebUI:
             cached = self._file_cache[filename]
             if os.path.exists(cached):
                 return cached
-        for root, _, files in os.walk(cache_dir):
+        for root, dirs, files in os.walk(cache_dir):
+            if Path(root) == Path(cache_dir):
+                dirs[:] = [
+                    item
+                    for item in dirs
+                    if item.casefold() != CHAT_RECORD_MEDIA_DIRNAME.casefold()
+                ]
             if filename in files:
                 full = os.path.join(root, filename)
                 self._file_cache[filename] = full
                 return full
         return ""
+
+    def _category_file_path(self, category_id, filename: str) -> Path:
+        if not _safe_serve_filename(filename):
+            raise ValueError("文件名无效")
+        db = get_db()
+        parts = db.get_category_path_names(category_id)
+        return category_dir(self._cfg.cache_dir, parts) / filename
+
+    def _find_meme_file_for_row(self, row) -> str:
+        if not row:
+            return ""
+        try:
+            expected = self._category_file_path(row.get("category_id"), row["filename"])
+            if expected.is_file():
+                return str(expected)
+        except (KeyError, ValueError):
+            return ""
+        return self._find_meme_file(row.get("filename", ""))
+
+    def _find_interrupted_rename_file(self, row, target: Path) -> str:
+        """按大小和 SHA-256 找回已移动但尚未入库的原件。"""
+        expected_hash = row.get("file_hash", "") or ""
+        if not expected_hash:
+            return ""
+        if target.is_file():
+            try:
+                if _file_sha256(target) == expected_hash:
+                    return str(target)
+            except OSError:
+                pass
+
+        expected_size = int(row.get("file_size", 0) or 0)
+        if expected_size <= 0:
+            return ""
+        old_parent = self._category_file_path(
+            row.get("category_id"), row.get("filename", "")
+        ).parent
+        search_dirs = [target.parent]
+        if old_parent != target.parent:
+            search_dirs.append(old_parent)
+        db = getattr(getattr(self, "_api", None), "_db", None)
+        matches = []
+        seen = set()
+        for directory in search_dirs:
+            try:
+                entries = os.scandir(directory)
+            except OSError:
+                continue
+            with entries:
+                for entry in entries:
+                    candidate = Path(entry.path)
+                    candidate_key = os.path.normcase(os.path.abspath(str(candidate)))
+                    if candidate_key in seen:
+                        continue
+                    seen.add(candidate_key)
+                    try:
+                        if (
+                            not entry.is_file()
+                            or candidate.suffix.lower() != target.suffix.lower()
+                            or entry.stat().st_size != expected_size
+                        ):
+                            continue
+                    except OSError:
+                        continue
+                    if db is not None:
+                        owner = db.get_by_filename(candidate.name)
+                        if owner and owner.get("id") != row.get("id"):
+                            continue
+                    try:
+                        if _file_sha256(candidate) != expected_hash:
+                            continue
+                    except OSError:
+                        continue
+                    matches.append(candidate)
+                    if len(matches) > 1:
+                        return ""
+        if matches:
+            logger.info("recovered interrupted rename source: %s", matches[0].name)
+            return str(matches[0])
+        return ""
+
+    def _move_meme_file(self, row, filename: str, category_id):
+        """把原件移动到类别对应目录并返回 (旧路径, 新路径)。"""
+        source_name = row.get("filename", "")
+        target = self._category_file_path(category_id, filename)
+        source_value = self._find_meme_file_for_row(row)
+        if not source_value:
+            source_value = self._find_interrupted_rename_file(row, target)
+        if not source_value:
+            raise FileNotFoundError("找不到原始图片文件")
+        source = Path(source_value)
+        allow_unresolved = self._cfg.get("virtual_drive_compat", False) is True
+        same = resolve_path(source, allow_unresolved) == resolve_path(
+            target, allow_unresolved
+        )
+        if same:
+            return source, target
+        if target.exists():
+            try:
+                if os.path.samefile(source, target):
+                    return source, target
+            except OSError:
+                pass
+            raise ValueError("目标位置已存在同名文件")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(str(source), str(target))
+        remove_empty_parents(source.parent, self._cfg.cache_dir)
+        if hasattr(self, "_file_cache"):
+            self._file_cache.pop(source_name, None)
+            self._file_cache.pop(filename, None)
+        return source, target
+
+    def _rename_category_directory(self, old_parts, parent_parts, new_name):
+        old_dir = category_dir(self._cfg.cache_dir, old_parts)
+        new_dir = category_dir(self._cfg.cache_dir, list(parent_parts) + [new_name])
+        if old_dir == new_dir or not old_dir.exists():
+            return None
+        if new_dir.exists():
+            raise ValueError("目标类别目录已存在")
+        new_dir.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(str(old_dir), str(new_dir))
+        return old_dir, new_dir
+
+    def _delete_category_directory(self, parts, parent_parts):
+        """删除类别节点时把其目录内容提升到父目录，避免原件丢失。"""
+        source_dir = category_dir(self._cfg.cache_dir, parts)
+        if not source_dir.exists():
+            return
+        target_dir = category_dir(self._cfg.cache_dir, parent_parts)
+        moves = []
+        for path in source_dir.rglob("*"):
+            if path.is_file():
+                target = target_dir / path.relative_to(source_dir)
+                moves.append((path, target))
+        for _source, target in moves:
+            if target.exists():
+                raise ValueError("删除类别会覆盖目标目录中的同名文件")
+        for source, target in moves:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(str(source), str(target))
+        # 仅移除空目录；类别子目录已随文件路径在父目录下自然保留。
+        for path in sorted(source_dir.rglob("*"), reverse=True):
+            if path.is_dir():
+                try:
+                    path.rmdir()
+                except OSError:
+                    pass
+        try:
+            source_dir.rmdir()
+        except OSError:
+            pass
+
+    def _find_daily_file(self, row) -> str:
+        """返回日常副本；旧数据或缓存丢失时从原件自动重建。"""
+        if not row:
+            return ""
+        daily_name = row.get("daily_filename", "") or ""
+        if daily_name and _safe_serve_filename(daily_name):
+            daily_path = self._cfg.derivative_dir / daily_name
+            if daily_path.is_file() and row.get("daily_profile") == DAILY_COPY_VERSION:
+                return str(daily_path)
+        source = self._find_meme_file_for_row(row)
+        if not source:
+            return ""
+        try:
+            with guarded_read():
+                result = create_daily_copy(
+                    source,
+                    self._cfg.derivative_dir,
+                    row.get("file_hash", "") or Path(source).stem,
+                )
+            get_db().set_daily_asset(
+                row["id"],
+                result["filename"],
+                result["file_size"],
+                result["mime_type"],
+                result["profile"],
+            )
+            if (
+                daily_name
+                and daily_name != result["filename"]
+                and _safe_serve_filename(daily_name)
+            ):
+                try:
+                    (self._cfg.derivative_dir / daily_name).unlink(missing_ok=True)
+                except OSError as cleanup_error:
+                    logger.warning(
+                        "old daily copy cleanup failed %s: %s",
+                        daily_name,
+                        cleanup_error,
+                    )
+            return str(self._cfg.derivative_dir / result["filename"])
+        except Exception as e:
+            logger.warning("daily copy failed %s: %s", row.get("filename", ""), e)
+            return source
 
     def _do_import(self, file_paths, names=None, progress_cb=None):
         import shutil
@@ -3486,6 +5067,10 @@ class WebUI:
         cfg = get_config()
         db = get_db()
         cache_dir = cfg.cache_dir
+        derivative_dir = getattr(
+            cfg, "derivative_dir", Path(cfg.data_dir) / "derivatives"
+        )
+        derivative_dir.mkdir(parents=True, exist_ok=True)
         imported = 0
         rejected = 0
         skipped_dup = 0
@@ -3516,8 +5101,9 @@ class WebUI:
                         fsize = 0
                     if HAS_PIL:
                         try:
-                            with PILImage.open(path) as img:
-                                w, h = img.size
+                            with guarded_read():
+                                with PILImage.open(path) as img:
+                                    w, h = img.size
                         except Exception:
                             pass
                     if fsize > _IMPORT_MAX_BYTES or max(w, h) > _IMPORT_MAX_PX:
@@ -3536,19 +5122,38 @@ class WebUI:
                             skipped_dup += 1
                             continue
                         dst = cache_dir / f"{fhash[:16]}{ext}"
-                        shutil.copy2(path, dst)
-                        db.add_meme(
-                            filename=dst.name,
-                            file_hash=fhash,
-                            width=w,
-                            height=h,
-                            file_size=fsize,
-                            mime_type=f"image/{ext[1:]}" if ext else "image/png",
-                            original_name=oname,
-                            stego_of_hash=stego_of_hash,
-                            from_stego=from_stego,
-                            perceptual_hash=src_phash,
-                        )
+                        daily = None
+                        try:
+                            with guarded_read():
+                                shutil.copy2(path, dst)
+                                daily = create_daily_copy(path, derivative_dir, fhash)
+                            db.add_meme(
+                                filename=dst.name,
+                                file_hash=fhash,
+                                width=w,
+                                height=h,
+                                file_size=fsize,
+                                mime_type=(f"image/{ext[1:]}" if ext else "image/png"),
+                                original_name=oname,
+                                stego_of_hash=stego_of_hash,
+                                from_stego=from_stego,
+                                perceptual_hash=src_phash,
+                                daily_filename=daily["filename"],
+                                daily_file_size=daily["file_size"],
+                                daily_mime_type=daily["mime_type"],
+                                daily_profile=daily["profile"],
+                            )
+                        except Exception:
+                            try:
+                                dst.unlink()
+                            except OSError:
+                                pass
+                            if daily:
+                                try:
+                                    (derivative_dir / daily["filename"]).unlink()
+                                except OSError:
+                                    pass
+                            raise
                         row = db.get_by_hash(fhash)
                         if row:
                             imported_ids.append(row["id"])
@@ -3759,15 +5364,20 @@ class WebUI:
 
         @app.route("/api/original/<meme_id>/<filename>")
         def serve_original(meme_id, filename):
-            path = self._find_meme_file(filename)
+            row = get_db().get_by_id(int(meme_id))
+            if not row or row["filename"] != filename:
+                bottle.response.status = 404
+                return ""
+            path = self._find_daily_file(row)
             if path:
-                ext = os.path.splitext(filename)[1].lower()
+                ext = os.path.splitext(path)[1].lower()
                 ctype = {
                     ".png": "image/png",
                     ".jpg": "image/jpeg",
                     ".jpeg": "image/jpeg",
                     ".gif": "image/gif",
                     ".webp": "image/webp",
+                    ".bmp": "image/bmp",
                 }.get(ext, "application/octet-stream")
                 return bottle.static_file(
                     os.path.basename(path), root=os.path.dirname(path), mimetype=ctype
@@ -3794,6 +5404,13 @@ class WebUI:
                     import uuid
 
                     raw = base64.b64decode(b64)
+                    if len(raw) > _IMPORT_MAX_BYTES:
+                        bottle.response.status = 413
+                        return {
+                            "ok": False,
+                            "error": "图片超过 %d MiB 原件上限"
+                            % (_IMPORT_MAX_BYTES // (1024 * 1024)),
+                        }
                     tmp = str(self._cfg.cache_dir / f"_upload_{uuid.uuid4().hex}{ext}")
                     with open(tmp, "wb") as f:
                         f.write(raw)
@@ -3870,13 +5487,30 @@ class WebUI:
         if not cache_dir.exists():
             logger.debug(f"scan_cache: cache dir not found {cache_dir}")
             return
-        for root, _, files in os.walk(cache_dir):
+        for root, dirs, files in os.walk(cache_dir):
+            if Path(root) == Path(cache_dir):
+                dirs[:] = [
+                    item
+                    for item in dirs
+                    if item.casefold() != CHAT_RECORD_MEDIA_DIRNAME.casefold()
+                ]
+            try:
+                relative_parts = Path(root).relative_to(cache_dir).parts
+            except ValueError:
+                relative_parts = ()
+            if any(part.lower() == "thumbnails" for part in relative_parts):
+                continue
+            try:
+                category_id = db.ensure_category_path(relative_parts)
+            except ValueError:
+                logger.warning("scan_cache skip invalid category path: %s", root)
+                continue
             for fname in files:
                 ext = os.path.splitext(fname)[1].lower()
                 if ext not in allowed_ext:
                     continue
                 fpath = os.path.join(root, fname)
-                if "thumbnails" in fpath:
+                if "thumbnails" in fpath.lower():
                     continue
                 # 跳过由 WebP 动图自动生成的 GIF（同名 .webp 存在即为生成物）
                 stem = os.path.splitext(fname)[0]
@@ -3885,22 +5519,24 @@ class WebUI:
                 if db.get_by_filename(fname):
                     continue
                 try:
-                    fsize = os.path.getsize(fpath)
-                    w = h = 0
-                    if HAS_PIL:
-                        try:
-                            with PILImage.open(fpath) as img:
-                                w, h = img.size
-                        except Exception:
-                            pass
-                    if fsize > _IMPORT_MAX_BYTES or max(w, h) > _IMPORT_MAX_PX:
-                        logger.info("scan_cache skip (over limit): %s", fname)
-                        continue
-                    sha256 = hashlib.sha256()
-                    with open(fpath, "rb") as f:
-                        for chunk in iter(lambda: f.read(65536), b""):
-                            sha256.update(chunk)
-                    fhash = sha256.hexdigest()
+                    with guarded_read():
+                        fsize = os.path.getsize(fpath)
+                        w = h = 0
+                        if HAS_PIL:
+                            try:
+                                with PILImage.open(fpath) as img:
+                                    w, h = img.size
+                            except Exception:
+                                pass
+                        if fsize > _IMPORT_MAX_BYTES or max(w, h) > _IMPORT_MAX_PX:
+                            logger.info("scan_cache skip (over limit): %s", fname)
+                            continue
+                        sha256 = hashlib.sha256()
+                        with open(fpath, "rb") as f:
+                            for chunk in iter(lambda: f.read(65536), b""):
+                                sha256.update(chunk)
+                        fhash = sha256.hexdigest()
+                        phash = _perceptual_hash_path(fpath)
                     if db.get_by_hash(fhash):
                         continue
                     mime = f"image/{ext[1:]}" if ext else "image/png"
@@ -3913,7 +5549,8 @@ class WebUI:
                         file_size=fsize,
                         mime_type=mime,
                         original_name=oname,
-                        perceptual_hash=_perceptual_hash_path(fpath),
+                        perceptual_hash=phash,
+                        category_id=category_id,
                     )
                     added += 1
                 except Exception as e:
@@ -3953,6 +5590,12 @@ class WebUI:
             easy_drag=False,
             hidden=self._silent_start,
         )
+        if platform.system() == "Windows":
+            # frameless=True 会让 WinForms 去掉系统最小化样式；窗口显示后补回，
+            # 使任务栏按钮在窗口位于前台时可以再次点击并最小化。
+            self._window.events.shown += lambda: _enable_windows_taskbar_minimize(
+                self._window
+            )
         self._visible = not self._silent_start
 
         self._started = True
@@ -4044,6 +5687,14 @@ class WebUI:
             pass
 
     def stop(self):
+        from .library_events import set_change_callback
+
+        set_change_callback(None)
+        with self._library_refresh_lock:
+            timer = self._library_refresh_timer
+            self._library_refresh_timer = None
+        if timer is not None:
+            timer.cancel()
         self._save_window_position()
         if self._window:
             try:

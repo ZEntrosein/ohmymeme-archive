@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, watch, nextTick } from 'vue'
+import { computed, ref, watch, nextTick } from 'vue'
 import type { MenuItem, MenuTrigger } from '../composables/useContextMenu'
 
 const props = defineProps<{
@@ -23,8 +23,27 @@ const emit = defineEmits<{
 
 const menuEl = ref<HTMLElement>()
 const submenuEl = ref<HTMLElement>()
+const submenuSearchEl = ref<HTMLInputElement>()
 const pos = ref({ x: props.x, y: props.y })
 const subPos = ref({ x: props.submenuX, y: props.submenuY })
+const submenuQuery = ref('')
+
+const submenuSearchable = computed(() =>
+  props.submenuItems.some(item => item.action.startsWith('subgroup-')),
+)
+
+const filteredSubmenuItems = computed(() => {
+  const query = submenuQuery.value.trim().toLocaleLowerCase()
+  if (!query) return props.submenuItems
+  return props.submenuItems.filter(item => (
+    item.action === '__new-subgroup__'
+    || item.label.toLocaleLowerCase().includes(query)
+  ))
+})
+
+const hasMatchingCollection = computed(() =>
+  filteredSubmenuItems.value.some(item => item.action.startsWith('subgroup-')),
+)
 
 // 把菜单位置钳制在窗口可见范围内（越界时翻转/内移）
 function clamp(el: HTMLElement | undefined, x: number, y: number) {
@@ -56,6 +75,13 @@ watch(() => [props.submenuVisible, props.submenuItems, props.submenuX, props.sub
   }
 })
 
+watch(() => props.submenuVisible, async visible => {
+  submenuQuery.value = ''
+  if (!visible || !submenuSearchable.value) return
+  await nextTick()
+  submenuSearchEl.value?.focus()
+})
+
 // 点击子菜单项切换展开/收起；子菜单位于该项右缘，避免锚在鼠标点漂移
 function onItemClick(e: MouseEvent, item: MenuItem) {
   if (item.action === 'add-to-subgroup') {
@@ -68,6 +94,24 @@ function onItemClick(e: MouseEvent, item: MenuItem) {
     return
   }
   emit('action', item.action, {} as MenuTrigger)
+}
+
+function onSubmenuSearchKeydown(e: KeyboardEvent) {
+  if (e.key === 'Escape') {
+    e.preventDefault()
+    e.stopPropagation()
+    if (submenuQuery.value) submenuQuery.value = ''
+    else emit('hide-submenu')
+    return
+  }
+  if (e.key !== 'Enter') return
+  const first = filteredSubmenuItems.value.find(
+    item => item.action.startsWith('subgroup-') && !item.disabled,
+  )
+  if (!first) return
+  e.preventDefault()
+  e.stopPropagation()
+  emit('action', first.action, {} as MenuTrigger)
 }
 </script>
 
@@ -86,14 +130,37 @@ function onItemClick(e: MouseEvent, item: MenuItem) {
       </button>
     </div>
     <div v-if="submenuVisible" ref="submenuEl" class="ctx-submenu" :style="{ left: subPos.x + 'px', top: subPos.y + 'px' }">
-      <button
-        v-for="item in submenuItems"
-        :key="item.action"
-        class="ctx-item"
-        @click.stop="onItemClick($event, item)"
-      >
-        {{ item.label }}
-      </button>
+      <div v-if="submenuSearchable" class="ctx-submenu-search" @click.stop>
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <circle cx="11" cy="11" r="7" />
+          <path d="m20 20-4-4" />
+        </svg>
+        <input
+          ref="submenuSearchEl"
+          v-model="submenuQuery"
+          type="search"
+          placeholder="搜索分组..."
+          aria-label="搜索分组"
+          autocomplete="off"
+          spellcheck="false"
+          @keydown="onSubmenuSearchKeydown"
+        >
+      </div>
+      <div class="ctx-submenu-options">
+        <button
+          v-for="item in filteredSubmenuItems"
+          :key="item.action"
+          class="ctx-item"
+          :class="{ disabled: item.disabled }"
+          :disabled="item.disabled"
+          @click.stop="onItemClick($event, item)"
+        >
+          {{ item.label }}
+        </button>
+        <div v-if="submenuSearchable && !hasMatchingCollection" class="ctx-submenu-empty">
+          没有匹配的分组
+        </div>
+      </div>
     </div>
   </div>
 </template>
@@ -119,9 +186,66 @@ function onItemClick(e: MouseEvent, item: MenuItem) {
 
 /* 子菜单列出全部分组树时可能超过视口高度，需可滚动 */
 .ctx-submenu {
+  width: min(260px, calc(100vw - 8px));
   max-height: 60vh;
-  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  box-sizing: border-box;
+  overflow: hidden;
   scrollbar-width: thin;
+}
+
+.ctx-submenu-search {
+  position: relative;
+  flex: 0 0 auto;
+  padding: 4px 4px 7px;
+  border-bottom: 1px solid var(--border);
+}
+
+.ctx-submenu-search svg {
+  position: absolute;
+  left: 13px;
+  top: 50%;
+  width: 14px;
+  height: 14px;
+  transform: translateY(-58%);
+  fill: none;
+  stroke: var(--muted);
+  stroke-width: 2;
+  stroke-linecap: round;
+  pointer-events: none;
+}
+
+.ctx-submenu-search input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 7px 9px 7px 30px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  outline: none;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: inherit;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.ctx-submenu-search input:focus { border-color: var(--primary); }
+
+.ctx-submenu-search input::-webkit-search-cancel-button { cursor: pointer; }
+
+.ctx-submenu-options {
+  min-height: 0;
+  overflow-y: auto;
+  padding-top: 3px;
+  scrollbar-width: thin;
+}
+
+.ctx-submenu-empty {
+  padding: 10px 12px;
+  color: var(--muted);
+  font-size: 11px;
+  text-align: center;
 }
 
 @keyframes ctxFadeIn {

@@ -3,7 +3,8 @@
 包结构（ZIP_STORED 不压缩，图片本身已是压缩格式）：
 - db/memes.db        sqlite backup API 导出的一致性快照
 - meme-index.json    打包时的远端同步清单（供人工核对，恢复以 memes.db 为准）
-- files/<文件名>     cache_dir 全部原图（文件名即 hash 前缀，跨机稳定）
+- files/<类别路径>/<文件名>  cache_dir 全部原图与聊天记录媒体；聊天记录媒体
+  保留独立目录及逐记录子目录，旧备份仍可使用根目录表情文件
 - backup.json        包内清单（app 版本/导出时间/文件数，恢复时校验完整性）
 """
 
@@ -14,15 +15,17 @@ import time
 import zipfile
 from pathlib import Path
 
+from .bulk_read import guarded_read
+from .category_storage import validate_category_name
+from .config import resolve_path
+
 BACKUP_PREFIX = "OhMyMeme-backup-"
 BACKUP_SUFFIX = ".zip"
 INFO_NAME = "backup.json"
 
 # 恢复安全限制：备份 ZIP 来自用户选择的文件，需防御损坏/恶意包耗尽资源
 RESTORE_MAX_MEMBERS = 100_000
-RESTORE_MAX_MEMBER_BYTES = (
-    64 * 1024 * 1024
-)  # 单成员 64MB（导入链路上限 20MiB，留足余量）
+RESTORE_MAX_MEMBER_BYTES = 256 * 1024 * 1024  # 单成员 256MB（原件硬上限 200MiB）
 RESTORE_MAX_TOTAL_BYTES = 20 * 1024 * 1024 * 1024  # 总解压体积 20GB
 
 
@@ -40,15 +43,15 @@ def get_backup_dir(cfg):
     return Path(cfg.data_dir) / "backups"
 
 
-def validate_backup_dir(path, cache_dir) -> tuple:
+def validate_backup_dir(path, cache_dir, allow_unresolved=False) -> tuple:
     """备份目录不得与表情包存储目录相同或互为嵌套。
 
     否则 create_backup 遍历 cache_dir 时会把备份 ZIP 打进后续备份（递归
     自包含、体积滚雪球），restore 也会把旧 ZIP 当普通文件拷回缓存目录。
     返回 (ok, error)。
     """
-    p = Path(path).resolve()
-    c = Path(cache_dir).resolve()
+    p = resolve_path(path, allow_unresolved)
+    c = resolve_path(cache_dir, allow_unresolved)
     if p == c or p in c.parents or c in p.parents:
         return False, "备份目录不能与表情包存储目录相同或互为嵌套"
     return True, ""
@@ -59,12 +62,23 @@ def _iter_image_files(cache_dir: Path):
     for root, dirs, files in os.walk(cache_dir):
         dirs[:] = [d for d in dirs if d != "thumbnails"]
         for name in files:
+            if name.endswith((".tmp", ".migrating")):
+                continue
             yield Path(root) / name
 
 
-def create_backup(backup_dir, data_dir, cache_dir, db, progress_cb=None) -> dict:
+def create_backup(
+    backup_dir,
+    data_dir,
+    cache_dir,
+    db,
+    progress_cb=None,
+    allow_unresolved=False,
+) -> dict:
     """创建全量备份 ZIP，返回 {ok, path, file_count, size}"""
-    ok, err = validate_backup_dir(backup_dir, cache_dir)
+    ok, err = validate_backup_dir(
+        backup_dir, cache_dir, allow_unresolved=allow_unresolved
+    )
     if not ok:
         return {"ok": False, "error": err}
     backup_dir = Path(backup_dir)
@@ -101,7 +115,9 @@ def create_backup(backup_dir, data_dir, cache_dir, db, progress_cb=None) -> dict
             zf.writestr(INFO_NAME, json.dumps(info, ensure_ascii=False, indent=2))
             tick()
             for f in files:
-                zf.write(f, f"files/{f.name}")
+                rel = f.relative_to(cache_dir).as_posix()
+                with guarded_read():
+                    zf.write(f, f"files/{rel}")
                 tick()
         os.replace(tmp, final)
     except Exception:
@@ -160,11 +176,22 @@ def delete_backup(backup_dir, name: str) -> bool:
 
 
 def _validate_member(name: str) -> bool:
-    """包内图片成员名必须是 files/ 下的安全文件名"""
+    """包内图片成员名必须是 files/ 下的安全相对路径。"""
     if not name.startswith("files/") or name.endswith("/"):
         return False
     base = name[len("files/") :]
-    if not base or "/" in base or "\\" in base or base in (".", ".."):
+    parts = base.split("/")
+    if not parts or any(
+        not part or part in (".", "..") or "\\" in part for part in parts
+    ):
+        return False
+    filename = parts[-1]
+    if filename.startswith((".", "~")) or any(ord(char) < 32 for char in filename):
+        return False
+    try:
+        for category in parts[:-1]:
+            validate_category_name(category)
+    except (TypeError, ValueError):
         return False
     return True
 
@@ -226,6 +253,7 @@ def restore_backup(zip_path, data_dir, cache_dir, db, progress_cb=None) -> dict:
             files_dir.mkdir()
             for n in members:
                 target = files_dir / n[len("files/") :]
+                target.parent.mkdir(parents=True, exist_ok=True)
                 with zf.open(n) as src, open(target, "wb") as dst:
                     shutil.copyfileobj(src, dst)
                 tick()
@@ -246,8 +274,10 @@ def restore_backup(zip_path, data_dir, cache_dir, db, progress_cb=None) -> dict:
             cache_dir.mkdir(parents=True, exist_ok=True)
             added = []
             try:
-                for f in sorted(files_dir.iterdir()):
-                    target = cache_dir / f.name
+                staged_files = sorted(p for p in files_dir.rglob("*") if p.is_file())
+                for f in staged_files:
+                    target = cache_dir / f.relative_to(files_dir)
+                    target.parent.mkdir(parents=True, exist_ok=True)
                     if not target.exists():
                         added.append(target)
                     shutil.move(str(f), str(target))

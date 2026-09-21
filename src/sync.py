@@ -15,6 +15,9 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import quote, unquote, urlparse
 
+from .bulk_read import enabled as bulk_read_enabled
+from .bulk_read import guarded_read
+from .category_storage import category_dir, validate_category_name
 from .config import _IMPORT_MAX_BYTES, _IMPORT_MAX_PX, get_config
 from .database import get_db
 from .manifest import INDEX_FILENAME
@@ -755,6 +758,52 @@ def _safe_remote_fname(name: str) -> bool:
     )
 
 
+def _safe_category_parts(value):
+    """校验清单中的类别路径；旧清单没有该字段时返回根目录。"""
+    if value in (None, ""):
+        return []
+    if isinstance(value, str):
+        value = value.replace("\\", "/").split("/")
+    if not isinstance(value, (list, tuple)):
+        return None
+    result = []
+    try:
+        for part in value:
+            text = validate_category_name(part)
+            if "/" in text or "\\" in text:
+                return None
+            result.append(text)
+    except (TypeError, ValueError):
+        return None
+    return result
+
+
+def _entry_local_path(cache_dir, entry):
+    fname = entry.get("filename", "") if isinstance(entry, dict) else ""
+    if not _safe_remote_fname(fname):
+        raise ValueError("invalid manifest filename")
+    raw_parts = entry.get("category_path", []) if isinstance(entry, dict) else []
+    parts = _safe_category_parts(raw_parts)
+    if parts is None:
+        raise ValueError("invalid manifest category path")
+    return category_dir(cache_dir, parts) / fname
+
+
+def _ensure_db_category_path(db, parts):
+    ensure = getattr(db, "ensure_category_path", None)
+    if callable(ensure):
+        return ensure(parts)
+    create = getattr(db, "create_category", None)
+    if not callable(create):
+        # 兼容仍使用旧数据库适配器的调用方：没有类别能力时按根目录处理，
+        # 但不要让带 category_path 的新清单阻断其它文件同步。
+        return None
+    parent = None
+    for part in parts:
+        parent = create(part, parent)
+    return parent
+
+
 def _fetch_remote_memes(bk, remote_root):
     """下载远端 manifest 并返回 {filename: entry} 字典（无 manifest 返回 {}）"""
     cfg = get_config()
@@ -771,11 +820,14 @@ def _fetch_remote_memes(bk, remote_root):
             raise SyncError("远端 manifest 下载失败")
         raw_bytes = tmp.read_bytes()
         rdata = json.loads(raw_bytes.decode("utf-8"))
-        return {
-            m["filename"]: m
-            for m in rdata.get("memes", [])
-            if _safe_remote_fname(m.get("filename", ""))
-        }
+        result = {}
+        for m in rdata.get("memes", []):
+            if not isinstance(m, dict) or not _safe_remote_fname(m.get("filename", "")):
+                continue
+            if _safe_category_parts(m.get("category_path", [])) is None:
+                continue
+            result[m["filename"]] = m
+        return result
     except SyncError:
         raise
     except Exception as e:
@@ -797,8 +849,14 @@ def _push_worker(entries, remote_root, cache_dir, remote_memes):
     try:
         for entry in entries:
             fname = entry["filename"]
-            local_file = cache_dir / fname
-            fsize = local_file.stat().st_size if local_file.exists() else 0
+            local_file = _entry_local_path(cache_dir, entry)
+            if not local_file.exists():
+                legacy_file = cache_dir / fname
+                if legacy_file.is_file():
+                    local_file = legacy_file
+            with guarded_read():
+                local_exists = local_file.exists()
+                fsize = local_file.stat().st_size if local_exists else 0
             local_hash = entry["sha256"]
             remote_entry = remote_memes.get(fname)
             rem_path = remote_root.rstrip("/") + "/" + REMOTE_MEME_DIR + "/" + fname
@@ -811,7 +869,7 @@ def _push_worker(entries, remote_root, cache_dir, remote_memes):
                     local_results["skipped"] += 1
                     _increment_sync_progress(files_add=1)
                     continue
-            if not local_file.exists():
+            if not local_exists:
                 local_results["errors"] += 1
                 local_results["failed"].append(
                     {"filename": fname, "status": "error", "error": "本地文件缺失"}
@@ -822,7 +880,9 @@ def _push_worker(entries, remote_root, cache_dir, remote_memes):
                 # 同一批次所有文件都上传到 memes/ 目录，仅需确保一次
                 bk.ensure_remote_dir(os.path.dirname(rem_path))
                 remote_dir_ready = True
-            if bk.upload_file(local_file, rem_path):
+            with guarded_read():
+                uploaded = bk.upload_file(local_file, rem_path)
+            if uploaded:
                 local_results["uploaded"] += 1
                 local_results["bytes"] += fsize
                 _increment_sync_progress(files_add=1, bytes_add=fsize)
@@ -882,16 +942,48 @@ def _pull_worker(entries, remote_root, cache_dir, db):
                 _increment_sync_progress(files_add=1)
                 continue
             local_entry = local_idx.get(fname)
+            target_path = _entry_local_path(cache_dir, rentry)
+            category_parts = _safe_category_parts(rentry.get("category_path", [])) or []
+            category_id = _ensure_db_category_path(db, category_parts)
+            row = db.get_by_filename(fname)
+            if (
+                row
+                and not target_path.exists()
+                and local_entry
+                and local_entry.get("sha256") == rentry.get("sha256")
+            ):
+                path_getter = getattr(db, "get_category_path_names", None)
+                old_parts = (
+                    path_getter(row.get("category_id"))
+                    if callable(path_getter)
+                    else []
+                )
+                old_path = category_dir(cache_dir, old_parts) / fname
+                if not old_path.is_file() and old_parts:
+                    legacy_path = cache_dir / fname
+                    if legacy_path.is_file():
+                        old_path = legacy_path
+                if old_path.is_file() and old_path != target_path:
+                    target_path.parent.mkdir(parents=True, exist_ok=True)
+                    os.replace(str(old_path), str(target_path))
+                    if row.get("category_id") != category_id:
+                        db.set_meme_category(row["id"], category_id)
+                    local_results["skipped"] += 1
+                    _increment_sync_progress(files_add=1)
+                    continue
             if (
                 local_entry
                 and local_entry.get("sha256") == rentry.get("sha256")
-                and (cache_dir / fname).exists()
+                and target_path.exists()
             ):
+                if row and row.get("category_id") != category_id:
+                    db.set_meme_category(row["id"], category_id)
                 local_results["skipped"] += 1
                 _increment_sync_progress(files_add=1)
                 continue
             rem_path = remote_root.rstrip("/") + "/" + REMOTE_MEME_DIR + "/" + fname
-            local_path = cache_dir / fname
+            local_path = target_path
+            local_path.parent.mkdir(parents=True, exist_ok=True)
             fsize = rentry.get("file_size", 0)
             if bk.download_file(rem_path, local_path):
                 if local_path.stat().st_size == 0:
@@ -906,7 +998,6 @@ def _pull_worker(entries, remote_root, cache_dir, db):
                     except Exception:
                         pass
                     continue
-                row = db.get_by_filename(fname)
                 if not row:
                     try:
                         ext = os.path.splitext(fname)[1].lower()
@@ -930,15 +1021,23 @@ def _pull_worker(entries, remote_root, cache_dir, db):
                                 pass
                             continue
                         oname = rentry.get("name", "") or os.path.splitext(fname)[0]
-                        db.add_meme(
-                            filename=fname,
-                            file_hash=rentry.get("sha256", ""),
-                            width=w,
-                            height=h,
-                            file_size=fsize,
-                            mime_type="image/%s" % ext[1:] if ext else "image/png",
-                            original_name=oname,
-                        )
+                        meme_kwargs = {
+                            "filename": fname,
+                            "file_hash": rentry.get("sha256", ""),
+                            "width": w,
+                            "height": h,
+                            "file_size": fsize,
+                            "mime_type": "image/%s" % ext[1:] if ext else "image/png",
+                            "original_name": oname,
+                            "category_id": category_id,
+                        }
+                        try:
+                            db.add_meme(**meme_kwargs)
+                        except TypeError as add_error:
+                            if "category_id" not in str(add_error):
+                                raise
+                            meme_kwargs.pop("category_id", None)
+                            db.add_meme(**meme_kwargs)
                     except Exception as e:
                         # DB 写入失败：清理残留 cache，避免“文件在但无记录”的游离态
                         logger.warning("pull db add failed %s: %s", fname, e)
@@ -956,6 +1055,20 @@ def _pull_worker(entries, remote_root, cache_dir, db):
                         except Exception:
                             pass
                         continue
+                elif row.get("category_id") != category_id:
+                    db.set_meme_category(row["id"], category_id)
+                    path_getter = getattr(db, "get_category_path_names", None)
+                    old_parts = (
+                        path_getter(row.get("category_id"))
+                        if callable(path_getter)
+                        else []
+                    )
+                    old_path = category_dir(cache_dir, old_parts) / fname
+                    if old_path != local_path and old_path.is_file():
+                        try:
+                            old_path.unlink()
+                        except OSError:
+                            pass
                 local_results["downloaded"] += 1
                 local_results["bytes"] += fsize
                 _increment_sync_progress(files_add=1, bytes_add=fsize)
@@ -1056,6 +1169,10 @@ def push(delete_remote: bool = None) -> dict:
     remote_root = _remote_root(cfg)
     cache_dir = cfg.cache_dir
     max_workers = max(1, min(8, int(cfg.get("sync_threads", 3))))
+    if bulk_read_enabled():
+        # 保护模式下不让同步 worker 并行打开挂载盘原件；guarded_read 还会
+        # 在文件之间分批暂停，降低 115/虚拟盘的瞬时请求密度。
+        max_workers = 1
     local = load_manifest()
     if not local.get("memes"):
         build_manifest()
@@ -1067,9 +1184,17 @@ def push(delete_remote: bool = None) -> dict:
     files_total = len(local["memes"])
     bytes_total = 0
     for entry in local["memes"]:
-        fp = cache_dir / entry["filename"]
-        if fp.exists():
-            bytes_total += fp.stat().st_size
+        try:
+            fp = _entry_local_path(cache_dir, entry)
+            if not fp.exists():
+                legacy_file = cache_dir / entry["filename"]
+                if legacy_file.is_file():
+                    fp = legacy_file
+        except ValueError:
+            continue
+        with guarded_read():
+            if fp.exists():
+                bytes_total += fp.stat().st_size
 
     if not _sync_run_lock.acquire(blocking=False):
         raise SyncError("同步正在进行中")
@@ -1245,6 +1370,24 @@ def _apply_remote_collections(remote_data: dict):
                 db.add_to_collection(row["id"], cid)
 
 
+def _apply_remote_categories(remote_data: dict):
+    """先创建远端清单中的空类别；具体图片类别在下载时按条目应用。"""
+    db = get_db()
+
+    def walk(items, parent_parts=()):
+        for item in items or []:
+            if not isinstance(item, dict):
+                continue
+            try:
+                parts = [*parent_parts, validate_category_name(item.get("name", ""))]
+                _ensure_db_category_path(db, parts)
+            except (TypeError, ValueError):
+                continue
+            walk(item.get("children", []), parts)
+
+    walk(remote_data.get("categories", []))
+
+
 def _apply_remote_order(remote_data: dict):
     """按远端 manifest 的 memes 顺序更新本地 sort_order，保留云端排序"""
     db = get_db()
@@ -1334,7 +1477,11 @@ def pull(remove_local: bool = None) -> dict:
                     row = db.get_by_filename(fname)
                     if row:
                         db.delete_meme(row["id"])
-                    local_path = cache_dir / fname
+                    try:
+                        local_entry = local_idx.get(fname, {"filename": fname})
+                        local_path = _entry_local_path(cache_dir, local_entry)
+                    except ValueError:
+                        local_path = cache_dir / fname
                     if local_path.exists():
                         try:
                             local_path.unlink()
@@ -1348,6 +1495,7 @@ def pull(remove_local: bool = None) -> dict:
                         except Exception:
                             pass
 
+        _apply_remote_categories(remote_data)
         _apply_remote_collections(remote_data)
         _apply_remote_order(remote_data)
         build_manifest()

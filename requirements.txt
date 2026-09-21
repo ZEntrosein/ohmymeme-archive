@@ -5,6 +5,7 @@ pywebview>=6.0.0            # WebView 现代化 UI
 pystray>=0.19.0             # 系统托盘
 pyperclip>=1.8.2            # 剪贴板
 bottle>=0.13.0              # HTTP 服务器（pywebview 依赖，也用于本地路由）
+websocket-client>=1.8.0     # NapCat / OneBot WebSocket 命令监听
 
 # 全局快捷键
 keyboard>=0.13.5

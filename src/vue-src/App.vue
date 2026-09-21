@@ -1,27 +1,33 @@
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted, computed } from 'vue'
-import { useMemes } from './composables/useMemes'
+import { tagKey, useMemes } from './composables/useMemes'
 import { useDragSort } from './composables/useDragSort'
 import { useContextMenu, type MenuItem } from './composables/useContextMenu'
 import { useCollectionBuilder, flattenCollections, type CollectionOption } from './composables/useCollectionBuilder'
 import ContextMenu from './components/ContextMenu.vue'
 import CollectionBuilder from './components/CollectionBuilder.vue'
 import CollectionTreeNode from './components/CollectionTreeNode.vue'
+import ChatRecordDetails from './components/ChatRecordDetails.vue'
 import ConfirmDialog from './components/ConfirmDialog.vue'
 import ImportMenu from './components/ImportMenu.vue'
 import ImportProgressOverlay from './components/ImportProgressOverlay.vue'
+import MemeDetails from './components/MemeDetails.vue'
+import NotionImportDialog from './components/NotionImportDialog.vue'
 import InputDialog from './components/InputDialog.vue'
 import Pager from './components/Pager.vue'
 import SimilarImportDialog from './components/SimilarImportDialog.vue'
 import SyncOverlay from './components/SyncOverlay.vue'
 import TagEditor from './components/TagEditor.vue'
 import UpdateDialog from './components/UpdateDialog.vue'
-import type { Meme } from './types'
+import type { ChatRecordSummary, Genre, Meme, TagRecord } from './types'
+import { api } from './utils/api'
 
-const { state, setMemes, search, goToPage, setSearch, toggleTag, setActiveCollection, refreshTags, refreshCollections, copyMeme, reorderMemes, canReorder, startNativeDrag, selectAllVisible, clearSelection, loadInitData } = useMemes()
+const { state, setMemes, search, goToPage, setSearch, setGenre, toggleTag, setActiveCollection, setActiveCategory, refreshTags, refreshCollections, refreshCategories, copyMeme, reorderMemes, canReorder, startNativeDrag, selectAllVisible, clearSelection, loadInitData } = useMemes()
 const ctx = useContextMenu()
 const cb = useCollectionBuilder()
 const tagEditor = ref<InstanceType<typeof TagEditor> | null>(null)
+const memeDetails = ref<InstanceType<typeof MemeDetails> | null>(null)
+const chatRecordDetails = ref<InstanceType<typeof ChatRecordDetails> | null>(null)
 const updateDialog = ref<InstanceType<typeof UpdateDialog> | null>(null)
 const inputDialog = ref<InstanceType<typeof InputDialog> | null>(null)
 const confirmDialog = ref<InstanceType<typeof ConfirmDialog> | null>(null)
@@ -95,15 +101,28 @@ onMounted(() => {
   window.refreshMemes = () => { search() }
   window.refreshTags = refreshTags
   window.refreshCollections = refreshCollections
+  window.refreshCategories = refreshCategories
+  // NapCat/LAN 等后台线程只重新查询当前筛选并回到第一页；仅结构变化才更新侧栏。
+  window.refreshLibrary = (kind = 'content') => {
+    void search()
+    if (kind === 'structure') {
+      void refreshCollections()
+      void refreshCategories()
+    }
+  }
 })
 // 网格列数由 CSS repeat(auto-fill, minmax(112px, 1fr)) 随容器宽度自适应
 
 // 当前分组（正 ID）下的子分组列表，用于网格顶部显示文件夹卡片
+const sidebarTab = ref<'collections' | 'categories'>('collections')
+const sidebarItems = computed(() => sidebarTab.value === 'categories' ? state.categories : state.collections)
+const activeSidebarId = computed(() => sidebarTab.value === 'categories' ? state.activeCategory : state.activeCollection)
+
 const folderCards = computed(() => {
-  if (!state.activeCollection || state.activeCollection < 0) return []
+  if (!activeSidebarId.value || activeSidebarId.value < 0) return []
   const find = (items: any[]): any[] => {
     for (const c of items) {
-      if (c.id === state.activeCollection) return c.children || []
+      if (c.id === activeSidebarId.value) return c.children || []
       if (c.children && c.children.length) {
         const r = find(c.children)
         if (r.length) return r
@@ -111,12 +130,12 @@ const folderCards = computed(() => {
     }
     return []
   }
-  return find(state.collections)
+  return find(sidebarItems.value)
 })
 
 // 面包屑：当前分组从「全部」到自身的祖先链
 const breadcrumb = computed(() => {
-  if (!state.activeCollection) return []
+  if (!activeSidebarId.value) return []
   const walk = (items: any[], target: number, trail: any[]): any[] | null => {
     for (const c of items) {
       if (c.id === target) return [...trail, c]
@@ -127,15 +146,15 @@ const breadcrumb = computed(() => {
     }
     return null
   }
-  const path = walk(state.collections, state.activeCollection, [])
+  const path = walk(sidebarItems.value, activeSidebarId.value, [])
   if (path) return [{ id: null, name: '全部' }, ...path]
-  const sys = state.collections.find(c => c.id === state.activeCollection)
+  const sys = sidebarItems.value.find(c => c.id === activeSidebarId.value)
   return sys ? [{ id: null, name: '全部' }, sys] : []
 })
 
 // 图标条祖先高亮：当前分组所属的顶层分组 id（用于折叠时高亮）
 const activeTopLevel = computed(() => {
-  if (!state.activeCollection || state.activeCollection < 0) return state.activeCollection
+  if (!activeSidebarId.value || activeSidebarId.value < 0) return activeSidebarId.value
   const findTop = (items: any[], target: number, inherited: number | null): number | null => {
     for (const c of items) {
       const thisTop = inherited ?? c.id
@@ -147,27 +166,87 @@ const activeTopLevel = computed(() => {
     }
     return null
   }
-  const r = findTop(state.collections, state.activeCollection, null)
-  return r != null ? r : state.activeCollection
+  const r = findTop(sidebarItems.value, activeSidebarId.value, null)
+  return r != null ? r : activeSidebarId.value
 })
 
+const tagGroups = computed(() => {
+  const groups = new Map<string, TagRecord[]>()
+  for (const tag of state.allTags) {
+    const category = tag.category || '未分类'
+    const items = groups.get(category) || []
+    items.push(tag)
+    groups.set(category, items)
+  }
+  return [...groups.entries()].map(([category, tags]) => ({ category, tags }))
+})
+
+const genreOptions: { value: Genre; label: string }[] = [
+  { value: 'all', label: '全部' },
+  { value: 'image', label: '图片' },
+  { value: 'gif', label: 'GIF' },
+  { value: 'chat_record', label: '聊天记录' },
+]
+
+function openChatRecord(record: ChatRecordSummary) {
+  if (sortEnabled.value || selectMode.value) return
+  if (ignoreChatRecordClick) { ignoreChatRecordClick = false; return }
+  chatRecordDetails.value?.open(record.id)
+}
+
+async function deleteChatRecord(recordId: number) {
+  if (!await confirmAsk('删除聊天记录', '确定删除这份聊天记录及其本地媒体吗？')) return
+  const result = await window.pywebview?.api?.delete_chat_record(recordId)
+  if (!result?.ok) {
+    showToast(result?.error || '删除失败')
+    return
+  }
+  chatRecordDetails.value?.close()
+  showToast('聊天记录已删除')
+  search()
+}
+
 function onBreadcrumbClick(id: number | null) {
-  setActiveCollection(id)
+  if (sidebarTab.value === 'categories') setActiveCategory(id)
+  else setActiveCollection(id)
+}
+
+function onSidebarSelect(id: number) {
+  if (sidebarTab.value === 'categories') setActiveCategory(id)
+  else setActiveCollection(id)
 }
 
 function onFolderCardClick(childId: number) {
-  setActiveCollection(childId)
+  if (sidebarTab.value === 'categories') setActiveCategory(childId)
+  else setActiveCollection(childId)
 }
 
 function onFolderCardContext(e: MouseEvent, childId: number, childName: string) {
   e.preventDefault()
   e.stopPropagation()
+  if (sidebarTab.value === 'categories') {
+    onCategoryRightClick(e, childId, childName)
+    return
+  }
   ctx.show([
     { action: 'delete-folder', label: '删除小分组', danger: true },
   ], { folderId: childId, folderName: childName, isFolder: true }, e.clientX, e.clientY)
 }
 
+function switchSidebarTab(tab: 'collections' | 'categories') {
+  if (sidebarTab.value === tab) return
+  sidebarTab.value = tab
+  state.activeCollection = null
+  state.activeCategory = null
+  search()
+}
+
 async function handleCopy(meme: Meme) {
+  if (longPressCopyBlock) {
+    const blocked = longPressCopyBlock.memeId === meme.id && Date.now() <= longPressCopyBlock.until
+    longPressCopyBlock = null
+    if (blocked) return
+  }
   if (ignoreClick) { ignoreClick = false; return }
   // 整理/多选模式：不复制（勾选由 drag-select 处理）
   if (sortEnabled.value || selectMode.value) return
@@ -239,15 +318,38 @@ function toggleSelect() {
 }
 
 const importMenu = ref<InstanceType<typeof ImportMenu> | null>(null)
+const notionImportDialog = ref<InstanceType<typeof NotionImportDialog> | null>(null)
 
 function showImportMenu() {
   importMenu.value?.open()
+}
+
+function showNotionImport() {
+  notionImportDialog.value?.open()
 }
 
 function onImportDone() {
   search()
   refreshTags()
   refreshCollections()
+  refreshCategories()
+}
+
+function onMemeDetailsSaved() {
+  search()
+  refreshTags()
+  refreshCollections()
+  refreshCategories()
+}
+
+function onMemeStructureCreated() {
+  refreshCollections()
+  refreshCategories()
+}
+
+async function onTagRenamed(oldName: string, newName: string) {
+  await refreshTags()
+  await search()
 }
 
 const importProgress = ref<InstanceType<typeof ImportProgressOverlay> | null>(null)
@@ -270,16 +372,22 @@ function onSyncDone() {
   search()
   refreshTags()
   refreshCollections()
+  refreshCategories()
 }
 
 function rescanCache() {
   showToast('缓存刷新中...')
   search()
   refreshCollections()
+  refreshCategories()
 }
 
 function hideWindow() {
   try { window.pywebview?.api?.hide_window() } catch (_) {}
+}
+
+function minimizeWindow() {
+  try { window.pywebview?.api?.minimize_window() } catch (_) {}
 }
 
 async function onTitlebarMouseDown(e: MouseEvent) {
@@ -324,7 +432,14 @@ function onWindowMouseUp() {
 function onMemeRightClick(e: MouseEvent, meme: Meme) {
   e.preventDefault()
   e.stopPropagation()
+  if (suppressContextMenu) {
+    const suppressed = suppressContextMenu.memeId === meme.id && Date.now() <= suppressContextMenu.until
+    if (suppressed || Date.now() > suppressContextMenu.until) suppressContextMenu = null
+    if (suppressed) return
+  }
   const items: MenuItem[] = [
+    { action: 'meme-details', label: '查看表情包详情' },
+    { action: 'copy-original', label: '复制原件' },
     { action: 'rename', label: '重命名' },
     { action: 'favorite', label: meme.favorited ? '取消收藏' : '收藏' },
     { action: 'tag', label: '打标签' },
@@ -344,6 +459,10 @@ function onMemeRightClick(e: MouseEvent, meme: Meme) {
 function onFolderRightClick(e: MouseEvent, folderId: number, folderName: string) {
   e.preventDefault()
   e.stopPropagation()
+  if (sidebarTab.value === 'categories') {
+    onCategoryRightClick(e, folderId, folderName)
+    return
+  }
   const items: MenuItem[] = [{ action: 'rename-collection', label: '重命名' }]
   if (folderId === -3) {
     items.push({ action: 'clear-recent', label: '清空最近使用', danger: true })
@@ -352,6 +471,20 @@ function onFolderRightClick(e: MouseEvent, folderId: number, folderName: string)
     items.push({ action: 'delete-collection', label: '删除', danger: true })
   }
   ctx.show(items, { folderId, folderName, isFolder: true }, e.clientX, e.clientY)
+}
+
+function onCategoryRightClick(e: MouseEvent, categoryId: number, categoryName: string) {
+  e.preventDefault()
+  e.stopPropagation()
+  const items: MenuItem[] = []
+  if (categoryId > 0) {
+    items.push({ action: 'rename-category', label: '重命名' })
+    items.push({ action: 'new-category-child', label: '新建子类别' })
+    items.push({ action: 'delete-category', label: '删除', danger: true })
+  }
+  if (items.length) {
+    ctx.show(items, { folderId: categoryId, folderName: categoryName, isFolder: true, isCategory: true }, e.clientX, e.clientY)
+  }
 }
 
 // 右键「加入分组」子菜单：表情上下文任意视图可用，列出全部分组树（子分组带「父/子」路径）
@@ -380,6 +513,17 @@ async function onCtxAction(action: string) {
   ctx.hide()
   const t = ctx.trigger.value
   switch (action) {
+    case 'meme-details': {
+      const meme = state.memes.find(item => item.id === t.memeId)
+      if (meme) memeDetails.value?.open(meme)
+      else showToast('无法读取表情包详情')
+      break
+    }
+    case 'copy-original': {
+      const result = await window.pywebview?.api?.copy_meme_original(t.memeId)
+      showToast(result?.ok ? '原件已复制' : '复制原件失败')
+      break
+    }
     case 'rename': {
       const name = await inputDialog.value?.open('重命名', t.memeName || '')
       if (name && name !== t.memeName) { await window.pywebview?.api?.rename_meme(t.memeId, name); search() }
@@ -457,12 +601,43 @@ async function onCtxAction(action: string) {
       break
     }
     case 'delete': {
-      if (await confirmAsk('删除表情包', '确定删除这个表情包吗？')) { await window.pywebview?.api?.delete_meme(t.memeId); search(); refreshCollections(); refreshTags() }
+      if (await confirmAsk('删除表情包', '确定删除这个表情包吗？')) { await window.pywebview?.api?.delete_meme(t.memeId); search(); refreshCollections(); refreshCategories(); refreshTags() }
       break
     }
     case 'rename-collection': {
       const name = await inputDialog.value?.open('重命名分组', t.folderName || '')
       if (name && name !== t.folderName) { await window.pywebview?.api?.rename_collection(t.folderId, name); refreshCollections() }
+      break
+    }
+    case 'rename-category': {
+      const name = await inputDialog.value?.open('重命名类别', t.folderName || '')
+      if (name && name !== t.folderName) {
+        const result = await window.pywebview?.api?.rename_category(t.folderId, name)
+        if (result?.ok) { showToast('类别已重命名'); await refreshCategories(); search() }
+        else showToast(result?.error || '重命名失败')
+      }
+      break
+    }
+    case 'new-category-root':
+    case 'new-category-child': {
+      const parentId = action === 'new-category-child' ? t.folderId : null
+      const name = await inputDialog.value?.open(parentId ? '新建子类别' : '新建类别', '', parentId ? '输入子类别名称' : '输入类别名称')
+      if (!name) break
+      const result = await window.pywebview?.api?.create_category(name, parentId)
+      if (result?.ok) { showToast('类别已创建'); await refreshCategories() }
+      else showToast(result?.error || '创建失败')
+      break
+    }
+    case 'delete-category': {
+      if (await confirmAsk('删除类别', '确定删除此类别吗？其表情包和子类别将移到上一级目录。')) {
+        const result = await window.pywebview?.api?.delete_category(t.folderId)
+        if (result?.ok) {
+          showToast('类别已删除')
+          if (state.activeCategory === t.folderId) setActiveCategory(null)
+          await refreshCategories()
+          search()
+        } else showToast(result?.error || '删除失败')
+      }
       break
     }
     case 'delete-collection': {
@@ -533,6 +708,7 @@ async function batchDelete() {
     showToast('没有删除任何表情包')
     await search(false)
     refreshCollections()
+    refreshCategories()
     refreshTags()
     return
   }
@@ -544,6 +720,7 @@ async function batchDelete() {
     await search(false)
   }
   refreshCollections()
+  refreshCategories()
   refreshTags()
 }
 
@@ -589,6 +766,7 @@ function batchMoveToCollection() {
     if (!result?.ok) { showToast(result?.error || '移动失败'); return }
     showToast(`已移动 ${result.moved ?? ids.length} 个表情包`)
     await refreshCollections()
+    await refreshCategories()
     const node = findCollectionNode(state.collections, fromId)
     if (fromId > 0 && (!node || node.count === 0) && !(node?.children || []).length) {
       const parent = findParentCollection(state.collections, fromId)
@@ -692,17 +870,55 @@ function onCardMouseLeave(meme: Meme) {
   if (img && img.dataset.thumb) img.src = img.dataset.thumb
 }
 
-let nativeDragStart: { x: number; y: number; memeId: number } | null = null
+const LONG_PRESS_MS = 500
+const LONG_PRESS_MOVE_PX = 8
+let nativeDragStart: {
+  x: number
+  y: number
+  memeId: number
+  longPressTimer: ReturnType<typeof setTimeout> | null
+} | null = null
+let chatRecordDragStart: { x: number; y: number; recordId: number } | null = null
 let ignoreClick = false
+let ignoreChatRecordClick = false
+let longPressCopyBlock: { memeId: number; pointerId: number; until: number } | null = null
+let suppressContextMenu: { memeId: number; until: number } | null = null
+
+// 清理尚未触发的长按计时，同时结束当前卡片手势候选
+function clearCardGesture() {
+  if (nativeDragStart?.longPressTimer) clearTimeout(nativeDragStart.longPressTimer)
+  nativeDragStart = null
+}
+
+function onChatRecordPointerDown(e: PointerEvent, record: ChatRecordSummary) {
+  if (e.button !== 0 || sortEnabled.value || selectMode.value) return
+  chatRecordDragStart = { x: e.clientX, y: e.clientY, recordId: record.id }
+  ignoreChatRecordClick = false
+}
 
 function onCardPointerDown(e: PointerEvent, meme: Meme, card: HTMLElement) {
   ignoreClick = false
+  if (longPressCopyBlock && Date.now() > longPressCopyBlock.until) longPressCopyBlock = null
+  clearCardGesture()
   if (sortEnabled.value && canReorder() && !selectMode.value) {
     drag.onPointerDown(e, meme.id, card)
     return
   }
   if (e.button !== 0 || selectMode.value) return
-  nativeDragStart = { x: e.clientX, y: e.clientY, memeId: meme.id }
+  const gesture = {
+    x: e.clientX,
+    y: e.clientY,
+    memeId: meme.id,
+    longPressTimer: null as ReturnType<typeof setTimeout> | null,
+  }
+  gesture.longPressTimer = setTimeout(() => {
+    if (nativeDragStart !== gesture) return
+    nativeDragStart = null
+    longPressCopyBlock = { memeId: meme.id, pointerId: e.pointerId, until: Date.now() + 1200 }
+    suppressContextMenu = { memeId: meme.id, until: Date.now() + 1200 }
+    memeDetails.value?.open(meme)
+  }, LONG_PRESS_MS)
+  nativeDragStart = gesture
 }
 
 function onDocPointerMove(e: PointerEvent) {
@@ -710,11 +926,42 @@ function onDocPointerMove(e: PointerEvent) {
     drag.onPointerMove(e)
     return
   }
+  if (chatRecordDragStart && !nativeDragActive) {
+    const dist = Math.hypot(
+      e.clientX - chatRecordDragStart.x,
+      e.clientY - chatRecordDragStart.y,
+    )
+    if (dist > LONG_PRESS_MOVE_PX) {
+      const recordId = chatRecordDragStart.recordId
+      chatRecordDragStart = null
+      ignoreChatRecordClick = true
+      nativeDragActive = true
+      api('start_chat_record_drag', recordId).then((result) => {
+        nativeDragActive = false
+        if (result?.cancelled) return
+        if (!result?.ok) {
+          showToast(result?.error || '聊天记录拖拽发送失败')
+          return
+        }
+        const suffix = result.degraded_media_count
+          ? `（${result.degraded_media_count} 个媒体已转为占位）`
+          : ''
+        const targetSource = result.target_source === 'napcat_plugin'
+          ? '（NapCat 会话 ID）'
+          : ''
+        showToast(`已发送到 ${result.target_label || '当前 QQ 会话'}${targetSource}${suffix}`)
+      }).catch(() => {
+        nativeDragActive = false
+        showToast('聊天记录拖拽发送失败')
+      })
+    }
+    return
+  }
   if (!nativeDragStart || sortEnabled.value || selectMode.value) return
   const dist = Math.hypot(e.clientX - nativeDragStart.x, e.clientY - nativeDragStart.y)
-  if (dist > 8) {
+  if (dist > LONG_PRESS_MOVE_PX) {
     const id = nativeDragStart.memeId
-    nativeDragStart = null
+    clearCardGesture()
     // 原生拖拽进行中置标志，回拖到窗口视为取消（不触发 drop 导入）
     nativeDragActive = true
     startNativeDrag(id).then((ok) => {
@@ -731,12 +978,19 @@ async function onDocPointerUp(e: PointerEvent) {
     if (wasActive) ignoreClick = true
     return
   }
-  nativeDragStart = null
+  if (longPressCopyBlock?.pointerId === e.pointerId) {
+    longPressCopyBlock.until = Date.now() + 800
+    suppressContextMenu = { memeId: longPressCopyBlock.memeId, until: Date.now() + 800 }
+  }
+  chatRecordDragStart = null
+  clearCardGesture()
 }
 
 function onDocPointerCancel() {
   if (drag.dragState.memeId) drag.cancel()
-  nativeDragStart = null
+  longPressCopyBlock = null
+  chatRecordDragStart = null
+  clearCardGesture()
 }
 
 function onDragEnter(e: DragEvent) {
@@ -799,13 +1053,13 @@ async function onDrop(e: DragEvent) {
   if (uri) {
     try {
       const r = await window.pywebview?.api?.download_original_image(uri)
-      if (r?.ok) { showToast('导入成功'); search(); refreshCollections(); return }
+      if (r?.ok) { showToast('导入成功'); search(); refreshCollections(); refreshCategories(); return }
       if (r?.duplicate) { showToast('该图片已存在'); return }
       if (r?.similar_pending) {
         const action = await similarImportDialog.value?.open(r.candidates || [])
         if (action) {
           const rr = await window.pywebview?.api?.resolve_similar_import(r.token, action)
-          if (rr?.ok && rr.imported) { showToast('导入成功'); search(); refreshCollections() }
+          if (rr?.ok && rr.imported) { showToast('导入成功'); search(); refreshCollections(); refreshCategories() }
           else if (rr?.ok) { showToast('已跳过该图片') }
           else { showToast(rr?.error || '处理失败') }
         }
@@ -839,14 +1093,14 @@ async function onDrop(e: DragEvent) {
         const action = await similarImportDialog.value?.open(j.candidates || [])
         if (action) {
           const rr = await window.pywebview?.api?.resolve_similar_import(j.token, action)
-          if (rr?.ok && rr.imported) { showToast('导入成功'); search(); refreshCollections() }
+          if (rr?.ok && rr.imported) { showToast('导入成功'); search(); refreshCollections(); refreshCategories() }
           else if (rr?.ok) { showToast('已跳过该图片') }
           else { showToast(rr?.error || '处理失败') }
         }
         return
       }
       if (j?.duplicate) { showToast('该图片已存在'); return }
-      if (res.ok || j?.ok) { showToast('导入成功'); search(); refreshCollections() }
+      if (res.ok || j?.ok) { showToast('导入成功'); search(); refreshCollections(); refreshCategories() }
       else { showToast(j?.error || '导入失败：服务器返回错误') }
     } catch (_) {
       showToast('导入失败：网络或服务异常')
@@ -892,6 +1146,7 @@ onUnmounted(() => {
   document.removeEventListener('keydown', onDocKeydown)
   window.removeEventListener('blur', onDocPointerCancel)
   if (updateInterval) { clearInterval(updateInterval); updateInterval = null }
+  clearCardGesture()
   hoverTimers.forEach(t => clearTimeout(t))
   hoverTimers.clear()
 })
@@ -906,6 +1161,7 @@ onUnmounted(() => {
     await search()
     await refreshTags()
     await refreshCollections()
+    await refreshCategories()
   }
   const prefersReducedMotion = !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches)
   if (state.showStartupAnimation && !prefersReducedMotion) {
@@ -947,22 +1203,51 @@ onUnmounted(() => {
         <button class="title-btn" @click="showImportMenu()">导入</button>
         <button class="title-btn" @click="rescanCache()">刷新</button>
         <button class="title-btn" @click="openSettings()">设置</button>
-        <button class="title-btn close-btn" aria-label="隐藏窗口" @click="hideWindow()">×</button>
+        <button class="title-btn window-btn" title="最小化" aria-label="最小化窗口" @click="minimizeWindow()">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 8h10" /></svg>
+        </button>
+        <button class="title-btn window-btn close-btn" title="隐藏到托盘" aria-label="隐藏到托盘" @click="hideWindow()">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8" /></svg>
+        </button>
       </div>
     </header>
 
     <div id="content">
       <aside id="sidebar" :class="{ collapsed: sidebarCollapsed }">
-        <div id="sidebar-header"><span v-if="!sidebarCollapsed">分组</span></div>
+        <div id="sidebar-header">
+          <div v-if="!sidebarCollapsed" class="sidebar-tabs" role="tablist" aria-label="浏览方式">
+            <button
+              class="sidebar-tab"
+              :class="{ active: sidebarTab === 'collections' }"
+              role="tab"
+              :aria-selected="sidebarTab === 'collections'"
+              @click="switchSidebarTab('collections')"
+            >分组</button>
+            <button
+              class="sidebar-tab"
+              :class="{ active: sidebarTab === 'categories' }"
+              role="tab"
+              :aria-selected="sidebarTab === 'categories'"
+              @click="switchSidebarTab('categories')"
+            >类别</button>
+          </div>
+          <button
+            v-if="!sidebarCollapsed && sidebarTab === 'categories'"
+            class="sidebar-add"
+            title="新建类别"
+            aria-label="新建类别"
+            @click="ctx.show([{ action: 'new-category-root', label: '新建类别' }], {}, $event.clientX, $event.clientY)"
+          >＋</button>
+        </div>
         <div id="tree">
           <CollectionTreeNode
-            v-for="c in state.collections"
+            v-for="c in sidebarItems"
             :key="c.id"
             :node="c"
-            :active-id="sidebarCollapsed ? activeTopLevel : state.activeCollection"
+            :active-id="sidebarCollapsed ? activeTopLevel : activeSidebarId"
             :depth="0"
             :collapsed="sidebarCollapsed"
-            @select="setActiveCollection"
+            @select="onSidebarSelect"
             @folder-context="onFolderRightClick"
           />
         </div>
@@ -975,23 +1260,41 @@ onUnmounted(() => {
               <line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/>
             </svg>
           </button>
-          <input id="search" type="text" placeholder="搜索表情包..." :value="state.searchQuery" @input="onSearchInput" autofocus spellcheck="false">
+          <input id="search" type="text" placeholder="搜索图片、GIF 或聊天记录..." :value="state.searchQuery" @input="onSearchInput" autofocus spellcheck="false">
           <button v-if="state.searchQuery" class="search-clear" title="清除搜索" aria-label="清除搜索" @click="clearSearch">×</button>
         </div>
 
         <div id="tagbar">
-          <span
-            v-for="tag in state.allTags"
-            :key="tag"
-            class="tag"
-            :class="{ active: state.activeTags.has(tag) }"
-            role="button"
-            tabindex="0"
-            :aria-pressed="state.activeTags.has(tag)"
-            @click="toggleTag(tag)"
-            @keydown.enter.prevent="toggleTag(tag)"
-            @keydown.space.prevent="toggleTag(tag)"
-          >{{ tag }}</span>
+          <div class="tag-group genre-group">
+            <span class="tag-category">体裁</span>
+            <span
+              v-for="item in genreOptions"
+              :key="item.value"
+              class="tag genre-tag"
+              :class="{ active: state.activeGenre === item.value }"
+              role="button"
+              tabindex="0"
+              :aria-pressed="state.activeGenre === item.value"
+              @click="setGenre(item.value)"
+              @keydown.enter.prevent="setGenre(item.value)"
+              @keydown.space.prevent="setGenre(item.value)"
+            >{{ item.label }}</span>
+          </div>
+          <div v-for="group in tagGroups" :key="group.category" class="tag-group">
+            <span class="tag-category">{{ group.category }}</span>
+            <span
+              v-for="tag in group.tags"
+              :key="tagKey(tag)"
+              class="tag"
+              :class="{ active: state.activeTags.has(tagKey(tag)) }"
+              role="button"
+              tabindex="0"
+              :aria-pressed="state.activeTags.has(tagKey(tag))"
+              @click="toggleTag(tag)"
+              @keydown.enter.prevent="toggleTag(tag)"
+              @keydown.space.prevent="toggleTag(tag)"
+            >{{ tag.name }}</span>
+          </div>
         </div>
 
         <div v-if="breadcrumb.length > 1" id="breadcrumb">
@@ -1031,7 +1334,7 @@ onUnmounted(() => {
               :data-folder-id="child.id"
               role="button"
               tabindex="0"
-              :aria-label="'打开分组 ' + child.name"
+              :aria-label="'打开' + (sidebarTab === 'categories' ? '类别 ' : '分组 ') + child.name"
               @click="onFolderCardClick(child.id)"
               @contextmenu="onFolderCardContext($event, child.id, child.name)"
               @keydown.enter.prevent="onFolderCardClick(child.id)"
@@ -1041,6 +1344,31 @@ onUnmounted(() => {
                 <svg viewBox="0 0 24 24" width="32" height="32" fill="none" stroke="var(--accent)" stroke-width="1.5"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
                 <span class="folder-name">{{ child.name }}</span>
               </div>
+            </div>
+          </div>
+
+          <div v-if="state.chatRecords.length" class="meme-grid chat-record-grid">
+            <div
+              v-for="record in state.chatRecords"
+              :key="'chat-' + record.id"
+              class="meme-card chat-record-card"
+              role="button"
+              tabindex="0"
+              :aria-label="'查看聊天记录 ' + record.title"
+              title="点击查看详情；拖到 QQ 当前聊天窗口直接发送"
+              @click="openChatRecord(record)"
+              @pointerdown="onChatRecordPointerDown($event, record)"
+              @keydown.enter.prevent="openChatRecord(record)"
+              @keydown.space.prevent="openChatRecord(record)"
+            >
+              <div class="chat-record-preview">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
+                  <path d="M4 4h16v12H7l-3 3V4z"/><path d="M8 8h8M8 12h5"/>
+                </svg>
+                <span class="chat-record-count">{{ record.node_count }} 条消息</span>
+              </div>
+              <span class="genre-badge">聊天记录</span>
+              <span class="meme-name">{{ record.title }}</span>
             </div>
           </div>
 
@@ -1100,13 +1428,13 @@ onUnmounted(() => {
             </TransitionGroup>
           </drag-select>
 
-          <div v-if="state.memes.length === 0 && !state.loading" id="empty">
+          <div v-if="state.memes.length === 0 && state.chatRecords.length === 0 && !state.loading" id="empty">
             <svg class="empty-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
               <path d="M3 7a2 2 0 0 1 2-2h4l2 3h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z"/>
               <path d="M8.5 13.5h7M8.5 16.5h4.5"/>
             </svg>
-            <div class="text">还没有表情包</div>
-            <button class="btn btn-primary" @click="showImportMenu()">导入表情包</button>
+            <div class="text">没有符合条件的内容</div>
+            <button v-if="state.activeGenre !== 'chat_record'" class="btn btn-primary" @click="showImportMenu()">导入表情包</button>
           </div>
         </div>
       </div>
@@ -1114,9 +1442,21 @@ onUnmounted(() => {
   </div>
 
   <CollectionBuilder />
-  <ImportMenu ref="importMenu" @imported="onImportDone" @importing="onImporting" />
+  <ImportMenu ref="importMenu" @imported="onImportDone" @importing="onImporting" @notion="showNotionImport" />
   <ImportProgressOverlay ref="importProgress" @imported="onImportDone" />
+  <NotionImportDialog ref="notionImportDialog" @imported="onImportDone" />
   <SyncOverlay ref="syncOverlay" @synced="onSyncDone" />
+  <MemeDetails
+    ref="memeDetails"
+    @saved="onMemeDetailsSaved"
+    @tag-renamed="onTagRenamed"
+    @structure-created="onMemeStructureCreated"
+  />
+  <ChatRecordDetails
+    ref="chatRecordDetails"
+    @copied="showToast('发送命令已复制')"
+    @request-delete="deleteChatRecord"
+  />
   <TagEditor ref="tagEditor" />
   <UpdateDialog ref="updateDialog" />
   <InputDialog ref="inputDialog" />

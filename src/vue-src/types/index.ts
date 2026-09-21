@@ -12,6 +12,23 @@ export interface Meme {
   favorited?: boolean
   auto_play_gif?: boolean
   hover_to_play?: boolean
+  genre?: 'image' | 'gif'
+}
+
+export type Genre = 'all' | 'image' | 'gif' | 'chat_record'
+
+export interface ChatRecordSummary {
+  id: number
+  title: string
+  node_count: number
+  record_count: number
+  message_type: string
+  peer_id: string
+  source_message_id: string
+  source_message_seq: string
+  created_at: string
+  updated_at: string
+  genre: 'chat_record'
 }
 
 export interface Collection {
@@ -22,9 +39,14 @@ export interface Collection {
   children?: Collection[]
 }
 
-export interface Tag {
+export interface TagRecord {
+  id?: number
   name: string
-  count: number
+  category: string
+}
+
+export interface Category extends Collection {
+  path?: string
 }
 
 export interface Page<T> {

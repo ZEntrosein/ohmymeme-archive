@@ -1,14 +1,17 @@
 """SQLite元数据管理 - 零依赖"""
 
+import json
 import re
 import sqlite3
 import threading
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
-from .config import get_config
+from .category_storage import validate_category_name
+from .config import CHAT_RECORD_MEDIA_DIRNAME, get_config
 
 _lazy_pinyin = None
+_UNSET = object()
 
 # 备份恢复候选库预校验所需的表与列（backup.prepare_restore_source 使用）
 _RESTORE_REQUIRED_TABLES = (
@@ -34,6 +37,9 @@ _RESTORE_REQUIRED_FOREIGN_KEYS = {
     "favorites": {("meme_id", "memes", "id", "CASCADE")},
     "recent_uses": {("meme_id", "memes", "id", "CASCADE")},
     "collections": {("parent_id", "collections", "id", "CASCADE")},
+    "categories": {("parent_id", "categories", "id", "CASCADE")},
+    "memes": {("category_id", "categories", "id", "SET NULL")},
+    "notion_sources": {("meme_id", "memes", "id", "CASCADE")},
 }
 _RESTORE_REQUIRED_COLUMNS = {
     "memes": {
@@ -49,15 +55,47 @@ _RESTORE_REQUIRED_COLUMNS = {
         "stego_of_hash",
         "from_stego",
         "perceptual_hash",
+        "ai_description",
+        "ai_ocr_text",
+        "manual_description",
+        "manual_ocr_text",
+        "category_id",
         "created_at",
         "updated_at",
     },
-    "tags": {"id", "name"},
+    "tags": {"id", "name", "category"},
     "meme_tags": {"meme_id", "tag_id"},
     "collections": {"id", "name", "parent_id", "sort_order"},
+    "categories": {"id", "name", "parent_id", "sort_order"},
     "meme_collections": {"meme_id", "collection_id", "sort_order"},
     "favorites": {"meme_id", "added_at"},
     "recent_uses": {"meme_id", "used_at"},
+    "notion_sources": {
+        "id",
+        "meme_id",
+        "data_source_id",
+        "page_id",
+        "property_id",
+        "file_index",
+        "file_name",
+        "page_last_edited_time",
+        "created_at",
+        "updated_at",
+    },
+    "chat_records": {
+        "id",
+        "account_id",
+        "source_message_id",
+        "source_message_seq",
+        "message_type",
+        "peer_id",
+        "title",
+        "node_count",
+        "record_count",
+        "package_json",
+        "created_at",
+        "updated_at",
+    },
 }
 
 
@@ -110,7 +148,8 @@ class MemeDB:
     def _init_db(self):
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         conn = self._get_conn()
-        conn.executescript("""
+        conn.executescript(
+            """
             CREATE TABLE IF NOT EXISTS memes (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
                 filename    TEXT    NOT NULL,
@@ -124,13 +163,25 @@ class MemeDB:
                 stego_of_hash TEXT DEFAULT NULL,
                 from_stego  INTEGER DEFAULT 0,
                 perceptual_hash TEXT DEFAULT NULL,
+                ai_description TEXT NOT NULL DEFAULT '',
+                ai_ocr_text TEXT NOT NULL DEFAULT '',
+                manual_description TEXT NOT NULL DEFAULT '',
+                manual_ocr_text TEXT NOT NULL DEFAULT '',
+                category_id INTEGER DEFAULT NULL
+                            REFERENCES categories(id) ON DELETE SET NULL,
+                daily_filename TEXT NOT NULL DEFAULT '',
+                daily_file_size INTEGER DEFAULT 0,
+                daily_mime_type TEXT NOT NULL DEFAULT '',
+                daily_profile INTEGER DEFAULT 0,
                 created_at  TEXT    NOT NULL DEFAULT (datetime('now','localtime')),
                 updated_at  TEXT    NOT NULL DEFAULT (datetime('now','localtime'))
             );
 
             CREATE TABLE IF NOT EXISTS tags (
-                id   INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT    NOT NULL UNIQUE COLLATE NOCASE
+                id       INTEGER PRIMARY KEY AUTOINCREMENT,
+                name     TEXT NOT NULL COLLATE NOCASE,
+                category TEXT NOT NULL DEFAULT '' COLLATE NOCASE,
+                UNIQUE (category, name)
             );
 
             CREATE TABLE IF NOT EXISTS meme_tags (
@@ -155,6 +206,14 @@ class MemeDB:
                 PRIMARY KEY (meme_id, collection_id)
             );
 
+            CREATE TABLE IF NOT EXISTS categories (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                name        TEXT NOT NULL COLLATE NOCASE,
+                parent_id   INTEGER DEFAULT NULL
+                            REFERENCES categories(id) ON DELETE CASCADE,
+                sort_order  INTEGER DEFAULT 0
+            );
+
             CREATE TABLE IF NOT EXISTS favorites (
                 meme_id   INTEGER PRIMARY KEY REFERENCES memes(id) ON DELETE CASCADE,
                 added_at  TEXT NOT NULL DEFAULT (datetime('now','localtime'))
@@ -166,19 +225,173 @@ class MemeDB:
                 PRIMARY KEY (meme_id)
             );
 
+            CREATE TABLE IF NOT EXISTS notion_sources (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                meme_id     INTEGER NOT NULL REFERENCES memes(id) ON DELETE CASCADE,
+                data_source_id TEXT NOT NULL,
+                page_id     TEXT NOT NULL,
+                property_id TEXT NOT NULL,
+                file_index  INTEGER NOT NULL,
+                file_name   TEXT NOT NULL DEFAULT '',
+                page_last_edited_time TEXT NOT NULL DEFAULT '',
+                created_at  TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+                updated_at  TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+                UNIQUE (data_source_id, page_id, property_id, file_index, file_name)
+            );
+
+            CREATE TABLE IF NOT EXISTS chat_records (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_id  TEXT NOT NULL,
+                source_message_id TEXT NOT NULL,
+                source_message_seq TEXT NOT NULL DEFAULT '',
+                message_type TEXT NOT NULL DEFAULT '',
+                peer_id     TEXT NOT NULL DEFAULT '',
+                title       TEXT NOT NULL DEFAULT '',
+                node_count  INTEGER NOT NULL DEFAULT 0,
+                record_count INTEGER NOT NULL DEFAULT 0,
+                package_json TEXT NOT NULL,
+                created_at  TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+                updated_at  TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+                UNIQUE (account_id, source_message_id)
+            );
+
             CREATE INDEX IF NOT EXISTS idx_memes_hash ON memes(file_hash);
             CREATE INDEX IF NOT EXISTS idx_memes_name ON memes(filename);
             CREATE INDEX IF NOT EXISTS idx_recent_uses_at ON recent_uses(used_at);
-        """)
+            CREATE INDEX IF NOT EXISTS idx_notion_sources_meme
+                ON notion_sources(meme_id);
+            CREATE INDEX IF NOT EXISTS idx_chat_records_updated
+                ON chat_records(updated_at DESC);
+        """
+        )
         self._migrate(conn)
 
     def _migrate(self, conn):
         """迁移旧表：添加可能缺失的列并补建依赖新列的索引（幂等，可重复执行）"""
+        # 来源映射单独建表，使旧数据库与旧备份恢复后都能自动获得该能力。
+        conn.executescript(
+            """
+                CREATE TABLE IF NOT EXISTS categories (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name        TEXT NOT NULL COLLATE NOCASE,
+                    parent_id   INTEGER DEFAULT NULL
+                                REFERENCES categories(id) ON DELETE CASCADE,
+                    sort_order  INTEGER DEFAULT 0
+                );
+                CREATE TABLE IF NOT EXISTS notion_sources (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    meme_id     INTEGER NOT NULL
+                                      REFERENCES memes(id) ON DELETE CASCADE,
+                    data_source_id TEXT NOT NULL,
+                    page_id     TEXT NOT NULL,
+                    property_id TEXT NOT NULL,
+                    file_index  INTEGER NOT NULL,
+                    file_name   TEXT NOT NULL DEFAULT '',
+                    page_last_edited_time TEXT NOT NULL DEFAULT '',
+                    created_at  TEXT NOT NULL
+                                      DEFAULT (datetime('now','localtime')),
+                    updated_at  TEXT NOT NULL
+                                      DEFAULT (datetime('now','localtime')),
+                    UNIQUE (data_source_id, page_id, property_id,
+                            file_index, file_name)
+                );
+                CREATE INDEX IF NOT EXISTS idx_notion_sources_meme
+                    ON notion_sources(meme_id);
+                CREATE TABLE IF NOT EXISTS chat_records (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    account_id  TEXT NOT NULL,
+                    source_message_id TEXT NOT NULL,
+                    source_message_seq TEXT NOT NULL DEFAULT '',
+                    message_type TEXT NOT NULL DEFAULT '',
+                    peer_id     TEXT NOT NULL DEFAULT '',
+                    title       TEXT NOT NULL DEFAULT '',
+                    node_count  INTEGER NOT NULL DEFAULT 0,
+                    record_count INTEGER NOT NULL DEFAULT 0,
+                    package_json TEXT NOT NULL,
+                    created_at  TEXT NOT NULL
+                                DEFAULT (datetime('now','localtime')),
+                    updated_at  TEXT NOT NULL
+                                DEFAULT (datetime('now','localtime')),
+                    UNIQUE (account_id, source_message_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_chat_records_updated
+                    ON chat_records(updated_at DESC);
+            """
+        )
+        # 早期版本把 OneBot 进程内短 message_id 误写入摘要序号列。
+        # package_json 中的 real_seq 才能跨 NapCat 重启重新定位原消息；
+        # 启动与备份恢复时都把已有记录的摘要修正为真实序号。
+        seq_updates = []
+        for row in conn.execute(
+            "SELECT id, source_message_seq, package_json FROM chat_records"
+        ).fetchall():
+            try:
+                package = json.loads(row[2])
+                source = package.get("source") if isinstance(package, dict) else None
+                real_seq = source.get("real_seq") if isinstance(source, dict) else None
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if real_seq not in (None, "") and str(real_seq) != str(row[1] or ""):
+                seq_updates.append((str(real_seq), int(row[0])))
+        if seq_updates:
+            conn.executemany(
+                "UPDATE chat_records SET source_message_seq=? WHERE id=?",
+                seq_updates,
+            )
+        tag_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(tags)").fetchall()
+        }
+        if "category" not in tag_columns:
+            # 旧表在 name 上有单列 UNIQUE，无法用 ALTER TABLE 移除。保留原 id
+            # 重建父表，使同名标签可以存在于不同分类，meme_tags 的关联不变。
+            foreign_keys_enabled = bool(
+                conn.execute("PRAGMA foreign_keys").fetchone()[0]
+            )
+            conn.commit()
+            conn.execute("PRAGMA foreign_keys=OFF")
+            try:
+                conn.executescript(
+                    """
+                    BEGIN;
+                    CREATE TABLE tags_new (
+                        id       INTEGER PRIMARY KEY AUTOINCREMENT,
+                        name     TEXT NOT NULL COLLATE NOCASE,
+                        category TEXT NOT NULL DEFAULT '' COLLATE NOCASE,
+                        UNIQUE (category, name)
+                    );
+                    INSERT INTO tags_new (id, name, category)
+                        SELECT id, name, '' FROM tags;
+                    DROP TABLE tags;
+                    ALTER TABLE tags_new RENAME TO tags;
+                    COMMIT;
+                    """
+                )
+            except Exception:
+                if conn.in_transaction:
+                    conn.rollback()
+                raise
+            finally:
+                conn.execute(
+                    f"PRAGMA foreign_keys={'ON' if foreign_keys_enabled else 'OFF'}"
+                )
         migrates = [
             ("memes", "sort_order", "INTEGER DEFAULT 0"),
             ("memes", "stego_of_hash", "TEXT DEFAULT NULL"),
             ("memes", "from_stego", "INTEGER DEFAULT 0"),
             ("memes", "perceptual_hash", "TEXT DEFAULT NULL"),
+            ("memes", "ai_description", "TEXT NOT NULL DEFAULT ''"),
+            ("memes", "ai_ocr_text", "TEXT NOT NULL DEFAULT ''"),
+            ("memes", "manual_description", "TEXT NOT NULL DEFAULT ''"),
+            ("memes", "manual_ocr_text", "TEXT NOT NULL DEFAULT ''"),
+            (
+                "memes",
+                "category_id",
+                "INTEGER DEFAULT NULL REFERENCES categories(id) ON DELETE SET NULL",
+            ),
+            ("memes", "daily_filename", "TEXT NOT NULL DEFAULT ''"),
+            ("memes", "daily_file_size", "INTEGER DEFAULT 0"),
+            ("memes", "daily_mime_type", "TEXT NOT NULL DEFAULT ''"),
+            ("memes", "daily_profile", "INTEGER DEFAULT 0"),
             (
                 "collections",
                 "parent_id",
@@ -192,10 +405,13 @@ class MemeDB:
                 conn.execute(f"ALTER TABLE {tbl} ADD COLUMN {col} {col_def}")
             except sqlite3.OperationalError:
                 pass  # 列已存在
-        # 该索引依赖迁移新增的 stego_of_hash 列，必须放在迁移之后建，
-        # 否则旧库缺列时 CREATE INDEX 会抛 OperationalError 中断启动
+        # 以下索引依赖迁移新增的列，必须放在迁移之后创建；否则旧库尚未
+        # 补齐 stego_of_hash/category_id 时，CREATE INDEX 会中断启动。
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_memes_stego ON memes(stego_of_hash)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_memes_category ON memes(category_id)"
         )
         conn.commit()
 
@@ -220,7 +436,14 @@ class MemeDB:
         供备份恢复的空库判定。
         """
         conn = self._get_conn()
-        for tbl in ("memes", "collections", "tags", "favorites"):
+        for tbl in (
+            "memes",
+            "collections",
+            "categories",
+            "tags",
+            "favorites",
+            "chat_records",
+        ):
             if conn.execute(f"SELECT 1 FROM {tbl} LIMIT 1").fetchone():
                 return True
         return False
@@ -316,10 +539,19 @@ class MemeDB:
         file_size: int = 0,
         mime_type: str = "image/png",
         original_name: str = "",
-        tags: List[str] = None,
+        tags: List[Any] = None,
         stego_of_hash: str = None,
         from_stego: int = 0,
         perceptual_hash: int = None,
+        ai_description: str = "",
+        ai_ocr_text: str = "",
+        manual_description: str = "",
+        manual_ocr_text: str = "",
+        daily_filename: str = "",
+        daily_file_size: int = 0,
+        daily_mime_type: str = "",
+        daily_profile: int = 0,
+        category_id: Any = None,
     ) -> int:
         with self._lock:
             conn = self._get_conn()
@@ -333,8 +565,11 @@ class MemeDB:
                 """INSERT INTO memes
                    (filename, file_hash, width, height,
                     file_size, mime_type, original_name, stego_of_hash, from_stego,
-                    perceptual_hash)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    perceptual_hash, ai_description, ai_ocr_text,
+                    manual_description, manual_ocr_text,
+                    category_id,
+                    daily_filename, daily_file_size, daily_mime_type, daily_profile)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     filename,
                     file_hash,
@@ -346,6 +581,19 @@ class MemeDB:
                     stego_of_hash,
                     from_stego,
                     ph_hex,
+                    ai_description or "",
+                    ai_ocr_text or "",
+                    manual_description or "",
+                    manual_ocr_text or "",
+                    (
+                        int(category_id)
+                        if category_id is not None and category_id is not _UNSET
+                        else None
+                    ),
+                    daily_filename or "",
+                    int(daily_file_size or 0),
+                    daily_mime_type or "",
+                    int(daily_profile or 0),
                 ),
             )
             meme_id = cur.lastrowid
@@ -369,6 +617,231 @@ class MemeDB:
     def delete_meme(self, meme_id: int):
         self.delete_memes([meme_id])
 
+    def get_notion_source(
+        self,
+        data_source_id: str,
+        page_id: str,
+        property_id: str,
+        file_index: int,
+        file_name: str,
+        page_last_edited_time: str,
+    ) -> Optional[dict]:
+        """按稳定来源与页面版本查找已导入的 Notion 文件。"""
+        if not page_last_edited_time:
+            return None
+        conn = self._get_conn()
+        row = conn.execute(
+            """SELECT ns.meme_id, ns.page_last_edited_time,
+                      m.filename, m.file_hash
+               FROM notion_sources ns
+               JOIN memes m ON m.id = ns.meme_id
+               WHERE ns.data_source_id=? AND ns.page_id=?
+                 AND ns.property_id=? AND ns.file_index=? AND ns.file_name=?
+                 AND ns.page_last_edited_time=?
+               LIMIT 1""",
+            (
+                data_source_id,
+                page_id,
+                property_id,
+                int(file_index),
+                file_name,
+                page_last_edited_time,
+            ),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def upsert_notion_source(
+        self,
+        meme_id: int,
+        data_source_id: str,
+        page_id: str,
+        property_id: str,
+        file_index: int,
+        file_name: str,
+        page_last_edited_time: str,
+    ):
+        """记录 Notion 文件到本地表情的映射，页面修改后更新版本。"""
+        with self._lock:
+            conn = self._get_conn()
+            conn.execute(
+                """INSERT INTO notion_sources
+                   (meme_id, data_source_id, page_id, property_id,
+                    file_index, file_name, page_last_edited_time)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(data_source_id, page_id, property_id,
+                               file_index, file_name)
+                   DO UPDATE SET meme_id=excluded.meme_id,
+                       page_last_edited_time=excluded.page_last_edited_time,
+                       updated_at=datetime('now','localtime')""",
+                (
+                    int(meme_id),
+                    data_source_id,
+                    page_id,
+                    property_id,
+                    int(file_index),
+                    file_name,
+                    page_last_edited_time,
+                ),
+            )
+            conn.commit()
+
+    def save_chat_record(self, package: dict) -> dict:
+        """保存完整聊天记录包；重复保存同一外层消息时更新原记录。"""
+        if not isinstance(package, dict):
+            raise ValueError("聊天记录包格式无效")
+        source = package.get("source")
+        summary = package.get("summary")
+        if not isinstance(source, dict) or not isinstance(summary, dict):
+            raise ValueError("聊天记录包缺少来源或摘要")
+        account_id = str(source.get("self_id") or "")
+        message_id = str(source.get("message_id") or "")
+        if not account_id or not message_id:
+            raise ValueError("聊天记录包缺少账号或消息 ID")
+        if str(source.get("message_type") or "") == "group":
+            peer_id = source.get("group_id")
+        else:
+            peer_id = source.get("target_id")
+            if str(peer_id or "") in ("", account_id):
+                peer_id = source.get("user_id")
+            if str(peer_id or "") in ("", account_id):
+                sender = source.get("sender")
+                sender = sender if isinstance(sender, dict) else {}
+                peer_id = sender.get("user_id")
+        package_json = json.dumps(
+            package, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+        )
+        with self._lock:
+            conn = self._get_conn()
+            existing = conn.execute(
+                "SELECT id FROM chat_records "
+                "WHERE account_id=? AND source_message_id=?",
+                (account_id, message_id),
+            ).fetchone()
+            conn.execute(
+                """INSERT INTO chat_records
+                   (account_id, source_message_id, source_message_seq,
+                    message_type, peer_id, title, node_count, record_count,
+                    package_json)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(account_id, source_message_id) DO UPDATE SET
+                       source_message_seq=excluded.source_message_seq,
+                       message_type=excluded.message_type,
+                       peer_id=excluded.peer_id,
+                       title=excluded.title,
+                       node_count=excluded.node_count,
+                       record_count=excluded.record_count,
+                       package_json=excluded.package_json,
+                       updated_at=datetime('now','localtime')""",
+                (
+                    account_id,
+                    message_id,
+                    str(source.get("real_seq") or source.get("message_seq") or ""),
+                    str(source.get("message_type") or ""),
+                    str(peer_id or ""),
+                    str(package.get("title") or "聊天记录"),
+                    int(summary.get("node_count") or 0),
+                    int(summary.get("record_count") or 0),
+                    package_json,
+                ),
+            )
+            row = conn.execute(
+                "SELECT id FROM chat_records "
+                "WHERE account_id=? AND source_message_id=?",
+                (account_id, message_id),
+            ).fetchone()
+            conn.commit()
+        return {"id": row[0], "created": existing is None}
+
+    def get_chat_record(self, record_id: int) -> Optional[dict]:
+        """读取一个完整聊天记录包。"""
+        row = (
+            self._get_conn()
+            .execute(
+                "SELECT package_json FROM chat_records WHERE id=?", (int(record_id),)
+            )
+            .fetchone()
+        )
+        return json.loads(row[0]) if row else None
+
+    def get_chat_record_by_source(
+        self, account_id: str, source_message_id: str
+    ) -> Optional[dict]:
+        """按账号与外层消息 ID 读取已有聊天记录包。"""
+        row = (
+            self._get_conn()
+            .execute(
+                "SELECT package_json FROM chat_records "
+                "WHERE account_id=? AND source_message_id=?",
+                (str(account_id), str(source_message_id)),
+            )
+            .fetchone()
+        )
+        return json.loads(row[0]) if row else None
+
+    def get_chat_record_entry(self, record_id: int) -> Optional[dict]:
+        """读取聊天记录摘要及完整结构包。"""
+        row = (
+            self._get_conn()
+            .execute("SELECT * FROM chat_records WHERE id=?", (int(record_id),))
+            .fetchone()
+        )
+        if not row:
+            return None
+        result = dict(row)
+        result["package"] = json.loads(result.pop("package_json"))
+        return result
+
+    def list_chat_records(
+        self, keyword: str = "", limit: int = 100, offset: int = 0
+    ) -> List[dict]:
+        """按更新时间分页读取聊天记录摘要，关键字匹配标题。"""
+        params = []
+        where = ""
+        if keyword:
+            where = " WHERE title LIKE ?"
+            params.append(f"%{keyword}%")
+        params.extend([max(0, int(limit)), max(0, int(offset))])
+        rows = self._get_conn().execute(
+            "SELECT id, title, node_count, record_count, message_type, peer_id, "
+            "source_message_id, source_message_seq, created_at, updated_at "
+            f"FROM chat_records{where} "
+            "ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?",
+            params,
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def count_chat_records(self, keyword: str = "") -> int:
+        """返回符合标题关键字的已保存聊天记录数量。"""
+        params = []
+        where = ""
+        if keyword:
+            where = " WHERE title LIKE ?"
+            params.append(f"%{keyword}%")
+        row = self._get_conn().execute(
+            f"SELECT COUNT(*) FROM chat_records{where}", params
+        ).fetchone()
+        return int(row[0]) if row else 0
+
+    def delete_chat_record(self, record_id: int) -> bool:
+        """删除一份聊天记录归档。"""
+        with self._lock:
+            conn = self._get_conn()
+            cur = conn.execute("DELETE FROM chat_records WHERE id=?", (int(record_id),))
+            conn.commit()
+            return cur.rowcount > 0
+
+    def get_latest_chat_record(self) -> Optional[dict]:
+        """返回最近保存记录的轻量摘要。"""
+        row = (
+            self._get_conn()
+            .execute(
+                """SELECT id, title, node_count, record_count, updated_at
+               FROM chat_records ORDER BY updated_at DESC, id DESC LIMIT 1"""
+            )
+            .fetchone()
+        )
+        return dict(row) if row else None
+
     def update_meme(self, meme_id: int, **kwargs):
         allowed = {
             "filename",
@@ -380,6 +853,14 @@ class MemeDB:
             "original_name",
             "stego_of_hash",
             "from_stego",
+            "ai_description",
+            "ai_ocr_text",
+            "manual_description",
+            "manual_ocr_text",
+            "daily_filename",
+            "daily_file_size",
+            "daily_mime_type",
+            "daily_profile",
             # perceptual_hash 不在此列：写统一走 set_perceptual_hash（hex 序列化）
         }
         sets = []
@@ -406,15 +887,50 @@ class MemeDB:
             "DELETE FROM tags WHERE id NOT IN (SELECT DISTINCT tag_id FROM meme_tags)"
         )
 
-    def _set_tags(self, conn, meme_id: int, tags: List[str]):
-        conn.execute("DELETE FROM meme_tags WHERE meme_id=?", (meme_id,))
-        for tag in tags:
-            tag = tag.strip()
-            if not tag:
+    @staticmethod
+    def _normalize_tag(tag: Any) -> Optional[Tuple[str, str]]:
+        """把旧字符串标签和新版结构化标签统一为 (category, name)。"""
+        if isinstance(tag, dict):
+            name = str(tag.get("name") or "").strip()
+            category = str(tag.get("category") or "").strip()
+        else:
+            name = str(tag or "").strip()
+            category = ""
+        return (category, name) if name else None
+
+    @classmethod
+    def _normalize_tags(cls, tags) -> List[Tuple[str, str]]:
+        normalized = []
+        seen = set()
+        for tag in tags or []:
+            value = cls._normalize_tag(tag)
+            if value is None:
                 continue
+            key = (value[0].casefold(), value[1].casefold())
+            if key not in seen:
+                normalized.append(value)
+                seen.add(key)
+        return normalized
+
+    @staticmethod
+    def _tag_record(row) -> dict:
+        return {
+            "id": int(row["id"]),
+            "name": row["name"],
+            "category": row["category"] or "",
+        }
+
+    def _set_tags(self, conn, meme_id: int, tags):
+        conn.execute("DELETE FROM meme_tags WHERE meme_id=?", (meme_id,))
+        for category, name in self._normalize_tags(tags):
             # INSERT OR IGNORE 后 lastrowid 不可靠（已有tag时返回上次真实插入的rowid）
-            conn.execute("INSERT OR IGNORE INTO tags (name) VALUES (?)", (tag,))
-            row = conn.execute("SELECT id FROM tags WHERE name=?", (tag,)).fetchone()
+            conn.execute(
+                "INSERT OR IGNORE INTO tags (name, category) VALUES (?, ?)",
+                (name, category),
+            )
+            row = conn.execute(
+                "SELECT id FROM tags WHERE name=? AND category=?", (name, category)
+            ).fetchone()
             if row is None:
                 continue
             tag_id = row[0]
@@ -424,11 +940,192 @@ class MemeDB:
             )
         self._prune_orphan_tags(conn)
 
-    def set_meme_tags(self, meme_id: int, tags: List[str]):
+    def set_meme_tags(self, meme_id: int, tags):
         with self._lock:
             conn = self._get_conn()
             self._set_tags(conn, meme_id, tags)
             conn.commit()
+
+    def set_daily_asset(
+        self,
+        meme_id: int,
+        filename: str,
+        file_size: int,
+        mime_type: str,
+        profile: int,
+    ):
+        """记录可再生日常副本，不改变业务更新时间和排序。"""
+        with self._lock:
+            conn = self._get_conn()
+            conn.execute(
+                """UPDATE memes
+                   SET daily_filename=?, daily_file_size=?,
+                       daily_mime_type=?, daily_profile=?
+                   WHERE id=?""",
+                (
+                    filename or "",
+                    int(file_size or 0),
+                    mime_type or "",
+                    int(profile or 0),
+                    meme_id,
+                ),
+            )
+            conn.commit()
+
+    def rename_tag(
+        self,
+        old_name: str,
+        new_name: str,
+        category: str = "",
+        new_category: str = None,
+    ) -> Optional[dict]:
+        """全局修改标签名称/种类；目标已存在时合并全部关联。"""
+        old_name = old_name.strip()
+        new_name = new_name.strip()
+        category = str(category or "").strip()
+        target_category = (
+            category if new_category is None else str(new_category or "").strip()
+        )
+        if not old_name or not new_name:
+            return None
+        with self._lock:
+            conn = self._get_conn()
+            source = conn.execute(
+                "SELECT id, name, category FROM tags WHERE name=? AND category=?",
+                (old_name, category),
+            ).fetchone()
+            if source is None:
+                return None
+            try:
+                target = conn.execute(
+                    "SELECT id, name, category FROM tags "
+                    "WHERE name=? AND category=?",
+                    (new_name, target_category),
+                ).fetchone()
+                if target is not None and target["id"] != source["id"]:
+                    conn.execute(
+                        """INSERT OR IGNORE INTO meme_tags (meme_id, tag_id)
+                           SELECT meme_id, ? FROM meme_tags WHERE tag_id=?""",
+                        (target["id"], source["id"]),
+                    )
+                    conn.execute("DELETE FROM tags WHERE id=?", (source["id"],))
+                    result = {
+                        "name": target["name"],
+                        "category": target["category"],
+                        "merged": True,
+                    }
+                else:
+                    conn.execute(
+                        "UPDATE tags SET name=?, category=? WHERE id=?",
+                        (new_name, target_category, source["id"]),
+                    )
+                    result = {
+                        "name": new_name,
+                        "category": target_category,
+                        "merged": False,
+                    }
+                conn.commit()
+                return result
+            except Exception:
+                conn.rollback()
+                raise
+
+    def update_meme_details(
+        self,
+        meme_id: int,
+        tags,
+        ai_description: str,
+        ai_ocr_text: str,
+        title: str = None,
+        filename: str = None,
+        collection_ids: List[int] = None,
+        manual_description: str = None,
+        manual_ocr_text: str = None,
+        category_id: Any = _UNSET,
+    ) -> bool:
+        """在同一事务内保存详情文字和标签，目标不存在时不产生孤儿标签。"""
+        with self._lock:
+            conn = self._get_conn()
+            if (
+                conn.execute("SELECT 1 FROM memes WHERE id=?", (meme_id,)).fetchone()
+                is None
+            ):
+                return False
+            try:
+                fields = [
+                    "ai_description=?",
+                    "ai_ocr_text=?",
+                    "updated_at=datetime('now','localtime')",
+                ]
+                values = [ai_description, ai_ocr_text]
+                if manual_description is not None:
+                    fields.append("manual_description=?")
+                    values.append(manual_description)
+                if manual_ocr_text is not None:
+                    fields.append("manual_ocr_text=?")
+                    values.append(manual_ocr_text)
+                if title is not None:
+                    fields.append("original_name=?")
+                    values.append(title)
+                if filename is not None:
+                    fields.append("filename=?")
+                    values.append(filename)
+                if category_id is not _UNSET:
+                    # None is a valid value here: it explicitly means「未分类」.
+                    fields.append("category_id=?")
+                    values.append(category_id)
+                values.append(meme_id)
+                conn.execute(
+                    f"UPDATE memes SET {', '.join(fields)} WHERE id=?",
+                    values,
+                )
+                self._set_tags(conn, meme_id, tags)
+                if collection_ids is not None:
+                    target_ids = list(
+                        dict.fromkeys(int(value) for value in collection_ids)
+                    )
+                    if target_ids:
+                        placeholders = ",".join("?" for _ in target_ids)
+                        valid_ids = {
+                            row[0]
+                            for row in conn.execute(
+                                f"SELECT id FROM collections "
+                                f"WHERE id IN ({placeholders})",
+                                target_ids,
+                            ).fetchall()
+                        }
+                        if valid_ids != set(target_ids):
+                            raise ValueError("collection not found")
+                    current = {
+                        row[0]: row[1]
+                        for row in conn.execute(
+                            "SELECT collection_id, sort_order "
+                            "FROM meme_collections WHERE meme_id=?",
+                            (meme_id,),
+                        ).fetchall()
+                    }
+                    for collection_id in set(current) - set(target_ids):
+                        conn.execute(
+                            "DELETE FROM meme_collections "
+                            "WHERE meme_id=? AND collection_id=?",
+                            (meme_id, collection_id),
+                        )
+                    for collection_id in set(target_ids) - set(current):
+                        next_order = conn.execute(
+                            "SELECT COALESCE(MAX(sort_order), -1) + 1 "
+                            "FROM meme_collections WHERE collection_id=?",
+                            (collection_id,),
+                        ).fetchone()[0]
+                        conn.execute(
+                            "INSERT INTO meme_collections "
+                            "(meme_id, collection_id, sort_order) VALUES (?, ?, ?)",
+                            (meme_id, collection_id, next_order),
+                        )
+                conn.commit()
+                return True
+            except Exception:
+                conn.rollback()
+                raise
 
     def get_meme_tags(self, meme_id: int) -> List[str]:
         conn = self._get_conn()
@@ -440,11 +1137,54 @@ class MemeDB:
         ).fetchall()
         return [r[0] for r in rows]
 
+    def get_meme_tag_records(self, meme_id: int) -> List[dict]:
+        conn = self._get_conn()
+        rows = conn.execute(
+            """SELECT t.id, t.name, t.category FROM tags t
+               JOIN meme_tags mt ON mt.tag_id = t.id
+               WHERE mt.meme_id = ?
+               ORDER BY t.category, t.name""",
+            (meme_id,),
+        ).fetchall()
+        return [self._tag_record(row) for row in rows]
+
     def get_all_tags(self) -> List[str]:
         conn = self._get_conn()
         return [
             r[0] for r in conn.execute("SELECT name FROM tags ORDER BY name").fetchall()
         ]
+
+    def get_all_tag_records(self) -> List[dict]:
+        conn = self._get_conn()
+        rows = conn.execute(
+            "SELECT id, name, category FROM tags ORDER BY category, name"
+        ).fetchall()
+        return [self._tag_record(row) for row in rows]
+
+    def get_meme_navigation(self, meme_id: int) -> Optional[dict]:
+        """按全图库默认顺序返回目标表情的前后项和当前位置。"""
+        conn = self._get_conn()
+        row = conn.execute(
+            """WITH ordered AS (
+                   SELECT id,
+                          LAG(id) OVER (
+                              ORDER BY sort_order ASC, id DESC
+                          ) AS previous_id,
+                          LEAD(id) OVER (
+                              ORDER BY sort_order ASC, id DESC
+                          ) AS next_id,
+                          ROW_NUMBER() OVER (
+                              ORDER BY sort_order ASC, id DESC
+                          ) AS position,
+                          COUNT(*) OVER () AS total
+                   FROM memes
+                   WHERE stego_of_hash IS NULL OR stego_of_hash = ''
+               )
+               SELECT previous_id, next_id, position, total
+               FROM ordered WHERE id=?""",
+            (meme_id,),
+        ).fetchone()
+        return dict(row) if row else None
 
     def _existing_meme_ids(self, conn, ids: List[int]) -> List[int]:
         """过滤出实际存在的表情 id（外键开启时对缺失 id 写子表会整批失败）"""
@@ -456,11 +1196,11 @@ class MemeDB:
             ).fetchall()
         ]
 
-    def add_tags_to_memes(self, meme_ids: List[int], tags: List[str]) -> int:
+    def add_tags_to_memes(self, meme_ids: List[int], tags) -> int:
         """批量合并追加标签（不清空各表情已有标签），返回实际存在的表情数"""
-        names = [t.strip() for t in (tags or []) if t.strip()]
+        normalized_tags = self._normalize_tags(tags)
         ids = list(dict.fromkeys(int(x) for x in (meme_ids or [])))
-        if not names or not ids:
+        if not normalized_tags or not ids:
             return 0
         with self._lock:
             conn = self._get_conn()
@@ -468,11 +1208,15 @@ class MemeDB:
                 valid_ids = self._existing_meme_ids(conn, ids)
                 if not valid_ids:
                     return 0
-                for tag in names:
+                for category, name in normalized_tags:
                     # INSERT OR IGNORE 后 lastrowid 不可靠（同 _set_tags）
-                    conn.execute("INSERT OR IGNORE INTO tags (name) VALUES (?)", (tag,))
+                    conn.execute(
+                        "INSERT OR IGNORE INTO tags (name, category) VALUES (?, ?)",
+                        (name, category),
+                    )
                     row = conn.execute(
-                        "SELECT id FROM tags WHERE name=?", (tag,)
+                        "SELECT id FROM tags WHERE name=? AND category=?",
+                        (name, category),
                     ).fetchone()
                     if row is None:
                         continue
@@ -515,6 +1259,226 @@ class MemeDB:
             ).fetchone()
             is not None
         )
+
+    # --- 单归属类别 ---
+
+    def _category_rows(self, conn):
+        return conn.execute(
+            "SELECT id, name, parent_id, sort_order FROM categories"
+        ).fetchall()
+
+    def get_categories(self) -> List[Tuple[int, str, int, int]]:
+        conn = self._get_conn()
+        rows = self._category_rows(conn)
+        return [
+            (row[0], row[1], row[2], row[3])
+            for row in sorted(rows, key=lambda r: (r[3], _name_sort_key(r[1])))
+        ]
+
+    def get_category(self, category_id: int) -> Optional[dict]:
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT id, name, parent_id, sort_order FROM categories WHERE id=?",
+            (category_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def category_exists(self, category_id: int) -> bool:
+        return self.get_category(category_id) is not None
+
+    def create_category(self, name: str, parent_id: int = None) -> int:
+        name = validate_category_name(name)
+        if (
+            parent_id is None
+            and name.casefold() == CHAT_RECORD_MEDIA_DIRNAME.casefold()
+        ):
+            raise ValueError("该名称由聊天记录媒体目录保留")
+        with self._lock:
+            conn = self._get_conn()
+            if (
+                parent_id is not None
+                and conn.execute(
+                    "SELECT 1 FROM categories WHERE id=?", (parent_id,)
+                ).fetchone()
+                is None
+            ):
+                raise ValueError("category parent not found")
+            if parent_id is None:
+                row = conn.execute(
+                    "SELECT id FROM categories WHERE name=? AND parent_id IS NULL",
+                    (name,),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT id FROM categories WHERE name=? AND parent_id=?",
+                    (name, parent_id),
+                ).fetchone()
+            if row:
+                return row[0]
+            conn.execute(
+                "INSERT INTO categories (name, parent_id) VALUES (?, ?)",
+                (name, parent_id),
+            )
+            conn.commit()
+            return conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+    def ensure_category_path(self, parts) -> Optional[int]:
+        """按名称路径逐级创建类别并返回末级 id；空路径表示未分类。"""
+        parent_id = None
+        for part in parts or ():
+            parent_id = self.create_category(part, parent_id)
+        return parent_id
+
+    def set_meme_category(self, meme_id: int, category_id: int = None) -> bool:
+        with self._lock:
+            conn = self._get_conn()
+            if (
+                conn.execute("SELECT 1 FROM memes WHERE id=?", (meme_id,)).fetchone()
+                is None
+            ):
+                return False
+            if (
+                category_id is not None
+                and conn.execute(
+                    "SELECT 1 FROM categories WHERE id=?", (category_id,)
+                ).fetchone()
+                is None
+            ):
+                raise ValueError("category not found")
+            conn.execute(
+                "UPDATE memes SET category_id=?, "
+                "updated_at=datetime('now','localtime') "
+                "WHERE id=?",
+                (category_id, meme_id),
+            )
+            conn.commit()
+            return True
+
+    def rename_category(self, category_id: int, new_name: str):
+        new_name = validate_category_name(new_name)
+        with self._lock:
+            conn = self._get_conn()
+            row = conn.execute(
+                "SELECT parent_id FROM categories WHERE id=?", (category_id,)
+            ).fetchone()
+            if row is None:
+                raise ValueError("category not found")
+            parent_id = row[0]
+            if (
+                parent_id is None
+                and new_name.casefold() == CHAT_RECORD_MEDIA_DIRNAME.casefold()
+            ):
+                raise ValueError("该名称由聊天记录媒体目录保留")
+            if parent_id is None:
+                duplicate = conn.execute(
+                    "SELECT 1 FROM categories "
+                    "WHERE name=? AND parent_id IS NULL AND id<>?",
+                    (new_name, category_id),
+                ).fetchone()
+            else:
+                duplicate = conn.execute(
+                    "SELECT 1 FROM categories WHERE name=? AND parent_id=? AND id<>?",
+                    (new_name, parent_id, category_id),
+                ).fetchone()
+            if duplicate:
+                raise ValueError("同级类别已存在同名项")
+            conn.execute(
+                "UPDATE categories SET name=? WHERE id=?", (new_name, category_id)
+            )
+            conn.commit()
+
+    def delete_category(self, category_id: int) -> Optional[int]:
+        """删除类别节点；直属图片归入父类别，子类别提升到父级。"""
+        with self._lock:
+            conn = self._get_conn()
+            row = conn.execute(
+                "SELECT parent_id FROM categories WHERE id=?", (category_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            parent_id = row[0]
+            conn.execute(
+                "UPDATE memes SET category_id=? WHERE category_id=?",
+                (parent_id, category_id),
+            )
+            conn.execute(
+                "UPDATE categories SET parent_id=? WHERE parent_id=?",
+                (parent_id, category_id),
+            )
+            conn.execute("DELETE FROM categories WHERE id=?", (category_id,))
+            conn.commit()
+            return parent_id
+
+    def get_category_descendants(self, category_id: int) -> List[int]:
+        ids = [int(category_id)]
+        cursor = 0
+        rows = self.get_categories()
+        children = {}
+        for cid, _name, parent_id, _order in rows:
+            children.setdefault(parent_id, []).append(cid)
+        while cursor < len(ids):
+            ids.extend(children.get(ids[cursor], []))
+            cursor += 1
+        return ids
+
+    def get_category_path_names(self, category_id: int) -> List[str]:
+        if category_id is None:
+            return []
+        conn = self._get_conn()
+        by_id = {
+            row[0]: {"name": row[1], "parent_id": row[2]}
+            for row in self._category_rows(conn)
+        }
+        parts = []
+        current = category_id
+        visited = set()
+        while current is not None and current not in visited:
+            visited.add(current)
+            node = by_id.get(current)
+            if node is None:
+                break
+            parts.append(node["name"])
+            current = node["parent_id"]
+        return list(reversed(parts))
+
+    def get_category_path(self, category_id: int) -> str:
+        return " / ".join(self.get_category_path_names(category_id))
+
+    def get_all_category_paths(self) -> List[dict]:
+        return [
+            {
+                "id": cid,
+                "name": name,
+                "path": self.get_category_path(cid),
+                "parent_id": parent_id,
+            }
+            for cid, name, parent_id, _order in self.get_categories()
+        ]
+
+    def get_meme_category(self, meme_id: int) -> Optional[dict]:
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT category_id FROM memes WHERE id=?", (meme_id,)
+        ).fetchone()
+        if not row or row[0] is None:
+            return None
+        category = self.get_category(row[0])
+        if not category:
+            return None
+        return {
+            "id": category["id"],
+            "name": category["name"],
+            "path": self.get_category_path(category["id"]),
+            "parent_id": category["parent_id"],
+        }
+
+    def count_uncategorized(self) -> int:
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT COUNT(*) FROM memes WHERE category_id IS NULL "
+            "AND (stego_of_hash IS NULL OR stego_of_hash='')"
+        ).fetchone()
+        return row[0] if row else 0
 
     # --- 收藏集 ---
 
@@ -708,6 +1672,61 @@ class MemeDB:
             for r in sorted(rows, key=lambda r: (r[3], _name_sort_key(r[1])))
         ]
 
+    def _collection_paths(self, conn, collection_ids) -> List[dict]:
+        """为给定分组 id 构造完整层级路径，并防御异常循环父级。"""
+        rows = conn.execute("SELECT id, name, parent_id FROM collections").fetchall()
+        by_id = {
+            row["id"]: {
+                "id": row["id"],
+                "name": row["name"],
+                "parent_id": row["parent_id"],
+            }
+            for row in rows
+        }
+        result = []
+        for collection_id in collection_ids:
+            item = by_id.get(collection_id)
+            if item is None:
+                continue
+            parts = []
+            current = collection_id
+            visited = set()
+            while current is not None and current not in visited:
+                visited.add(current)
+                node = by_id.get(current)
+                if node is None:
+                    break
+                parts.append(node["name"])
+                current = node["parent_id"]
+            result.append(
+                {
+                    "id": item["id"],
+                    "name": item["name"],
+                    "path": " / ".join(reversed(parts)),
+                }
+            )
+        return sorted(result, key=lambda item: _name_sort_key(item["path"]))
+
+    def get_all_collection_paths(self) -> List[dict]:
+        """返回全部分组及完整层级路径，供详情页选择器使用。"""
+        conn = self._get_conn()
+        collection_ids = [
+            row[0] for row in conn.execute("SELECT id FROM collections").fetchall()
+        ]
+        return self._collection_paths(conn, collection_ids)
+
+    def get_meme_collections(self, meme_id: int) -> List[dict]:
+        """返回表情直接所属的全部分组及完整层级路径。"""
+        conn = self._get_conn()
+        collection_ids = [
+            row[0]
+            for row in conn.execute(
+                "SELECT collection_id FROM meme_collections WHERE meme_id=?",
+                (meme_id,),
+            ).fetchall()
+        ]
+        return self._collection_paths(conn, collection_ids)
+
     def get_child_collections(self, parent_id: int) -> List[dict]:
         conn = self._get_conn()
         rows = conn.execute(
@@ -738,11 +1757,14 @@ class MemeDB:
         """删除所有表情包及相关数据"""
         with self._lock:
             conn = self._get_conn()
+            conn.execute("DELETE FROM chat_records")
+            conn.execute("DELETE FROM notion_sources")
             conn.execute("DELETE FROM favorites")
             conn.execute("DELETE FROM meme_collections")
             conn.execute("DELETE FROM meme_tags")
             conn.execute("DELETE FROM memes")
             conn.execute("DELETE FROM collections")
+            conn.execute("DELETE FROM categories")
             conn.execute("DELETE FROM tags")
             conn.commit()
 
@@ -765,15 +1787,35 @@ class MemeDB:
 
     # --- 搜索 ---
 
+    @staticmethod
+    def _genre_condition(genre: str, table_prefix: str = "") -> Optional[str]:
+        """返回不可编辑体裁筛选条件；GIF 按真实 GIF MIME/扩展名判定。"""
+        filename = f"{table_prefix}filename"
+        mime_type = f"{table_prefix}mime_type"
+        gif = (
+            f"(LOWER(COALESCE({mime_type}, '')) = 'image/gif' "
+            f"OR LOWER({filename}) LIKE '%.gif')"
+        )
+        if genre == "gif":
+            return gif
+        if genre == "image":
+            return f"NOT {gif}"
+        return None
+
     def search(
         self,
         keyword: str = "",
-        tags: List[str] = None,
+        tags: List[Any] = None,
         collection_id: int = None,
         favorite_only: bool = False,
         uncategorized_only: bool = False,
         offset: int = 0,
         limit: int = 100,
+        include_description: bool = True,
+        include_ocr_text: bool = True,
+        category_id=None,
+        uncategorized_category: bool = False,
+        genre: str = None,
     ) -> List[dict]:
         conn = self._get_conn()
         where = ["(m.stego_of_hash IS NULL OR m.stego_of_hash = '')"]
@@ -781,31 +1823,53 @@ class MemeDB:
 
         if keyword:
             kw = f"%{keyword}%"
-            where.append(
-                "(m.filename LIKE ? OR m.original_name LIKE ? OR m.id IN ("
-                "SELECT mt.meme_id FROM meme_tags mt "
-                "JOIN tags t ON t.id = mt.tag_id WHERE t.name LIKE ?))"
+            keyword_parts = ["m.filename LIKE ?", "m.original_name LIKE ?"]
+            keyword_params = [kw, kw]
+            if include_description:
+                keyword_parts.extend(
+                    ["m.manual_description LIKE ?", "m.ai_description LIKE ?"]
+                )
+                keyword_params.extend([kw, kw])
+            if include_ocr_text:
+                keyword_parts.extend(
+                    ["m.manual_ocr_text LIKE ?", "m.ai_ocr_text LIKE ?"]
+                )
+                keyword_params.extend([kw, kw])
+            keyword_parts.append(
+                "m.id IN (SELECT mt.meme_id FROM meme_tags mt "
+                "JOIN tags t ON t.id = mt.tag_id WHERE t.name LIKE ?)"
             )
-            params.extend([kw, kw, kw])
+            keyword_params.append(kw)
+            where.append("(" + " OR ".join(keyword_parts) + ")")
+            params.extend(keyword_params)
 
-        if tags:
-            placeholders = ",".join("?" for _ in tags)
-            where.append(f"""m.id IN (
+        normalized_tags = self._normalize_tags(tags)
+        if normalized_tags:
+            tag_conditions = " OR ".join(
+                "(t.category=? COLLATE NOCASE AND t.name=? COLLATE NOCASE)"
+                for _ in normalized_tags
+            )
+            where.append(
+                f"""m.id IN (
                 SELECT mt.meme_id FROM meme_tags mt
                 JOIN tags t ON t.id = mt.tag_id
-                WHERE t.name IN ({placeholders})
+                WHERE {tag_conditions}
                 GROUP BY mt.meme_id HAVING COUNT(DISTINCT t.id) = ?
-            )""")
-            params.extend(tags)
-            params.append(len(tags))
+            )"""
+            )
+            for category, name in normalized_tags:
+                params.extend([category, name])
+            params.append(len(normalized_tags))
 
         if collection_id is not None:
             if isinstance(collection_id, list):
                 placeholders = ",".join("?" for _ in collection_id)
-                where.append(f"""m.id IN (
+                where.append(
+                    f"""m.id IN (
                     SELECT mc.meme_id FROM meme_collections mc
                     WHERE mc.collection_id IN ({placeholders})
-                )""")
+                )"""
+                )
                 params.extend(collection_id)
             else:
                 where.append(
@@ -815,13 +1879,30 @@ class MemeDB:
                 )
                 params.append(collection_id)
 
+        if uncategorized_category:
+            where.append("m.category_id IS NULL")
+        elif category_id is not None:
+            category_ids = (
+                category_id if isinstance(category_id, list) else [category_id]
+            )
+            if category_ids:
+                placeholders = ",".join("?" for _ in category_ids)
+                where.append(f"m.category_id IN ({placeholders})")
+                params.extend(category_ids)
+
         if favorite_only:
             where.append("m.id IN (SELECT meme_id FROM favorites)")
 
         if uncategorized_only:
-            where.append("""NOT EXISTS (
+            where.append(
+                """NOT EXISTS (
                 SELECT 1 FROM meme_collections mc WHERE mc.meme_id = m.id
-            )""")
+            )"""
+            )
+
+        genre_condition = self._genre_condition(genre, "m.")
+        if genre_condition:
+            where.append(genre_condition)
 
         sql = "SELECT m.* FROM memes m"
         if where:
@@ -847,51 +1928,94 @@ class MemeDB:
     def count(
         self,
         keyword: str = "",
-        tags: List[str] = None,
+        tags: List[Any] = None,
         collection_id: int = None,
         favorite_only: bool = False,
         uncategorized_only: bool = False,
+        include_description: bool = True,
+        include_ocr_text: bool = True,
+        category_id=None,
+        uncategorized_category: bool = False,
+        genre: str = None,
     ) -> int:
         conn = self._get_conn()
         where = ["(stego_of_hash IS NULL OR stego_of_hash = '')"]
         params = []
         if keyword:
             kw = f"%{keyword}%"
-            where.append(
-                "(filename LIKE ? OR original_name LIKE ? OR memes.id IN ("
-                "SELECT mt.meme_id FROM meme_tags mt "
-                "JOIN tags t ON t.id = mt.tag_id WHERE t.name LIKE ?))"
+            keyword_parts = ["filename LIKE ?", "original_name LIKE ?"]
+            keyword_params = [kw, kw]
+            if include_description:
+                keyword_parts.extend(
+                    ["manual_description LIKE ?", "ai_description LIKE ?"]
+                )
+                keyword_params.extend([kw, kw])
+            if include_ocr_text:
+                keyword_parts.extend(["manual_ocr_text LIKE ?", "ai_ocr_text LIKE ?"])
+                keyword_params.extend([kw, kw])
+            keyword_parts.append(
+                "memes.id IN (SELECT mt.meme_id FROM meme_tags mt "
+                "JOIN tags t ON t.id = mt.tag_id WHERE t.name LIKE ?)"
             )
-            params.extend([kw, kw, kw])
-        if tags:
-            placeholders = ",".join("?" for _ in tags)
-            where.append(f"""id IN (
+            keyword_params.append(kw)
+            where.append("(" + " OR ".join(keyword_parts) + ")")
+            params.extend(keyword_params)
+        normalized_tags = self._normalize_tags(tags)
+        if normalized_tags:
+            tag_conditions = " OR ".join(
+                "(t.category=? COLLATE NOCASE AND t.name=? COLLATE NOCASE)"
+                for _ in normalized_tags
+            )
+            where.append(
+                f"""id IN (
                 SELECT mt.meme_id FROM meme_tags mt
                 JOIN tags t ON t.id = mt.tag_id
-                WHERE t.name IN ({placeholders})
+                WHERE {tag_conditions}
                 GROUP BY mt.meme_id HAVING COUNT(DISTINCT t.id) = ?
-            )""")
-            params.extend(tags)
-            params.append(len(tags))
+            )"""
+            )
+            for category, name in normalized_tags:
+                params.extend([category, name])
+            params.append(len(normalized_tags))
         if collection_id is not None:
             if isinstance(collection_id, list):
                 placeholders = ",".join("?" for _ in collection_id)
-                where.append(f"""id IN (
+                where.append(
+                    f"""id IN (
                     SELECT meme_id FROM meme_collections
                     WHERE collection_id IN ({placeholders})
-                )""")
+                )"""
+                )
                 params.extend(collection_id)
             else:
-                where.append("""id IN (
+                where.append(
+                    """id IN (
                     SELECT meme_id FROM meme_collections WHERE collection_id = ?
-                )""")
+                )"""
+                )
                 params.append(collection_id)
+
+        if uncategorized_category:
+            where.append("category_id IS NULL")
+        elif category_id is not None:
+            category_ids = (
+                category_id if isinstance(category_id, list) else [category_id]
+            )
+            if category_ids:
+                placeholders = ",".join("?" for _ in category_ids)
+                where.append(f"category_id IN ({placeholders})")
+                params.extend(category_ids)
         if favorite_only:
             where.append("id IN (SELECT meme_id FROM favorites)")
         if uncategorized_only:
-            where.append("""NOT EXISTS (
+            where.append(
+                """NOT EXISTS (
                 SELECT 1 FROM meme_collections WHERE meme_id = memes.id
-            )""")
+            )"""
+            )
+        genre_condition = self._genre_condition(genre)
+        if genre_condition:
+            where.append(genre_condition)
         sql = "SELECT COUNT(*) FROM memes"
         if where:
             sql += " WHERE " + " AND ".join(where)
@@ -1007,25 +2131,35 @@ class MemeDB:
             conn.execute("DELETE FROM recent_uses")
             conn.commit()
 
-    def get_recent(self, limit: int = 50, offset: int = 0) -> List[dict]:
+    def get_recent(
+        self, limit: int = 50, offset: int = 0, genre: str = None
+    ) -> List[dict]:
         """按最近使用时间分页查询表情（used_at 相同时以 meme_id 稳定排序）"""
         conn = self._get_conn()
+        where = ["(m.stego_of_hash IS NULL OR m.stego_of_hash = '')"]
+        genre_condition = self._genre_condition(genre, "m.")
+        if genre_condition:
+            where.append(genre_condition)
         rows = conn.execute(
             "SELECT m.* FROM memes m "
             "JOIN recent_uses r ON r.meme_id = m.id "
-            "WHERE (m.stego_of_hash IS NULL OR m.stego_of_hash = '') "
+            "WHERE " + " AND ".join(where) + " "
             "ORDER BY r.used_at DESC, r.meme_id DESC LIMIT ? OFFSET ?",
             (limit, offset),
         ).fetchall()
         return [dict(r) for r in rows]
 
-    def count_recent(self) -> int:
+    def count_recent(self, genre: str = None) -> int:
         """统计最近使用表情总数"""
         conn = self._get_conn()
+        where = ["(m.stego_of_hash IS NULL OR m.stego_of_hash = '')"]
+        genre_condition = self._genre_condition(genre, "m.")
+        if genre_condition:
+            where.append(genre_condition)
         row = conn.execute(
             "SELECT COUNT(*) FROM memes m "
             "JOIN recent_uses r ON r.meme_id = m.id "
-            "WHERE (m.stego_of_hash IS NULL OR m.stego_of_hash = '')"
+            "WHERE " + " AND ".join(where)
         ).fetchone()
         return row[0] if row else 0
 

@@ -10,6 +10,8 @@ QQ/微信只接受真实本地文件。本模块用 WinForms DoDragDrop 构造�
 import os
 import platform
 import threading
+import ctypes
+from ctypes import wintypes
 
 _lock = threading.Lock()
 
@@ -73,3 +75,101 @@ def start_native_drag(path):
     if "err" in result:
         return False
     return not result.get("cancelled", False)
+
+
+def start_chat_record_target_drag(record_id):
+    """启动不向目标投递内容的聊天记录拖拽，并返回松手位置的顶层窗口。
+
+    QQ 不需要接收任何文本或文件；拖拽只作为用户明确选择目标窗口的手势。
+    Esc 取消与鼠标正常松手通过 QueryContinueDrag 区分。
+    """
+    if platform.system() != "Windows":
+        return {"ok": False, "error": "聊天记录拖拽发送目前仅支持 Windows"}
+    try:
+        import webview
+
+        if not webview.windows:
+            return {"ok": False, "error": "主窗口尚未就绪"}
+        form = webview.windows[0].native
+        if form is None:
+            return {"ok": False, "error": "主窗口尚未就绪"}
+    except Exception:
+        return {"ok": False, "error": "无法访问主窗口"}
+
+    WinForms = _import_wf()
+    if WinForms is None:
+        return {"ok": False, "error": "缺少 Windows 原生拖拽组件"}
+
+    from System import Action
+
+    data = WinForms.DataObject()
+    data.SetData("OhMyMeme.ChatRecord", False, str(record_id))
+    result = {"released": False, "cancelled": False}
+
+    def _query_continue(_sender, event):
+        try:
+            action = str(event.Action).lower()
+            if event.EscapePressed or action == "cancel":
+                result["cancelled"] = True
+            elif action == "drop":
+                result["released"] = True
+        except Exception:
+            pass
+
+    def _run():
+        try:
+            form.QueryContinueDrag += _query_continue
+            form.DoDragDrop(data, WinForms.DragDropEffects.Copy)
+        except Exception as exc:
+            result["error"] = repr(exc)
+        finally:
+            try:
+                form.QueryContinueDrag -= _query_continue
+            except Exception:
+                pass
+
+    try:
+        with _lock:
+            form.Invoke(Action(_run))
+    except Exception:
+        return {"ok": False, "error": "无法启动原生拖拽"}
+    if result.get("error"):
+        return {"ok": False, "error": "原生拖拽失败"}
+    if result.get("cancelled") or not result.get("released"):
+        return {"ok": False, "cancelled": True}
+
+    user32 = ctypes.windll.user32
+    user32.GetCursorPos.argtypes = [ctypes.POINTER(wintypes.POINT)]
+    user32.GetCursorPos.restype = wintypes.BOOL
+    user32.WindowFromPoint.argtypes = [wintypes.POINT]
+    user32.WindowFromPoint.restype = wintypes.HWND
+    user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+    user32.GetAncestor.restype = wintypes.HWND
+    user32.GetWindowThreadProcessId.argtypes = [
+        wintypes.HWND,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+
+    point = wintypes.POINT()
+    if not user32.GetCursorPos(ctypes.byref(point)):
+        return {"ok": False, "error": "无法读取拖拽位置"}
+    window = user32.WindowFromPoint(point)
+    root = user32.GetAncestor(window, 2) if window else 0  # GA_ROOT
+    if not root:
+        return {"ok": False, "error": "未识别到目标窗口"}
+    process_id = wintypes.DWORD()
+    user32.GetWindowThreadProcessId(root, ctypes.byref(process_id))
+    try:
+        from System.Diagnostics import Process
+
+        process_name = str(Process.GetProcessById(int(process_id.value)).ProcessName)
+    except Exception:
+        process_name = ""
+    return {
+        "ok": True,
+        "window_handle": int(root),
+        "process_name": process_name,
+        "x": int(point.x),
+        "y": int(point.y),
+    }

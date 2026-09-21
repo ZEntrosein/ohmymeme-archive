@@ -125,6 +125,7 @@ def build_nuitka(onefile=False, use_clang=False, target=None):
         "--include-package=cryptography",
         "--include-package=keyboard",
         "--include-package=bottle",
+        "--include-package=websocket",
         "--disable-plugin=pywebview",
     ]
 

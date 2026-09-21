@@ -10,6 +10,8 @@ declare global {
     refreshMemes: () => void
     refreshTags: () => void
     refreshCollections: () => void
+    refreshCategories: () => void
+    refreshLibrary: (kind?: 'content' | 'structure') => void
     showLanDeviceConfirm: (device: any) => void
   }
 }

@@ -10,9 +10,26 @@ from . import __version__
 from .crypto_util import decrypt_data, encrypt_data
 
 APP_NAME = "OhMyMeme"
+CHAT_RECORD_MEDIA_DIRNAME = "chat-record-media"
 
 # 当前配置文件版本（与软件版本同步，用于数据迁移）
 _CONFIG_VERSION = __version__
+
+
+def resolve_path(path, allow_unresolved=False) -> Path:
+    """解析绝对路径；显式兼容虚拟盘时允许退回纯字符串规范化。
+
+    CloudDrive2 等虚拟文件系统可能可正常读写，却不支持 pathlib.resolve()
+    依赖的 Windows 最终路径 API。默认仍保持严格解析，避免静默放宽校验。
+    """
+    candidate = Path(path).expanduser()
+    try:
+        return candidate.resolve()
+    except OSError:
+        if not allow_unresolved:
+            raise
+        return Path(os.path.abspath(os.path.normpath(str(candidate))))
+
 
 # ~~~ 加密字段列表 ~~~（写入前自动加密，读取时自动解密）
 _SECRET_KEYS = {
@@ -23,11 +40,14 @@ _SECRET_KEYS = {
     "ftp_password",
     "webdav_password",
     "lan_secret",
+    "notion_token",
+    "napcat_token",
+    "napcat_webui_token",
 }
 
-# ~~~ 导入限制 ~~~（超过限制的图片拒绝入库）
+# ~~~ 导入限制 ~~~（原件保留；日常使用副本另行压缩）
 _IMPORT_MAX_PX = 2560  # 最长边像素上限（超过 2K）
-_IMPORT_MAX_BYTES = 20 * 1024 * 1024  # 文件大小上限（20 MiB）
+_IMPORT_MAX_BYTES = 200 * 1024 * 1024  # 原件硬上限（200 MiB）
 
 
 def _get_config_dir() -> Path:
@@ -68,6 +88,13 @@ class Config:
         "cache_max_size_mb": 500,
         "thumbnail_size": 150,
         "cache_dir": "",  # 自定义表情包存储目录（空=默认 data_dir/cache）
+        "virtual_drive_compat": False,  # resolve() 失效的虚拟盘兼容（默认严格）
+        # 一次性读取大量原件时串行化并分批暂停，适合 CloudDrive2 等虚拟盘
+        "bulk_read_protection": False,
+        "bulk_read_batch_size": 8,
+        "bulk_read_pause_seconds": 1.0,
+        # 当前筛选存在后续页时，后台按限流参数补建日常副本和缩略图
+        "bulk_read_prefetch_pages": False,
         # 本地备份
         "backup_dir": "",  # 自定义备份输出目录（空=默认 data_dir/backups）
         # 云端同步
@@ -116,8 +143,27 @@ class Config:
         # 局域网互联
         "lan_port": 17852,  # 局域网服务端口
         "lan_secret": "",  # 互联访问密钥（加密存储）
+        # QQ 聊天记录桥接（NapCat / OneBot 11）
+        "napcat_enabled": False,
+        "napcat_http_url": "http://127.0.0.1:3000",
+        "napcat_ws_url": "ws://127.0.0.1:3001",
+        "napcat_token": "",
+        "napcat_webui_url": "http://127.0.0.1:6099",
+        "napcat_webui_token": "",
+        "napcat_command": "/omm",
+        "napcat_send_mode": "original_native",
         # Telegram 导入
         "tg_tdata_path": "",  # 手动指定的 Telegram tdata 目录
+        # Notion 只读导入
+        "notion_token": "",
+        "notion_database_id": "",
+        "notion_data_source_id": "",
+        "notion_media_property": "",
+        "notion_title_property": "",
+        "notion_tags_property": "",
+        "notion_tag_mappings": [],
+        "notion_collection_property": "",
+        "notion_version": "2026-03-11",
         # UI
         "theme": "dark",
         "window_x": -1,
@@ -125,7 +171,9 @@ class Config:
         "auto_play_gif": True,
         "hover_to_play": False,
         "try_original_image": False,
-        "show_uncategorized": True,  # 显示「未分类」分组
+        "search_description": True,
+        "search_image_text": True,
+        "show_uncategorized": True,  # 显示「未分组」分组
         "record_recent_use": True,  # 复制时记录最近使用
         "show_startup_animation": True,  # 启动时播放启动动画（关闭时降级 300ms 延时）
     }
@@ -259,7 +307,7 @@ class Config:
     def cache_dir(self) -> Path:
         custom = self.get("cache_dir")
         if custom:
-            d = Path(custom).expanduser().resolve()
+            d = resolve_path(custom, self.get("virtual_drive_compat", False) is True)
         else:
             d = self.data_dir / "cache"
         d.mkdir(parents=True, exist_ok=True)
@@ -268,6 +316,20 @@ class Config:
     @property
     def thumbnail_dir(self) -> Path:
         d = self.data_dir / "thumbnails"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    @property
+    def derivative_dir(self) -> Path:
+        """可再生的日常副本目录，不随原件备份或远程同步。"""
+        d = self.data_dir / "derivatives"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    @property
+    def chat_record_media_dir(self) -> Path:
+        """聊天记录媒体目录，跟随表情包存储位置迁移与备份。"""
+        d = self.cache_dir / CHAT_RECORD_MEDIA_DIRNAME
         d.mkdir(parents=True, exist_ok=True)
         return d
 

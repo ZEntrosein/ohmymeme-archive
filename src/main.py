@@ -136,9 +136,32 @@ class OhMyMemeApp:
         except Exception as e:
             logger.debug("storage migration resume: %s", e)
 
+        # 7. 按设置启动 QQ /omm 命令监听（WebSocket 自动重连）。
+        try:
+            from . import onebot
+
+            def _migrate_chat_media():
+                try:
+                    result = onebot.migrate_legacy_chat_record_media(
+                        self._db, self._cfg
+                    )
+                    if result["files"]:
+                        logger.info(
+                            "聊天记录媒体迁移完成: %s 份记录，%s 个文件",
+                            result["records"],
+                            result["files"],
+                        )
+                except Exception as migrate_error:
+                    logger.warning("聊天记录媒体迁移失败: %s", migrate_error)
+
+            threading.Thread(target=_migrate_chat_media, daemon=True).start()
+            onebot.apply_command_listener_config(self._cfg)
+        except Exception as e:
+            logger.warning("NapCat 命令监听启动失败: %s", e)
+
         logger.info(f"{__app_name__} v{__version__} 已启动")
 
-        # 7. 启动 WebView GUI 循环（阻塞主线程）
+        # 8. 启动 WebView GUI 循环（阻塞主线程）
         try:
             self._webui.start()
         except Exception as e:
@@ -189,6 +212,12 @@ class OhMyMemeApp:
             from . import lan
 
             lan.stop()
+        except Exception:
+            pass
+        try:
+            from . import onebot
+
+            onebot.stop_command_listener()
         except Exception:
             pass
         if self._webui:

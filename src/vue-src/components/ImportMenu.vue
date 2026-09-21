@@ -5,6 +5,7 @@ import { api } from '../utils/api'
 const emit = defineEmits<{
   imported: []
   importing: []
+  notion: []
   error: [msg: string]
 }>()
 
@@ -90,6 +91,11 @@ function importQQ() {
   } catch (_) {}
 }
 
+function importNotion() {
+  close()
+  emit('notion')
+}
+
 function showToast(msg: string) {
   const el = document.getElementById('toast')
   if (!el) return
@@ -108,6 +114,7 @@ defineExpose({ open, close })
       <button class="btn btn-primary btn-block" :disabled="pending" @click="importLocal">本地导入</button>
       <button class="btn btn-primary btn-block" :disabled="pending" @click="importFolder">导入文件夹</button>
       <button class="btn btn-primary btn-block" :disabled="pending" @click="importClipboard">从剪贴板导入</button>
+      <button class="btn btn-secondary btn-block" :disabled="pending" @click="importNotion">从 Notion 数据库导入</button>
       <button class="btn btn-secondary btn-block" @click="importQQ">从手机版 QQ 缓存获取</button>
       <label class="import-group-label">
         <input id="import-folder-group" type="checkbox" checked> 导入文件夹时自动创建分组

@@ -1,0 +1,12 @@
+{
+  "name": "napcat-plugin-ohmymeme-current-peer",
+  "plugin": "OhMyMeme 当前会话桥接",
+  "version": "0.4.16",
+  "main": "index.mjs",
+  "description": "为 OhMyMeme 暴露 QQNT 当前会话，恢复持久原生转发与多层聊天记录资源。",
+  "author": "OhMyMeme",
+  "napcat": {
+    "tags": ["工具", "OhMyMeme"],
+    "minVersion": "4.18.0"
+  }
+}

@@ -23,10 +23,12 @@ except ImportError:
     HAS_AESGCM = False
 
 from . import __version__
+from .bulk_read import guarded_read
 from .config import (
     _IMPORT_MAX_BYTES,
     _IMPORT_MAX_PX,
     _SECRET_KEYS,
+    CHAT_RECORD_MEDIA_DIRNAME,
     get_config,
 )
 from .database import get_db
@@ -407,12 +409,17 @@ class LanServer:
     def _cmd_push_manifest(self, manifest) -> dict:
         if not isinstance(manifest, dict):
             return {"ok": False, "error": "manifest 格式错误"}
-        from .sync import _apply_remote_collections, _apply_remote_order
+        from .sync import (
+            _apply_remote_categories,
+            _apply_remote_collections,
+            _apply_remote_order,
+        )
 
         db = get_db()
         try:
             _apply_remote_order(manifest)
             _apply_remote_collections(manifest)
+            _apply_remote_categories(manifest)
         except Exception as e:
             logger.warning(f"push_manifest apply error: {e}")
         build_manifest()
@@ -425,7 +432,8 @@ class LanServer:
         if not path:
             return {"ok": False, "error": "文件不存在"}
         try:
-            data = Path(path).read_bytes()
+            with guarded_read():
+                data = Path(path).read_bytes()
         except OSError as e:
             return {"ok": False, "error": str(e)}
         data_b64 = base64.b64encode(data).decode()
@@ -542,7 +550,13 @@ def _find_meme_file(filename: str):
     direct = cache_dir / filename
     if direct.exists() and direct.is_file():
         return direct
-    for root, _, files in os.walk(cache_dir):
+    for root, dirs, files in os.walk(cache_dir):
+        if Path(root) == Path(cache_dir):
+            dirs[:] = [
+                item
+                for item in dirs
+                if item.casefold() != CHAT_RECORD_MEDIA_DIRNAME.casefold()
+            ]
         if filename in files:
             full = os.path.join(root, filename)
             if os.path.isfile(full):
@@ -567,10 +581,11 @@ def _import_bytes(data: bytes, filename: str) -> dict:
         return {"ok": False, "error": "图片解析失败"}
     if w <= 0 or h <= 0:
         return {"ok": False, "error": "图片尺寸无效"}
-    if len(data) > _IMPORT_MAX_BYTES:
+    allowed_bytes = min(MAX_FILE_SIZE, _IMPORT_MAX_BYTES)
+    if len(data) > allowed_bytes:
         return {
             "ok": False,
-            "error": "文件超过 %dMB 限制" % (_IMPORT_MAX_BYTES // (1024 * 1024)),
+            "error": "文件超过 %dMB 限制" % (allowed_bytes // (1024 * 1024)),
         }
     if max(w, h) > _IMPORT_MAX_PX:
         return {"ok": False, "error": "分辨率超过 %dK 限制" % (_IMPORT_MAX_PX // 1000)}
@@ -592,6 +607,10 @@ def _import_bytes(data: bytes, filename: str) -> dict:
         original_name=os.path.splitext(filename)[0],
     )
     build_manifest()
+    # 局域网推送在服务线程中完成，通知主窗口重新查询当前内容页。
+    from .library_events import notify_changed
+
+    notify_changed("content")
     return {"ok": True, "filename": dst.name}
 
 

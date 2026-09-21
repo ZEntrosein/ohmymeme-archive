@@ -179,6 +179,147 @@ async function checkConnectivity() {
   }
 }
 
+function toggleBulkReadOptions() {
+  const enabled = document.getElementById('s-bulk-read-protection')?.checked === true;
+  for (const id of ['s-bulk-read-prefetch-pages', 's-bulk-read-batch-size', 's-bulk-read-pause-seconds']) {
+    const input = document.getElementById(id);
+    if (input) input.disabled = !enabled;
+  }
+  const options = document.getElementById('s-bulk-read-options');
+  if (options) options.style.opacity = enabled ? '1' : '0.55';
+}
+
+function collectNapCatSettings() {
+  return {
+    napcat_enabled: document.getElementById('s-napcat-enabled')?.checked === true,
+    napcat_http_url: document.getElementById('s-napcat-http-url')?.value.trim() || '',
+    napcat_webui_url: document.getElementById('s-napcat-webui-url')?.value.trim() || '',
+    napcat_webui_token: document.getElementById('s-napcat-webui-token')?.value || '',
+    napcat_ws_url: document.getElementById('s-napcat-ws-url')?.value.trim() || '',
+    napcat_token: document.getElementById('s-napcat-token')?.value || '',
+    napcat_command: document.getElementById('s-napcat-command')?.value.trim() || '/omm',
+    napcat_send_mode: document.getElementById('s-napcat-send-mode')?.value || 'original_native',
+  };
+}
+
+async function testNapCatConnection() {
+  const settings = collectNapCatSettings();
+  const btn = document.getElementById('btn-napcat-test');
+  const status = document.getElementById('napcat-status');
+  if (!settings.napcat_http_url || !settings.napcat_ws_url) {
+    showToast('请填写 NapCat HTTP 和 WebSocket 地址');
+    return;
+  }
+  if (btn) { btn.disabled = true; btn.textContent = '连接中...'; }
+  if (status) {
+    status.textContent = '正在验证 OneBot 登录态和版本...';
+    setStatusColor(status, '');
+    status.style.color = 'var(--muted)';
+  }
+  try {
+    const r = await api(
+      'napcat_test_connection',
+      settings.napcat_http_url,
+      settings.napcat_ws_url,
+      settings.napcat_token
+    );
+    if (!r || !r.ok) {
+      if (status) {
+        status.textContent = '连接失败：' + ((r && r.error) || '未知错误');
+        setStatusColor(status, 'error');
+      }
+      return;
+    }
+    const account = [r.nickname, r.user_id ? 'QQ ' + r.user_id : ''].filter(Boolean).join('（')
+      + (r.nickname && r.user_id ? '）' : '');
+    const version = [r.app_name, r.app_version].filter(Boolean).join(' ');
+    const protocol = r.protocol_version ? 'OneBot ' + r.protocol_version : '';
+    if (status) {
+      status.textContent = '连接成功：' + [account, version, protocol].filter(Boolean).join(' · ');
+      setStatusColor(status, 'ok');
+    }
+  } catch (_) {
+    if (status) {
+      status.textContent = '连接测试失败';
+      setStatusColor(status, 'error');
+    }
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '测试连接'; }
+  }
+}
+
+async function applyNapCatListener() {
+  const settings = collectNapCatSettings();
+  const btn = document.getElementById('btn-napcat-listen');
+  const status = document.getElementById('napcat-listener-status');
+  if (!settings.napcat_http_url || !settings.napcat_ws_url) {
+    showToast('请填写 NapCat HTTP 和 WebSocket 地址');
+    return;
+  }
+  if (!/^\/\S{1,31}$/.test(settings.napcat_command)) {
+    showToast('保存命令必须以 / 开头，且不能包含空格');
+    return;
+  }
+  if (btn) { btn.disabled = true; btn.textContent = '应用中...'; }
+  if (status) status.textContent = settings.napcat_enabled ? '正在启动命令监听...' : '正在停止命令监听...';
+  try {
+    const r = await api(
+      'napcat_apply_listener',
+      settings.napcat_enabled,
+      settings.napcat_http_url,
+      settings.napcat_ws_url,
+      settings.napcat_token,
+      settings.napcat_command,
+      settings.napcat_send_mode,
+      settings.napcat_webui_url,
+      settings.napcat_webui_token
+    );
+    if (!r || !r.ok) {
+      if (status) {
+        status.textContent = '应用失败：' + ((r && r.error) || '未知错误');
+        setStatusColor(status, 'error');
+      }
+      return;
+    }
+    await refreshNapCatListenerStatus();
+  } catch (_) {
+    if (status) {
+      status.textContent = '命令监听应用失败';
+      setStatusColor(status, 'error');
+    }
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '应用并监听'; }
+  }
+}
+
+async function refreshNapCatListenerStatus() {
+  const status = document.getElementById('napcat-listener-status');
+  if (!status) return;
+  const r = await api('napcat_get_listener_status');
+  if (!r) return;
+  const command = r.command || '/omm';
+  let headline = '监听未启动';
+  let mode = '';
+  if (r.connected) {
+    headline = '监听已连接，等待你在 QQ 中发送 ' + command;
+    mode = 'ok';
+  } else if (r.running) {
+    headline = '监听正在重连 NapCat...';
+  }
+  const lines = [headline, '本地已保存 ' + Number(r.saved_count || 0) + ' 份聊天记录'];
+  const latest = r.latest || r.last_saved;
+  if (latest && latest.title) {
+    lines.push('最近保存：' + latest.title + ' · ' + Number(latest.node_count || 0) + ' 条消息');
+  }
+  if (r.last_error) {
+    lines.push('最近错误：' + r.last_error);
+    mode = 'error';
+  }
+  status.textContent = lines.join('\n');
+  status.style.whiteSpace = 'pre-line';
+  setStatusColor(status, mode);
+}
+
 /* 局域网互联 */
 let lanPollTimer = null;
 
@@ -297,8 +438,23 @@ async function getSettings() {
   if (unc) unc.checked = s.show_uncategorized !== false;
   const rec = document.getElementById('s-record-recent');
   if (rec) rec.checked = s.record_recent_use !== false;
+  const searchDescription = document.getElementById('s-search-description');
+  if (searchDescription) searchDescription.checked = s.search_description !== false;
+  const searchImageText = document.getElementById('s-search-image-text');
+  if (searchImageText) searchImageText.checked = s.search_image_text !== false;
   const ssa = document.getElementById('s-show-startup-anim');
   if (ssa) ssa.checked = s.show_startup_animation !== false;
+  const vdc = document.getElementById('s-virtual-drive-compat');
+  if (vdc) vdc.checked = s.virtual_drive_compat === true;
+  const brp = document.getElementById('s-bulk-read-protection');
+  if (brp) brp.checked = s.bulk_read_protection === true;
+  const brpp = document.getElementById('s-bulk-read-prefetch-pages');
+  if (brpp) brpp.checked = s.bulk_read_prefetch_pages === true;
+  const brbs = document.getElementById('s-bulk-read-batch-size');
+  if (brbs) brbs.value = String(s.bulk_read_batch_size || 8);
+  const brps = document.getElementById('s-bulk-read-pause-seconds');
+  if (brps) brps.value = String(s.bulk_read_pause_seconds ?? 1);
+  toggleBulkReadOptions();
   toggleSilentStart();
   const ff = document.getElementById('s-sync-fetch');
   const sa = document.getElementById('s-sync-auto');
@@ -348,11 +504,28 @@ async function getSettings() {
   if (lport) lport.value = s.lan_port || 17852;
   const lsec = document.getElementById('s-lan-secret');
   if (lsec) lsec.value = s.lan_secret || '';
+  const napcatEnabled = document.getElementById('s-napcat-enabled');
+  if (napcatEnabled) napcatEnabled.checked = s.napcat_enabled === true;
+  const napcatHttp = document.getElementById('s-napcat-http-url');
+  if (napcatHttp) napcatHttp.value = s.napcat_http_url || 'http://127.0.0.1:3000';
+  const napcatWebUi = document.getElementById('s-napcat-webui-url');
+  if (napcatWebUi) napcatWebUi.value = s.napcat_webui_url || 'http://127.0.0.1:6099';
+  const napcatWebUiToken = document.getElementById('s-napcat-webui-token');
+  if (napcatWebUiToken) napcatWebUiToken.value = s.napcat_webui_token || '';
+  const napcatWs = document.getElementById('s-napcat-ws-url');
+  if (napcatWs) napcatWs.value = s.napcat_ws_url || 'ws://127.0.0.1:3001';
+  const napcatToken = document.getElementById('s-napcat-token');
+  if (napcatToken) napcatToken.value = s.napcat_token || '';
+  const napcatCommand = document.getElementById('s-napcat-command');
+  if (napcatCommand) napcatCommand.value = s.napcat_command || '/omm';
+  const napcatSendMode = document.getElementById('s-napcat-send-mode');
+  if (napcatSendMode) napcatSendMode.value = s.napcat_send_mode || 'original_native';
   const tgtd = document.getElementById('s-tg-tdata');
   if (tgtd && s.tg_tdata_path) tgtd.value = s.tg_tdata_path;
   checkConnectivity();  // DeepSeek V4 Flash
   loadStorageInfo();
   refreshLanStatus();
+  refreshNapCatListenerStatus();
   _settingsDirty = false;
   return true;
 }
@@ -408,12 +581,13 @@ async function applyStorageDir() {
   if (!pendingStorageDir) return;
   const moveEl = document.getElementById('s-move-files');
   const move = moveEl ? moveEl.checked === true : true;
+  const compat = document.getElementById('s-virtual-drive-compat')?.checked === true;
   const btn = document.getElementById('btn-storage-apply');
   const status = document.getElementById('s-storage-status');
   const pending = document.getElementById('s-storage-pending');
   if (btn) btn.disabled = true;
   try {
-    const r = await api('apply_storage_dir', pendingStorageDir, move);
+    const r = await api('apply_storage_dir', pendingStorageDir, move, compat);
     if (!r || !r.ok) {
       if (status) status.textContent = '应用失败：' + (r && r.error ? r.error : '未知错误');
       return;
@@ -600,22 +774,40 @@ async function saveSettings() {
   const silent_start = document.getElementById('s-silent-start')?.checked === true;
   const show_uncategorized = document.getElementById('s-show-uncategorized')?.checked !== false;
   const record_recent_use = document.getElementById('s-record-recent')?.checked !== false;
+  const search_description = document.getElementById('s-search-description')?.checked !== false;
+  const search_image_text = document.getElementById('s-search-image-text')?.checked !== false;
   const show_startup_animation = document.getElementById('s-show-startup-anim')?.checked !== false;
+  const virtual_drive_compat = document.getElementById('s-virtual-drive-compat')?.checked === true;
+  const bulk_read_protection = document.getElementById('s-bulk-read-protection')?.checked === true;
+  const bulk_read_prefetch_pages = document.getElementById('s-bulk-read-prefetch-pages')?.checked === true;
+  const batchValue = parseInt(document.getElementById('s-bulk-read-batch-size')?.value || '8', 10);
+  const pauseValue = parseFloat(document.getElementById('s-bulk-read-pause-seconds')?.value || '1');
+  const bulk_read_batch_size = Math.max(1, Math.min(Number.isFinite(batchValue) ? batchValue : 8, 1000));
+  const bulk_read_pause_seconds = Math.max(0, Math.min(Number.isFinite(pauseValue) ? pauseValue : 1, 60));
   const sync = collectSyncSettings();
+  const napcat = collectNapCatSettings();
   if (!validateSync(sync)) return;
   const lan_port = parseInt(document.getElementById('s-lan-port')?.value) || 17852;
   const lan_secret = document.getElementById('s-lan-secret')?.value || '';
   const hover_play = document.getElementById('s-hover-play')?.checked === true;
-  await api('save_settings', {
+  const saved = await api('save_settings', {
     hotkey, hotkey_show_at_mouse, auto_play_gif: gif, hover_to_play: hover_play,
     try_original_image: try_original,  // DeepSeek V4 Flash
     copy_resize_mode: copy_mode,
     auto_start, silent_start, show_uncategorized, record_recent_use,
-    show_startup_animation,
+    search_description, search_image_text,
+    show_startup_animation, virtual_drive_compat, bulk_read_protection,
+    bulk_read_batch_size, bulk_read_pause_seconds, bulk_read_prefetch_pages,
     lan_port, lan_secret,
+    ...napcat,
     ...sync
   });
+  if (saved && saved.ok === false) {
+    showToast('保存失败：' + (saved.error || '未知错误'));
+    return;
+  }
   showToast('设置已保存');
+  refreshNapCatListenerStatus();
   _settingsDirty = false;
 }
 
@@ -684,12 +876,46 @@ async function resetSettings() {
     if (dd) dd.checked = true;
     const rec = document.getElementById('s-record-recent');
     if (rec) rec.checked = true;
+    const searchDescription = document.getElementById('s-search-description');
+    if (searchDescription) searchDescription.checked = s.search_description !== false;
+    const searchImageText = document.getElementById('s-search-image-text');
+    if (searchImageText) searchImageText.checked = s.search_image_text !== false;
     const ssa = document.getElementById('s-show-startup-anim');
     if (ssa) ssa.checked = true;
+    const vdc = document.getElementById('s-virtual-drive-compat');
+    if (vdc) vdc.checked = s.virtual_drive_compat === true;
+    const brp = document.getElementById('s-bulk-read-protection');
+    if (brp) brp.checked = false;
+    const brpp = document.getElementById('s-bulk-read-prefetch-pages');
+    if (brpp) brpp.checked = false;
+    const brbs = document.getElementById('s-bulk-read-batch-size');
+    if (brbs) brbs.value = '8';
+    const brps = document.getElementById('s-bulk-read-pause-seconds');
+    if (brps) brps.value = '1';
+    toggleBulkReadOptions();
     const lport = document.getElementById('s-lan-port');
     if (lport) lport.value = '17852';
     const lsec = document.getElementById('s-lan-secret');
     if (lsec) lsec.value = '';
+    const napcatEnabled = document.getElementById('s-napcat-enabled');
+    if (napcatEnabled) napcatEnabled.checked = false;
+    const napcatHttp = document.getElementById('s-napcat-http-url');
+    if (napcatHttp) napcatHttp.value = s.napcat_http_url || 'http://127.0.0.1:3000';
+    const napcatWebUi = document.getElementById('s-napcat-webui-url');
+    if (napcatWebUi) napcatWebUi.value = 'http://127.0.0.1:6099';
+    const napcatWebUiToken = document.getElementById('s-napcat-webui-token');
+    if (napcatWebUiToken) napcatWebUiToken.value = '';
+    const napcatWs = document.getElementById('s-napcat-ws-url');
+    if (napcatWs) napcatWs.value = s.napcat_ws_url || 'ws://127.0.0.1:3001';
+    const napcatToken = document.getElementById('s-napcat-token');
+    if (napcatToken) napcatToken.value = '';
+    const napcatCommand = document.getElementById('s-napcat-command');
+    if (napcatCommand) napcatCommand.value = s.napcat_command || '/omm';
+    const napcatSendMode = document.getElementById('s-napcat-send-mode');
+    if (napcatSendMode) napcatSendMode.value = s.napcat_send_mode || 'original_native';
+    const napcatStatus = document.getElementById('napcat-status');
+    if (napcatStatus) { napcatStatus.textContent = ''; setStatusColor(napcatStatus, ''); }
+    refreshNapCatListenerStatus();
     const le = document.getElementById('s-lan-enable');
     if (le) le.checked = false;
     const lcc = document.getElementById('s-lan-secret-config');
@@ -2191,4 +2417,5 @@ document.addEventListener('DOMContentLoaded', () => {
   initSettings();
   setTimeout(initVersion, 500);
   initDirtyTracking();
+  setInterval(refreshNapCatListenerStatus, 3000);
 });

@@ -375,9 +375,14 @@ def test_pull_manifest(lan_env):
     sock.close()
 
 
-def test_push_pull_file(lan_env):
+def test_push_pull_file(lan_env, monkeypatch):
     cfg, db, tmp = lan_env
     import base64
+
+    changed = []
+    monkeypatch.setattr(
+        "src.library_events.notify_changed", lambda kind: changed.append(kind)
+    )
 
     sock = _connect()
     key = _handshake(sock, "test-secret")
@@ -399,6 +404,7 @@ def test_push_pull_file(lan_env):
     assert resp2["ok"] is True
 
     assert base64.b64decode(resp2["data"]) == png
+    assert changed == ["content"]
     sock.close()
     sock2.close()
 

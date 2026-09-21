@@ -51,11 +51,22 @@
     <div class="section" data-group="base">
       <div class="section-title">分组显示</div>
       <label class="check-row">
-        <input id="s-show-uncategorized" type="checkbox">显示「未分类」分组
+        <input id="s-show-uncategorized" type="checkbox">显示「未分组」分组
       </label>
       <label class="check-row">
         <input id="s-record-recent" type="checkbox">记录最近使用
       </label>
+    </div>
+
+    <div class="section" data-group="base">
+      <div class="section-title">搜索范围</div>
+      <label class="check-row">
+        <input id="s-search-description" type="checkbox" checked>图片描述参与关键词搜索
+      </label>
+      <label class="check-row">
+        <input id="s-search-image-text" type="checkbox" checked>图片文字参与关键词搜索
+      </label>
+      <p style="font-size:11px;color:var(--muted);margin:4px 0 0 24px;line-height:1.5">文件名和标签始终参与搜索；这两项可分别关闭。</p>
     </div>
 
     <div class="section" data-group="base">
@@ -95,6 +106,30 @@
     <div class="section" data-group="base">
       <div class="section-title">存储位置</div>
       <p style="font-size:11.5px;color:var(--muted);margin-bottom:10px;line-height:1.6">表情包图片文件存放目录；数据库与缩略图仍保留在系统数据目录</p>
+      <label class="check-row" style="margin-bottom:10px">
+        <input id="s-virtual-drive-compat" type="checkbox">增强虚拟盘兼容性（CloudDrive2 等）
+      </label>
+      <p style="font-size:11px;color:var(--muted);margin:-4px 0 10px 24px;line-height:1.5">仅在虚拟盘无法解析真实路径时启用；应用目录前会执行临时文件读写与原子重命名测试。</p>
+      <label class="check-row" style="margin-bottom:10px">
+        <input id="s-bulk-read-protection" type="checkbox" onchange="toggleBulkReadOptions()">批量读取保护（分批、限速读取原件）
+      </label>
+      <p style="font-size:11px;color:var(--muted);margin:-4px 0 10px 24px;line-height:1.5">适合 115/CloudDrive2 等虚拟盘；启动扫描、首次建立日常副本、备份、迁移和同步读取大量文件时限制为单文件读取。普通本地磁盘无需开启。</p>
+      <div id="s-bulk-read-options" style="margin:0 0 12px 24px">
+        <label class="check-row" style="margin-bottom:8px">
+          <input id="s-bulk-read-prefetch-pages" type="checkbox">后台逐渐缓存当前结果的后续页面
+        </label>
+        <p style="font-size:11px;color:var(--muted);margin:-3px 0 9px 26px;line-height:1.5">适用于主页、搜索结果、分组和类别；只生成持久化的日常副本与缩略图，不把全部图片长期留在内存中。切换筛选时会取消旧任务。</p>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+          <div class="form-group" style="margin-bottom:0">
+            <label>每批文件数</label>
+            <input id="s-bulk-read-batch-size" type="number" min="1" max="1000" step="1" value="8">
+          </div>
+          <div class="form-group" style="margin-bottom:0">
+            <label>每批暂停（秒）</label>
+            <input id="s-bulk-read-pause-seconds" type="number" min="0" max="60" step="0.1" value="1">
+          </div>
+        </div>
+      </div>
       <div class="form-group">
         <label>当前存储目录</label>
         <input id="s-cache-dir" readonly placeholder="加载中...">
@@ -157,6 +192,64 @@
         </span>
         <span class="import-name">微信</span>
       </button>
+    </div>
+
+    <div class="section" data-group="network">
+      <div class="section-title">QQ 聊天记录（NapCat）</div>
+      <p style="font-size:11.5px;color:var(--muted);margin-bottom:10px;line-height:1.6">监听你在 QQ 中发出的特定命令。回复一条合并转发消息并发送命令，即可把完整嵌套结构保存到 OhMyMeme</p>
+      <label class="check-row" style="margin-bottom:12px">
+        <input id="s-napcat-enabled" type="checkbox">启用 QQ 命令监听
+      </label>
+      <div class="form-group">
+        <label>HTTP 服务地址</label>
+        <input id="s-napcat-http-url" value="http://127.0.0.1:3000" spellcheck="false">
+      </div>
+      <div class="form-group">
+        <label>WebUI/API 地址（当前会话桥接）</label>
+        <input id="s-napcat-webui-url" value="http://127.0.0.1:6099" spellcheck="false">
+        <div class="form-hint">NapCat WebUI 默认端口通常是 6099；用于读取 QQ 当前会话 ID，不是 OneBot HTTP 端口</div>
+      </div>
+      <div class="form-group">
+        <label>WebUI Token</label>
+        <input id="s-napcat-webui-token" type="password" autocomplete="off" placeholder="NapCat webui.json 中的 token">
+      </div>
+      <div class="form-group">
+        <label>WebSocket 服务地址</label>
+        <input id="s-napcat-ws-url" value="ws://127.0.0.1:3001" spellcheck="false">
+      </div>
+      <div class="form-group">
+        <label>Access Token</label>
+        <input id="s-napcat-token" type="password" autocomplete="off" placeholder="在 NapCat 网络配置中设置的 Token">
+      </div>
+      <div class="form-group">
+        <label>保存命令</label>
+        <input id="s-napcat-command" value="/omm" spellcheck="false" placeholder="例如 /omm">
+      </div>
+      <div class="form-group">
+        <label>聊天记录发送方式</label>
+        <select id="s-napcat-send-mode">
+          <option value="original_native">原生转发原消息（推荐）</option>
+          <option value="original_rebuild">重新读取原消息并重组</option>
+          <option value="archive_rebuild">仅使用本地归档重组</option>
+        </select>
+        <div class="form-hint">用于测试三条发送链路；所选方式失败时不会自动切换到其他方式</div>
+      </div>
+      <div style="display:flex;gap:8px">
+        <button id="btn-napcat-test" class="btn btn-secondary btn-sm btn-flex" onclick="testNapCatConnection()">测试连接</button>
+        <button id="btn-napcat-listen" class="btn btn-secondary btn-sm btn-flex" onclick="applyNapCatListener()">应用并监听</button>
+      </div>
+      <div id="napcat-status" role="status" aria-live="polite" style="font-size:11.5px;color:var(--muted);margin-top:6px;line-height:1.8"></div>
+      <div style="height:1px;background:var(--border);margin:16px 0 13px"></div>
+      <div style="font-size:12px;font-weight:600;color:var(--fg);margin-bottom:6px">使用方法</div>
+      <ol style="font-size:11.5px;color:var(--muted);padding-left:18px;line-height:1.8;margin-bottom:8px">
+        <li>在 NapCat 的 WebSocket 服务配置中开启“上报自身消息”（reportSelfMessage）</li>
+        <li>在 NapCat 的 OneBot 全局配置中开启“解析合并转发消息”（parseMultMsg），否则多层嵌套内容可能为空</li>
+        <li>在 QQ 中右键一条合并转发聊天记录，选择“回复”</li>
+        <li>只发送上方命令，例如 <code>/omm</code></li>
+        <li>OhMyMeme 会在原会话回复保存结果</li>
+      </ol>
+      <p style="font-size:11.5px;color:var(--muted);line-height:1.6">也可发送 <code>/omm 消息ID</code> 作为排障备用。仅接受当前 QQ 账号自己发送的命令，其他人的同名消息不会触发保存</p>
+      <div id="napcat-listener-status" role="status" aria-live="polite" style="font-size:11.5px;color:var(--muted);margin-top:9px;line-height:1.75"></div>
     </div>
 
     <div class="section" data-group="network">

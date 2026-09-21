@@ -183,6 +183,7 @@ def build_pyinstaller(target=None):
         "--add-data", str(SRC_DIR / "adb-help.txt") + sep + "src/adb-help.txt",
         "--add-data", str(PROJECT_ROOT / "config" / "offsets.json") + sep + "config",
         "--hidden-import", "src.main",
+        "--hidden-import", "websocket",
         str(PROJECT_ROOT / "scripts" / "launcher.py"),
     ]
 

@@ -231,6 +231,9 @@ select:hover { border-color: var(--border-light); }
 .ftp-row > * { flex: 1; }
 .form-group { margin-bottom: 10px; }
 .form-group:last-child { margin-bottom: 0; }
+.form-hint {
+  margin-top: 5px; font-size: 11px; line-height: 1.55; color: var(--muted);
+}
 
 /* Toast */
 #toast {

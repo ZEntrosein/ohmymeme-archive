@@ -62,9 +62,11 @@ def env(tmp_path, monkeypatch):
     _reset()
 
 
-def _run_sync(env):
+def _run_sync(env, virtual_drive_compat=None):
     """直接同步跑 worker（绕过线程），返回最终状态"""
-    webui._storage_migrate_worker(env["old"], env["new"])
+    webui._storage_migrate_worker(
+        env["old"], env["new"], virtual_drive_compat
+    )
     with webui._STORAGE_MIGRATE_LOCK:
         return dict(webui._STORAGE_MIGRATE_STATE)
 
@@ -86,6 +88,13 @@ def test_normal_migration(env):
     assert env["cfg"].saved["cache_dir"] == str(env["new"])
     assert env["cfg"].saved.get("_saved") is True
     assert not webui._storage_migrate_manifest_path().exists()
+
+
+def test_migration_commits_virtual_drive_compat_with_cache_dir(env):
+    st = _run_sync(env, virtual_drive_compat=True)
+    assert st["status"] == "done"
+    assert env["cfg"].saved["cache_dir"] == str(env["new"])
+    assert env["cfg"].saved["virtual_drive_compat"] is True
 
 
 def test_idempotent_rerun_same_size_files(env):
@@ -162,7 +171,13 @@ def test_resume_pending_migration(tmp_path, monkeypatch, env):
     # 构造崩溃现场：清单存在，部分文件已复制到新目录，源文件还在
     manifest = tmp_path / "storage_migration.json"
     manifest.write_text(
-        json.dumps({"old": str(env["old"]), "new": str(env["new"])}),
+        json.dumps(
+            {
+                "old": str(env["old"]),
+                "new": str(env["new"]),
+                "virtual_drive_compat": True,
+            }
+        ),
         encoding="utf-8",
     )
     monkeypatch.setattr(webui, "_storage_migrate_manifest_path", lambda: manifest)
@@ -177,6 +192,7 @@ def test_resume_pending_migration(tmp_path, monkeypatch, env):
     assert not manifest.exists()
     assert not (env["old"] / "a.gif").exists()
     assert env["cfg"].saved["cache_dir"] == str(env["new"])
+    assert env["cfg"].saved["virtual_drive_compat"] is True
 
 
 def test_phase2_crash_resume_only_cleans_source(env):

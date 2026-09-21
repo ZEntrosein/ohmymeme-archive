@@ -4,7 +4,9 @@ import os
 import re
 import subprocess
 import sys
+import threading
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 os.environ["OHMYMEME_TEST"] = "1"
@@ -42,6 +44,11 @@ class _FakeWindow:
         self.y = 20
         self.on_top = False
         self.calls = []
+        self.events = type(
+            "FakeEvents",
+            (),
+            {"shown": _FakeEvent()},
+        )()
 
     def move(self, x, y):
         self.calls.append(("move", x, y))
@@ -54,6 +61,18 @@ class _FakeWindow:
 
     def hide(self):
         self.calls.append(("hide",))
+
+    def minimize(self):
+        self.calls.append(("minimize",))
+
+
+class _FakeEvent:
+    def __init__(self):
+        self.callbacks = []
+
+    def __iadd__(self, callback):
+        self.callbacks.append(callback)
+        return self
 
 
 class _FakeMemeDB:
@@ -205,6 +224,49 @@ def test_hide_clears_hotkey_session():
     assert not ui._hotkey_session
 
 
+def test_minimize_keeps_window_visible_for_taskbar_restore():
+    ui = _fake_webui(True, visible=True)
+
+    assert ui.minimize()
+
+    assert ui._window.calls == [("minimize",)]
+    assert ui._visible is True
+
+
+def test_background_library_notifications_are_coalesced(monkeypatch):
+    from src.webui import WebUI
+
+    timers = []
+
+    class FakeTimer:
+        def __init__(self, delay, callback):
+            self.delay = delay
+            self.callback = callback
+            self.daemon = False
+            self.started = False
+
+        def start(self):
+            self.started = True
+            timers.append(self)
+
+    ui = WebUI.__new__(WebUI)
+    ui._library_refresh_lock = threading.Lock()
+    ui._library_refresh_timer = None
+    ui._library_refresh_kind = "content"
+    ui._window = mock.Mock()
+    monkeypatch.setattr("src.webui.threading.Timer", FakeTimer)
+
+    ui._on_library_changed("content")
+    ui._on_library_changed("structure")
+
+    assert len(timers) == 1
+    assert timers[0].delay == 0.12
+    timers[0].callback()
+    ui._window.evaluate_js.assert_called_once_with(
+        "window.refreshLibrary && window.refreshLibrary('structure')"
+    )
+
+
 def test_tray_toggle_show_does_not_mark_hotkey_session():
     ui = _fake_webui(True)
 
@@ -285,7 +347,7 @@ def test_successful_native_drag_requests_hide_only_for_hotkey_session(monkeypatc
     ui = _fake_webui(True)
     ui._api = JsApi(ui)
     ui._api._db = _FakeMemeDB()
-    monkeypatch.setattr(ui._api, "_find_meme_file", lambda filename: filename)
+    monkeypatch.setattr(ui._api, "_daily_meme_path", lambda row: row["filename"])
     monkeypatch.setattr(native_drag, "start_native_drag", lambda path: True)
     monkeypatch.setattr(ui, "_run_on_gui", lambda delay, func: func())
 
@@ -299,6 +361,83 @@ def test_successful_native_drag_requests_hide_only_for_hotkey_session(monkeypatc
     assert ui._visible is False
 
 
+def test_chat_record_drag_sends_directly_to_resolved_qq_group(monkeypatch):
+    import src.native_drag as native_drag
+    import src.qq_drag as qq_drag
+    import src.webui as webui_module
+    from src.webui import JsApi
+
+    ui = type("DragWebUI", (), {})()
+    ui.schedule_hide = mock.Mock()
+    api = JsApi.__new__(JsApi)
+    api._webui = ui
+    api._cfg = _FakeConfig(False)
+    api._cfg.saved.update(
+        {
+            "napcat_http_url": "http://127.0.0.1:3000",
+            "napcat_token": "token",
+            "napcat_send_mode": "archive_rebuild",
+        }
+    )
+    api._cfg.get = lambda key, default=None: api._cfg.saved.get(key, default)
+    api._db = type(
+        "ChatDB",
+        (),
+        {"get_chat_record_entry": lambda self, record_id: {"id": record_id}},
+    )()
+    monkeypatch.setattr(
+        native_drag,
+        "start_chat_record_target_drag",
+        lambda record_id: {
+            "ok": True,
+            "window_handle": 123,
+            "process_name": "QQ",
+        },
+    )
+    monkeypatch.setattr(
+        qq_drag,
+        "resolve_qq_target",
+        lambda *args: {
+            "message_type": "group",
+            "peer_id": "456",
+            "label": "测试群",
+        },
+    )
+    sent = {}
+
+    def fake_send(
+        http_url,
+        token,
+        record_id,
+        event,
+        db=None,
+        send_mode=None,
+        webui_url="",
+        webui_token="",
+    ):
+        sent.update(
+            {
+                "http_url": http_url,
+                "token": token,
+                "record_id": record_id,
+                "event": event,
+                "db": db,
+                "send_mode": send_mode,
+            }
+        )
+        return {"source": send_mode, "degraded_media_count": 0}
+
+    monkeypatch.setattr(webui_module.onebot, "send_chat_record", fake_send)
+
+    result = api.start_chat_record_drag(7)
+
+    assert result["ok"]
+    assert result["target_label"] == "测试群"
+    assert sent["event"] == {"message_type": "group", "group_id": "456"}
+    assert sent["send_mode"] == "archive_rebuild"
+    ui.schedule_hide.assert_called_once()
+
+
 def test_successful_copy_requests_hide_only_for_hotkey_session(monkeypatch):
     import src.webui as webui_module
     from src.webui import JsApi
@@ -306,7 +445,7 @@ def test_successful_copy_requests_hide_only_for_hotkey_session(monkeypatch):
     ui = _fake_webui(True)
     ui._api = JsApi(ui)
     ui._api._db = _FakeMemeDB()
-    monkeypatch.setattr(ui._api, "_find_meme_file", lambda filename: filename)
+    monkeypatch.setattr(ui._api, "_daily_meme_path", lambda row: row["filename"])
     monkeypatch.setattr(webui_module, "copy_image_to_clipboard", lambda path: True)
     monkeypatch.setattr(ui, "_run_on_gui", lambda delay, func: func())
 
@@ -541,7 +680,10 @@ def test_sorting_visual_feedback_static_contract():
     assert re.search(
         r"activeCollection\s*>\s*0[\s\S]*?api\(\s*['\"]reorder_collection_members['\"]\s*,\s*activeCollection",
         index_js,
-    ), "sortable collections must persist their member order through the active collection"
+    ), (
+        "sortable collections must persist their member order through the "
+        "active collection"
+    )
     assert re.search(
         r"api\(\s*['\"]reorder_memes['\"]\s*,\s*memes\.map\([^)]*\.id\s*\)",
         index_js,
@@ -804,3 +946,104 @@ def test_storage_dir_validation(tmp_path):
     assert _storage_dir_validation(str(data / "x"), str(old), (data,))[0] is False
     assert _storage_dir_validation(str(tmp_path), str(old), (data,))[0] is False
     assert _storage_dir_validation(str(tmp_path / "ok"), str(old), (data,))[0] is True
+
+
+def test_storage_dir_virtual_drive_compat_is_opt_in(monkeypatch, tmp_path):
+    from src.webui import _probe_storage_dir, _storage_dir_validation
+
+    old = tmp_path / "old"
+    old.mkdir()
+    new = tmp_path / "virtual"
+
+    def fail_resolve(*_args, **_kwargs):
+        raise OSError("virtual filesystem does not support resolve")
+
+    monkeypatch.setattr(Path, "resolve", fail_resolve)
+    assert _storage_dir_validation(str(new), str(old))[0] is False
+    assert _storage_dir_validation(str(new), str(old), allow_unresolved=True)[0] is True
+
+    new.mkdir()
+    assert _probe_storage_dir(new) == (True, "")
+    assert list(new.iterdir()) == []
+
+
+def test_virtual_drive_compat_settings_contract():
+    root = Path(__file__).resolve().parent.parent
+    settings_html = (root / "src" / "webui" / "settings.html").read_text(
+        encoding="utf-8"
+    )
+    settings_js = (root / "src" / "webui" / "settings.js").read_text(encoding="utf-8")
+
+    assert 'id="s-virtual-drive-compat"' in settings_html
+    assert 'id="s-bulk-read-protection"' in settings_html
+    assert 'id="s-bulk-read-prefetch-pages"' in settings_html
+    assert 'id="s-bulk-read-batch-size"' in settings_html
+    assert 'id="s-bulk-read-pause-seconds"' in settings_html
+    assert "s.virtual_drive_compat === true" in settings_js
+    assert (
+        "show_startup_animation, virtual_drive_compat, bulk_read_protection"
+        in settings_js
+    )
+    assert (
+        "bulk_read_batch_size, bulk_read_pause_seconds, bulk_read_prefetch_pages"
+        in settings_js
+    )
+    assert "s.bulk_read_protection === true" in settings_js
+    assert "s.bulk_read_prefetch_pages === true" in settings_js
+    assert "toggleBulkReadOptions()" in settings_js
+    assert "pendingStorageDir, move, compat" in settings_js
+
+
+def test_later_page_cache_warmup_follows_current_query_contract():
+    root = Path(__file__).resolve().parent.parent
+    source = (
+        root / "src" / "vue-src" / "composables" / "useMemes.ts"
+    ).read_text(encoding="utf-8")
+
+    assert "'start_page_cache_warmup'" in source
+    assert "state.searchQuery" in source
+    assert "state.activeCollection" in source
+    assert "state.activeCategory" in source
+    assert "state.activeGenre" in source
+    assert "'cancel_page_cache_warmup'" in source
+    assert "warmLaterPages(offset, selectedTags)" in source
+
+
+def test_meme_details_close_discards_unsaved_changes():
+    root = Path(__file__).resolve().parent.parent
+    source = (root / "src" / "vue-src" / "components" / "MemeDetails.vue").read_text(
+        encoding="utf-8"
+    )
+    close_block = source.split("function close() {", 1)[1].split(
+        "function isTextEditing", 1
+    )[0]
+
+    assert "saveChanges" not in close_block
+    assert "dirty.value = false" in close_block
+    assert "放弃修改并关闭" in source
+
+    actions = source.split('<div class="details-actions">', 1)[1].split("</div>", 1)[0]
+    close_button = actions.index('ref="closeEl" class="btn btn-secondary"')
+    save_button = actions.index('class="btn btn-primary"')
+    assert close_button < save_button
+
+
+def test_meme_details_can_create_and_select_collections_and_categories():
+    root = Path(__file__).resolve().parent.parent
+    source = (root / "src" / "vue-src" / "components" / "MemeDetails.vue").read_text(
+        encoding="utf-8"
+    )
+    app_source = (root / "src" / "vue-src" / "App.vue").read_text(
+        encoding="utf-8"
+    )
+
+    assert "'create_collection'" in source
+    assert "'create_category'" in source
+    assert "collectionCreateParentId" in source
+    assert "categoryCreateParentId" in source
+    assert "顶层分组" in source
+    assert "顶层类别" in source
+    assert "创建并选中" in source
+    assert "表情的归属需点击保存更改才生效" in source
+    assert "emit('structure-created')" in source
+    assert '@structure-created="onMemeStructureCreated"' in app_source

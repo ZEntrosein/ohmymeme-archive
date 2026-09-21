@@ -47,13 +47,16 @@ src/              # 主代码
   main.py         # CLI 入口, OhMyMemeApp 编排
   webui.py        # pywebview 窗口 + JsApi/SettingsApi + Bottle 路由
   updater.py      # 版本检查 + 并发镜像下载
-  database.py     # MemeDB (SQLite, 6 表)
+  database.py     # MemeDB (SQLite, 分组/类别/标签/来源映射)
   config.py       # Config (JSON + Fernet 加密密钥)
   sync.py         # 同步后端 (FTP/S3/R2/WebDAV)
   lan.py          # 局域网互联 (UDP 发现 + TCP 握手 + AES-GCM 会话)
   tray.py         # TrayManager (pystray, 惰性导入)
   hotkey.py       # GlobalHotkey (三级降级: keyboard→pynput→轮询)
   clipboard_util.py # 剪贴板操作 (Win32 ctypes / macOS osascript / Linux xclip)
+  media_derivative.py # 原件生成可再生的日常预览/复制副本
+  category_storage.py # 单归属类别名称校验与类别目录安全操作
+  bulk_read.py      # 虚拟盘批量原件读取闸门（串行 + 分批暂停）
   gif_stego.py     # GIF 增量隐写（实验性：粘贴表情大小 + 无损还原原图）
   native_drag.py   # Windows 原生文件拖拽 (WinForms DoDragDrop + CF_HDROP, 惰性加载 pythonnet)
   crypto_util.py  # 加密 (Fernet + PBKDF2, 降级 XOR)
@@ -61,7 +64,9 @@ src/              # 主代码
   platform_util.py # 平台工具 (WSL检测, 开机自启, 单实例互斥)
   adb_util.py      # ADB 自动检测/下载 + QQ 表情包缓存导入（ADB 拉取 + 魔数识别扩展名 + ZIP 打包）
   qqnt_extract.py  # QQNT 本地收藏表情提取（GPL-3.0 衍生模块，纯函数 + 回调接口，无 UI 依赖）
+  onebot.py        # NapCat / OneBot HTTP+WebSocket、本机命令监听与聊天记录归档
   tg_stickers.py   # Telegram Desktop 缓存表情包提取（tdata 解密 + webm 转 webp + 入库）
+  notion_import.py # Notion 数据库只读导入（Files & media + 标题/标签/分组映射）
   douyin.py        # 抖音表情包下载导入（ABogus 签名 + curl_cffi TLS 指纹 + WebP 原格式入库）
   abogus.py        # ABogus 签名算法（纯 Python，GPL-3.0，源自 TikTokDownloader）
   backup.py        # 本地备份（ZIP 导出/恢复，仅 PC 间整库迁移，仅允许恢复到空库）
@@ -69,14 +74,15 @@ src/              # 主代码
   wechat_probe.py  # 微信收藏表情导入（helper 二进制提取密钥 + AES-CBC 解密 DB + CDN 下载，仅 Windows）
   wechat_keyfinder/ # 微信密钥提取 C++ 辅助二进制源码（CMake 构建）
   vue-src/       # Vue 3 前端源码（Vite 构建，产物到 webui/dist/ohmymeme.js）
-    App.vue      # 根组件：标题栏/搜索/侧边栏/面包屑/标签栏/网格/分页
+    App.vue      # 根组件：标题栏/搜索/侧边栏/面包屑/体裁与标签栏/统一内容网格/分页
+    components/ChatRecordDetails.vue # 聊天记录来源、节点预览与发送命令弹窗
     main.ts      # 入口：挂载 + window.focusSearch 全局（快捷键呼出聚焦搜索）
     style.css    # 主窗口样式（CSS 变量主题，蓝色 #3b82f6）
     types/       # TS 类型定义 (Meme/Collection/Tag)
     utils/       # api 桥接 + esc + renderMarkdown
     composables/ # useMemes 状态 / useDragSort 拖拽 / useContextMenu / useCollectionBuilder
-    components/  # Pager/TagEditor/ImportMenu/ImportProgressOverlay/SyncOverlay/
-                 # ContextMenu/CollectionBuilder/CollectionTreeNode/UpdateDialog/SimilarImportDialog
+    components/  # Pager/TagEditor/MemeDetails/ImportMenu/NotionImportDialog/ImportProgressOverlay/
+                 # SyncOverlay/ContextMenu/CollectionBuilder/CollectionTreeNode/UpdateDialog/SimilarImportDialog
   webui/          # 前端静态文件
     vue.html      # 主窗口入口（Vue），Bottle 优先加载
     dist/ohmymeme.js # Vite 构建产物（gitignored）
@@ -138,14 +144,20 @@ tests/
 - 侧边栏折叠按钮 `.sidebar-toggle` 位于搜索框左侧（`#search-wrap` 内），点击折叠/展开 `#sidebar`；搜索框 `flex:1` 随侧边栏 180px↔48px 动态伸缩
 
 ### 数据库
-- 7 表: `memes`, `tags`, `meme_tags`, `collections`, `meme_collections`, `favorites`, `recent_uses`
-  - `tags`/`meme_tags`：DB 层方法（`get_all_tags`/`set_meme_tags`/`get_meme_tags`/`search` 标签筛选），已启用；右键表情「打标签」弹出标签编辑器（`showTagEditor`：点选已有标签/搜索过滤/输入新建，回车添加），`_set_tags` 覆盖式写入；`_prune_orphan_tags` 在 `_set_tags` 与 `delete_meme` 中清理无任何表情使用的孤儿标签（tagbar 不残留幽灵标签）
+- 10 表: `memes`, `tags`, `meme_tags`, `collections`, `meme_collections`, `categories`, `favorites`, `recent_uses`, `notion_sources`, `chat_records`
+  - `tags`/`meme_tags`：`tags` 以 `(category, name)` 作为不区分大小写的复合唯一标识；旧库启动时重建旧 `name UNIQUE` 表并把已有标签迁入空分类（UI 显示「未分类」），原 tag id 与 `meme_tags` 关联保持不变。DB 同时保留字符串兼容接口，并提供 `get_all_tag_records`/`get_meme_tag_records` 结构化接口；`set_meme_tags`/`add_tags_to_memes`/`rename_tag`/`search` 接受 `{category,name}`，所以不同分类可存在同名标签且独立筛选/改名。主标签栏按分类分组；`MemeDetails` 与 `TagEditor` 保留分类并允许新标签指定分类，`MemeDetails` 的标签编辑入口还能全局修改现有标签的名称与种类，目标已存在时合并关联；`_set_tags` 覆盖式写入；`_prune_orphan_tags` 在 `_set_tags` 与 `delete_meme` 中清理无任何表情使用的孤儿标签
+  - `memes.manual_description`/`manual_ocr_text` 与 `memes.ai_description`/`ai_ocr_text`：分别保存人工和 AI 来源的图片描述/图片文字，四项都是普通用户可编辑字段；旧库由 `_migrate` 幂等新增空的人工字段，因此升级前已有值原封不动保留为 AI 内容。`JsApi.get_meme_details` 仅在打开单张详情时按需返回四个独立字段、向旧调用方提供人工优先回退 AI 的中性字段 `description`/`ocr_text`、标题、文件名、直接所属分组（完整层级路径）、全部可选分组、全量标签建议和全图库前后项；新版 `update_meme_details` 独立保存四个字段，旧版中性载荷仍写 AI 字段。详情保存以单事务写入标题、文件名、文字、标签与分组归属。分组更新保留未移除成员关系的 `sort_order`，新加入分组追加到末尾；这里只更新 `meme_collections`，不移动磁盘文件。文件名变化时 JsApi 先校验安全名称/扩展名/冲突，再同步重命名实际文件，DB 写入失败则把文件名回滚，避免加入分页网格载荷
+  - `memes.daily_filename`/`daily_file_size`/`daily_mime_type`/`daily_profile`：指向 `data_dir/derivatives` 中的可再生日常副本；旧库由 `_migrate` 幂等补列。`filename`/`file_hash`/`file_size`/`mime_type` 始终描述原件，不能改成副本语义
+  - `notion_sources`：本地 Meme 与 Notion 托管文件的多对一来源映射；以 data source/page/property/file index+name 唯一定位，保存 `last_edited_time`，`meme_id` 删除时级联清理；旧库与旧备份由 `_migrate` 自动建表
+  - `chat_records`：保存 `/omm` 捕获的完整 JSON 结构包；以 `(account_id, source_message_id)` 唯一，重复归档同一外层消息时更新。摘要列保存标题、节点数、转发资源数和外层会话位置，`package_json` 保存来源消息、命令位置以及所有已获取的嵌套 forward 数据；`list_chat_records`/`count_chat_records(keyword)` 为统一内容库提供按标题搜索和分页，`get_chat_record_entry` 返回摘要+完整包；`get_chat_record_by_source` 用于重复归档时复用已落地媒体。删除记录必须经 `onebot.delete_chat_record_archive` 同步删除其独占媒体子目录；旧库与旧备份由 `_migrate` 自动建表
+  - `categories`：与 `collections` 分离的单归属层级类别；`memes.category_id` 只保存一个类别节点，父类别筛选递归包含子类别。类别名称经过目录安全校验，`cache_dir/<类别路径>/<filename>` 是原件的真实存储位置；详情换类、类别重命名/删除会同步移动原件，原有多对多分组不改变路径。
 - `PRAGMA journal_mode=WAL`, `PRAGMA foreign_keys=ON`
-- `MemeDB.search()`: 动态 WHERE, 多标签交集用 `HAVING COUNT = len(tags)`；keyword 除 `filename`/`original_name` LIKE 外同时匹配标签名（`meme_tags` JOIN `tags` 子查询 LIKE），`count()` 同步该逻辑
+- `MemeDB.search()`: 动态 WHERE, 多标签交集用 `HAVING COUNT = len(tags)`；keyword 始终匹配 `filename`/`original_name` 和标签名（`meme_tags` JOIN `tags` 子查询 LIKE），`include_description` 同时控制 `manual_description`/`ai_description`，`include_ocr_text` 同时控制 `manual_ocr_text`/`ai_ocr_text`。`genre=image|gif` 是由 MIME/`.gif` 扩展名推导的不可编辑系统体裁条件，不写入 tags 表。`JsApi.search_memes`/`count_memes` 从配置 `search_description`/`search_image_text` 传入；`count()` 必须同步该逻辑以保证分页总数一致
 - `MemeDB.add_tags_to_memes(meme_ids, tags)`: 批量合并追加标签（get-or-create + `INSERT OR IGNORE`，不清空各表情已有标签），返回实际存在的表情数；先过滤出实际存在的 meme id（外键开启时对缺失 id 写 `meme_tags` 会整批失败），批量写包 try/rollback/re-raise；供 JsApi `batch_add_tags` 使用
 - `MemeDB.add_memes_to_collection(meme_ids, collection_id)` / `MemeDB.move_memes_to_collection(meme_ids, from_ids, to_id)`: 批量加组/移动的单事务实现（先校验表情 id 与目标分组存在，写入失败 rollback 后抛出）；按 `INSERT OR IGNORE` 实际新增关联计数（重复加入目标不计）；move 仅纳入实际属于 `from_ids` 子树的成员（非成员不受删除或移动影响），从子树删除后再加入目标，提交前级联清理源子树内变空的分组（迭代删除无成员且无子分组的叶子空组直到不动点，支持子组先空父组后空；仅限 from_ids 范围，子树外空分组保留；两处 FK 均 ON DELETE CASCADE，故只删叶子防波及）；供 JsApi `batch_add_to_collection`/`batch_move_to_collection` 使用（JsApi 负责目标解析/创建与「不能移入源分组自身或其子分组」校验——`create_collection` 会复用同名顶层分组，故该校验在目标解析后统一执行；move 成功后无条件重建 manifest——`moved==0` 时成员关系仍可能变化，如成员已在目标、仅从源移除）
 - `memes.sort_order`: 自定义排序（拖拽更新），默认 0，查询 `ORDER BY sort_order ASC, updated_at DESC`
 - `collections.parent_id`: 多级分组支持（最多 3 层），`NULL` 为顶层分组
+- 主窗口侧边栏以 tabs 分开「分组」与「类别」：`CollectionTreeNode` 渲染两棵树，类别支持递归子类别、搜索/详情选择和右键新建/重命名/删除；类别父节点筛选包含后代，切换 tab 时只保留当前树的筛选。
 - `meme_collections.sort_order`: 分组内成员自定义排序
 - `recent_uses`: `meme_id` + `used_at`，复制时 `INSERT OR REPLACE`，按 `used_at DESC` 取最近使用
 
@@ -154,7 +166,22 @@ tests/
 - 密钥字段 (ftp_password, s3_secret_key 等) 用 Fernet 加密存储
 - 全局单例: `get_config()`, `get_db()`
 - `hotkey_show_at_mouse` 默认 `false`，控制 Windows 上全局热键显示隐藏主面板时是否按鼠标位置放置
-- `cache_dir`（表情包图片目录）可自定义：配置键 `cache_dir` 非空时 `Config.cache_dir` 返回该路径，否则默认 `data_dir/cache`；设置页「存储位置」通过 `SettingsApi.pick_storage_dir`/`apply_storage_dir` 切换，`apply_storage_dir` 可选把旧目录文件递归迁移（跳过 `thumbnails`）；**切换后旧文件不再可见**，故未迁移时必须确保文件已存在于新目录；`_storage_dir_validation` 拒绝相对/相同/上下级目录以及 `data_dir`/`thumbnail_dir` 及其上下级（受保护路径）；DB/缩略图/manifest 仍留在 `data_dir`，数据库只存文件名，文件在新目录时按 basename 自动解析；`reset_settings` 恢复默认时保留 `cache_dir`。迁移为**后台三阶段幂等**设计（避免跨盘长拷贝时进程被杀导致分裂状态）：①复制阶段源只读（`O_EXCL` 排他写入，dst 已存在且大小一致视为已复制跳过——幂等；失败/取消仅清理本次新副本，源完好无分裂，不回滚）；②写配置（唯一切换点，此后新目录已完整）；③删源（失败仅残留旧目录冗余，不阻断）。迁移开始写 `data_dir/storage_migration.json` 清单、完成后删除；`main.py` 启动时若检测到未完成清单则后台幂等续跑（强杀/断电后重启自愈）。取消由 move 回滚改为删新副本，消除回滚自身失败风险
+- `notion_token` 属于 `_SECRET_KEYS`，与其他密钥一样加密写入配置；Notion URL/ID、data source ID 及属性映射保存在同一配置文件
+- `napcat_token` 属于 `_SECRET_KEYS`；`napcat_enabled`、HTTP/WebSocket 根地址、Token、`napcat_command`（默认 `/omm`）和 `napcat_send_mode`（`original_native`/`original_rebuild`/`archive_rebuild`，默认 `original_native`）由设置页「QQ 聊天记录（NapCat）」保存。接口地址强制为 `127.0.0.1`/`localhost`/`::1` 回环地址，HTTP 与 WebSocket 都拒绝重定向且绕过系统代理，命令必须是以 `/` 开头且不含空白的单词
+- `Config.derivative_dir` 固定为 `data_dir/derivatives`，存放可再生日常副本；不跟随自定义 `cache_dir` 迁移，不进入备份或远程同步
+- `bulk_read_protection` 默认 `false`；开启后由 `bulk_read.guarded_read()` 对可能读取虚拟盘原件的操作单文件串行化，并按 `bulk_read_batch_size`（后端钳制 1–1000，默认 8）和 `bulk_read_pause_seconds`（0–60 秒，默认 1）分批暂停。已接入启动缓存扫描、pHash/日常副本惰性生成、导入、manifest 重建、存储迁移、备份、同步上传和 LAN 拉取；仅为 115/CloudDrive2 等虚拟盘降低突发请求，不应默认开启在普通本地磁盘上
+- `cache_dir`（表情包图片与聊天记录媒体目录）可自定义：配置键 `cache_dir` 非空时 `Config.cache_dir` 返回该路径，否则默认 `data_dir/cache`；`Config.chat_record_media_dir` 固定为其下的保留目录 `chat-record-media`，其中每份聊天记录使用来源账号+外层消息 ID 哈希出的独占子目录，结构包保存 cache 相对路径。表情扫描、文件查找、LAN 与 Notion 来源查找必须跳过这个根级保留目录，避免把归档图片误注册成表情。设置页「存储位置」通过 `SettingsApi.pick_storage_dir`/`apply_storage_dir` 切换，`apply_storage_dir` 可选把旧目录文件递归迁移（跳过 `thumbnails`）；**切换后旧文件不再可见**，故未迁移时必须确保文件已存在于新目录；`_storage_dir_validation` 拒绝相对/相同/上下级目录以及 `data_dir`/`thumbnail_dir` 及其上下级（受保护路径）；DB/缩略图/manifest 仍留在 `data_dir`，数据库只存表情文件名，聊天记录媒体保存 cache 相对路径；`reset_settings` 恢复默认时保留 `cache_dir`。迁移为**后台三阶段幂等**设计（避免跨盘长拷贝时进程被杀导致分裂状态）：①复制阶段源只读（`O_EXCL` 排他写入，dst 已存在且大小一致视为已复制跳过——幂等；失败/取消仅清理本次新副本，源完好无分裂，不回滚）；②写配置（唯一切换点，此后新目录已完整）；③删源（失败仅残留旧目录冗余，不阻断）。迁移开始写 `data_dir/storage_migration.json` 清单、完成后删除；`main.py` 启动时若检测到未完成清单则后台幂等续跑（强杀/断电后重启自愈）。取消由 move 回滚改为删新副本，消除回滚自身失败风险
+
+### NapCat / OneBot 连接
+- `websocket-client` 连接 NapCat 正向 WebSocket 服务；NapCat 必须为该服务开启 `reportSelfMessage`。`OneBotCommandListener` 仅处理当前账号自己的 `message`/`message_sent` 事件，不调用 `get_recent_contact`。命令包括：回复记录后发 `/omm` 保存、`/omm <message_id>` 排障保存、`/omm list` 列最近十份归档、在目标会话发 `/omm send <ID>` 取用
+- 命令事件经单 worker 串行处理，按命令消息 ID 去重，WebSocket 断开后每 3 秒重连；启动、设置保存/立即应用、恢复默认和应用退出分别负责监听器的启动/重载/停止。成功或失败通过 `send_group_msg`/`send_private_msg` 回到命令所在会话
+- `build_chat_record_package()` 先用 `get_msg` 获取外层消息，再递归调用 `get_forward_msg`；NapCat 的 OneBot 全局配置必须开启 `parseMultMsg` 才能展开多层嵌套记录。节点正文兼容 `node.message`、NapCat 4.18 的 `node.data.message` 与 `node.data.content`，并把消息段中的 `type: node` 嵌套包装统一视为内联 forward 层级。归档上限为 100 份 forward 资源、12 层、20000 节点和 64 MiB JSON，任何上限、嵌套读取失败或最终仍无正文的空节点都会拒绝写入不完整数据；空节点也可能来自过期、撤回或未支持类型，不能一律归因于 `parseMultMsg`。`archive_chat_record()` 随后沿实际聊天节点树递归查找 image/record/video/file（同时覆盖 forward 资源与 `parseMultMsg` 内联内容），依次尝试桥接插件回填的 QQNT 本地路径或刷新 URL、标准消息段 URL，以及类型专用内部标识，并原子复制到 `cache_dir/chat-record-media/<来源哈希>/`（图片单文件上限 64 MiB，其他媒体 512 MiB），在媒体段写入 cache 相对 `local_path`，摘要以 `media_localized`/`media_localized_count` 标识结果；重复保存先复用既有本地媒体并清理同记录目录中的过期文件。虚拟盘清理必须按归档结构中声明的安全相对路径作词法保留，不能因刚写入文件暂时无法 `is_file`/`resolve` 而误删。模式二、三发送前逐段把媒体解析为真实本地文件，单段失败只降级该段，不能直接把可能过期的接收态 URL 交给 NapCat，也不能因一个媒体失败而降级整份记录。`migrate_legacy_chat_record_media` 在启动后台把旧 `data_dir/chat-record-media` 文件逐记录复制、落库后才删旧文件
+- NapCat 的 OneBot `message_id` 是当前进程内 `MessageUnique` LRU 生成的短 ID，重启或淘汰后不能作为永久索引；归档必须同时保存来源会话、QQ `real_seq`、完整消息段和节点内容，不能只保存 `message_id` 或 forward id。数据库迁移会用 `package_json.source.real_seq` 修正早期误存短 ID 的 `source_message_seq` 摘要列
+- `send_chat_record` 严格按 `napcat_send_mode` 选择单条路径，测试失败时不会跨模式自动回退：`original_native` 先用外层 OneBot `message_id` 调 `forward_group_single_msg`/`forward_friend_single_msg`；短 ID 失效时改由 WebUI 鉴权插件 `/forward-message` 按来源会话+`real_seq` 获取当前进程可用的 QQ 原始 `msgId`，验证时间/发送者/合并转发类型后调用 `MsgApi.forwardMsg`，这仍是同一种原生发送方式。QQ 历史已不可取或旧包没有 `real_seq` 时明确失败，不自动改用重组；`original_rebuild` 调 `build_chat_record_package` 重新读取原消息节点，并按图片顺序合并旧归档中仍存在的 `local_path`；`archive_rebuild` 只读取本地 `package_json`。两种重组路径把聊天记录树递归转换成 OneBot `node`，内层 forward 变成父 node 的纯子 node `content`，供 NapCat Packet/非 Packet 实现递归生成原生嵌套卡片；NapCat 4.18.28 最多处理到 `dp < 3`，所以应用保留最多两级内层记录（连同最外层卡片共三层），更深内容在最深可用层加说明后展开，保证不丢消息。原节点同时含普通内容与 forward 时拆成同发送者的普通节点和嵌套卡片节点，因为 NapCat 非 Packet 实现要求子消息 `content` 全部为 node。接收态 image/record/video/file 不能原样回传：`_media_send_source` 按 `local_path → path → url → file` 选择 HTTP(S)/file/base64 或确实存在的绝对路径；没有归档副本时，图片内部文件 ID 再经 `download_file_image_stream`（兼容回退 `get_image`）尝试还原，统一写为发送态 `{file: source}`。内部文件 ID 不可用时直接变为文字占位；若 NapCat 仍返回下载文件失败，当前重组方式会以所有媒体转文字占位自动重试，并通过 `degraded_media_count` 告知用户，避免单个过期媒体拖垮整份记录
+- 深层重组列入 README 待办：未来通过独立 NapCat Framework 桥接插件暴露“仅上传 forward 资源”的本机接口，再由 OhMyMeme 自内向外组装；不直接修改 `napcat.mjs`，也不维护 NapCat fork。公开 OneBot 的自聊暂存卡片方案已实测会在父卡片中变成空节点，不得直接启用或重复实现。
+- **聊天记录拖到 QQ 直接发送（Windows）**：聊天记录卡 pointer 位移超过 8px 后调用 `JsApi.start_chat_record_drag`；`native_drag.start_chat_record_target_drag` 用私有 `OhMyMeme.ChatRecord` OLE 格式启动仅用于选目标的 `DoDragDrop`，不向 QQ 投递文件、文本或命令，并用 `QueryContinueDrag` 区分松手与 Esc。松手后按光标位置取得顶层窗口，严格要求进程名为 QQ；`qq_drag.resolve_qq_target` 先向 NapCat WebUI 的当前会话桥接插件读取真实 peer ID（先以 WebUI 初始 Token 换取短期 Credential），插件未安装、Token 未配置或没有可用状态时才通过 Windows UI Automation 对聊天区顶部固定 15 个坐标做点命中，只读 Button/Text 名称（禁止 `FindAll(Descendants)` 遍历整个 QQNT 消息树，也不要恢复上百次跨进程点查询），再与 `get_group_list`/`get_friend_list` 唯一匹配成真实 ID。匹配同时使用好友昵称和备注；允许 QQNT 在唯一别名两侧附加状态文字，但只有全部包含匹配均指向同一个目标时才发送。歧义或不可读时拒绝发送并返回实际采到的控件名称。成功后直接按 `napcat_send_mode` 调 `send_chat_record`，群内只出现最终记录卡片。QQNT 不提供带消息/资源 ID 的标准拖出数据，所以反向拖入 QQ 卡片暂不支持，导入仍用回复卡片后 `/omm`。
+- **NapCat 当前会话与持久消息桥接插件**：`napcat-plugin-ohmymeme-current-peer/index.mjs` 注册受 WebUI 鉴权保护的 `/current-peer` 路由。拖拽发送的主路径必须把落点 QQ 顶层 HWND 传给插件；插件用 Electron `BrowserWindow.getNativeWindowHandle()` 精确匹配同一个渲染窗口，只读取 `.chat-header .panel-header__title`，应用再用 `get_group_list`/`get_friend_list` 唯一映射成 OneBot ID。这个 `confidence=renderer_title` 路径不依赖“最近一次切换”，因此多聊天窗口也不会串到前一个会话。旧事件路径只作无 HWND 调用兼容：`onUserTabStatusChanged` 一到即先清空旧目标，`onMsgBoxChanged` 的唯一候选可以更新；`onMsgInfoListUpdate`、`onMsgInfoListAdd`、`onInputStatusPush` 都可能来自后台会话，绝不能注册成当前会话更新源。插件清理时只删除自己安装在复用 listener 上的回调。`/forward-message` 把持久来源 UIN 转为内部 UID，以 `MsgApi.getMsgsBySeqAndCount`（并用查询 API 回退）精确匹配 `msgSeq`，再直接调用 `MsgApi.forwardMsg`。`/recover-forward-resource` 用 `PacketApi.pkt.operation.FetchForwardMsgRaw` 同时读取主 `MultiMsg` 与附属 action，从 `richMsg.m_fileName` 重建内联 forward 树；`src/onebot.py` 对每个顶层 forward 资源都调用它，并把外层来源会话、`real_seq`、时间与发送者一并交给插件，因此节点正文已完整时也会补全媒体；只有存在空节点时插件失败才属于结构恢复错误，否则静默继续后备媒体链路。媒体归档优先复用 QQ Chat Exporter 的路径：按持久来源重新取得外层原消息，再递归调用 `MsgApi.getMultiMsg(peer, msgId, msgId)` 获取带真实 `msgId`/`elementId` 的内层 RawMessage。图片先尝试 `FileApi.downloadMedia`，超时时再用原生 `picElement` 经 `FileApi.getImageUrl` 生成带当前 rkey 的地址并下载；视频、语音和文件分别复用 Native RawMessage 的路径或 `getVideoUrl`/`getVideoUrlPacket`、`getPttUrl`、`getFileUrl` 刷新地址，再按同类型顺序回填到多 action 协议树。若真实消息树不可取，图片才从 `MsgInfo.index` 回填 NapCat 4.18 `PacketMsgPicElement` 丢失的 `fileUuid`、MD5 和大小，依次尝试现有 QQNT 缓存、协议节点自身身份、visit/UUID 内核接口与签名 URL。图片签名地址下载严格限制为腾讯 `qq.com`/`qq.com.cn`/`qpic.cn` HTTPS 域名、拒绝任意外部主机和 64 MiB 上限，校验图片格式及可用时的 MD5 后原子写入 QQNT 标准媒体缓存，再交给 OhMyMeme 复制到永久归档。受 WebUI 鉴权保护的 `/media-status` 仅保留最近一次恢复的逐媒体阶段、布尔值和 HTTP 状态码，不记录消息 ID、元素 ID、URL、Token、本地绝对路径或媒体内容；`/media-capabilities` 只列出 QQ 内核媒体服务的方法名，用于定位版本特有的拖拽导出能力。`src/onebot.py` 先调用 `/api/auth/login` 用 WebUI 初始 Token 换取短期 Credential，再访问插件路由；插件/渲染标题不可用时才使用 UIA 标题降级。`scripts/install_napcat_current_peer.ps1` 默认只复制插件入口与清单；对包含“只接受内置白名单 ID”限制的 NapCat Framework，可显式追加 `-PatchLocalWhitelist`，脚本会备份并仅在精确锚点存在时修改 `napcat.mjs`。插件内部 API 属于 NapCat 高级 API，升级 QQNT/NapCat 后需复验 Electron DOM 选择器与消息查询签名。
+- 合并转发节点里的 `group_id` 等会话字段可能来自兼容回退值，不作为来源依据；会话类型、会话 ID、外层消息 ID/序号必须从用户选择的外层原消息单独保存
 
 ### 同步
 - manifest 文件: `meme-index.json`
@@ -234,14 +261,15 @@ tests/
 - **双重去重** — 文件名去重防止每次启动重复注册，哈希去重防止同图不同名重复
 - `_do_import`（拖入/导入对话框）同样有哈希去重，且文件重命名为 `{hash[:16]}{ext}`
 - **感知哈希相似去重**（`download_original_image` 单图导入路径）：`memes.perceptual_hash` 列（TEXT 存 16 进制，旧库自动 ALTER 迁移）持久化每张图的 64 位感知哈希（`_perceptual_hash`，8x8 可分离 DCT pHash，比均值哈希对浅色/低信息图判别力更强）。导入时哈希未命中则 `_find_similar_candidates` **只算新图 phash + 从 DB 读存量 phash 比对**（整数 XOR，微秒级），`perceptual_hash` 为空的旧库行惰性回填：缺失 ≤`_PHASH_SYNC_BACKFILL_MAX`(5) 同步回填，超过则丢后台线程（`_PHASH_BACKFILLING` 防重入，start 异常复位），本次只比对已填的。`_build_cache_index` 一次性构建文件索引避免逐行 walk（仅在有缺失时执行）。汉明距离 `_PHASH_SIMILAR_DIST<=12` 视为近似，**全库比对无截断漏检**。命中候选时将文件复制到独立临时文件登记 `_PENDING_SIMILAR`（token 随机、TTL 300s 过期时在 pop/next-register 时删除临时文件），返回 `similar_pending`，前端 `SimilarImportDialog` 弹窗让用户选：保留新图 / 保留旧图 / 跳过（discard）/ 都保留（keep_both），经 `JsApi.resolve_similar_import(token, action)` 决定导入或放弃。哈希精确命中返回 `duplicate` 提示「已存在」。`_do_import`/`scan_cache` 新建时写入 `perceptual_hash`（`add_meme` 内部转 hex，规避 64 位溢出 SQLite INTEGER）。两条单图交互路径都启用：`download_original_image`（URL 拖放/下载原图）与 `/api/upload/`（File 拖放，单张时走 `_import_with_similar_decision`）；批量路径（多文件拖放/文件夹/同步 pull/LAN）不做感知去重（多文件走 `_do_import` 避免逐个打断）。`_do_import` 去重关键区（`get_by_hash`检查→copy2→`add_meme`→回查）由模块级 `_IMPORT_LOCK` 串行化：并发拖入完全相同字节的图也不产生重复记录（测试 `test_import_concurrency.py`）
-- **导入限制**：`config.py` 常量 `_IMPORT_MAX_PX=2560`（最长边）/`_IMPORT_MAX_BYTES=20MiB`，超过即拒绝接收；覆盖 `_do_import`、`scan_cache`、同步 `_pull_worker`、LAN `_import_bytes` 四类接收路径，跳过超限文件并计数（前端 toast 提示）
+- **原件与日常副本**：`config.py` 的 `_IMPORT_MAX_BYTES=200MiB` 是原件硬上限，`_IMPORT_MAX_PX=2560` 仍限制最长边；LAN 还受协议 `MAX_FILE_SIZE=64MiB` 限制。`media_derivative.py` 的 `create_daily_copy()` 在导入时生成可再生副本：静态图→WebP（最长边 1600、质量 84 起步并按 8MiB 软目标递降），GIF→GIF，动画 WebP→动画 WebP；保留透明通道、帧时长和循环。超大 JPEG 先由 `_jpeg_dimensions` 有界读取 SOF，像素数不超过 `LARGE_JPEG_MAX_PIXELS=300_000_000` 时临时调高 Pillow 阈值并立即恢复，然后在解码前用 `draft()` 原生降采样；超限仍拒绝，其他格式不放宽。仅当原件已在 1600px/8MiB 范围内且重编码更大时，副本目录才复制原格式字节；超出任一日常限制时始终采用重编码结果。生成和校验成功后原子落盘，再与原件路径一起写 DB；失败回滚本次原件/副本。旧数据、扫描/同步/恢复数据由 `WebUI._find_daily_file` 首次使用时惰性生成，`daily_profile` 控制编码版本失效。网格动画、`/api/original` 详情预览、普通复制、`get_meme_path(s)` 与原生拖拽使用副本；右键「复制原件」调用 `copy_meme_original` 绕过副本和 `copy_resize_mode`。缩略图和日常副本均持久化且没有容量/LRU 自动淘汰（`cache_max_size_mb` 当前未用于清理）；删除表情会清理对应缓存，清空本地数据会整体清理。原件改名不改哈希命名的副本
+- **虚拟盘后续页预热**：`bulk_read_prefetch_pages` 仅在 `bulk_read_protection` 开启时生效；`useMemes.search/loadInitData` 每次把当前关键词、结构化标签、分组、类别、类型、当前 offset/page size/total 传给 `JsApi.start_page_cache_warmup`。新调用递增 generation 取消旧查询任务；worker 跳过当前页，从后续 meme offset 分块调用无图片探测的 `_search_meme_rows`，逐项 `_get_thumbnail_path`，从而按需生成持久化日常副本与缩略图。启动延迟约 1 秒并在每项后短暂 yield，减少与当前页请求竞争；不创建前端 Image/DOM 缓存，不长期占用整库解码内存
 - **文件夹导入** (`JsApi.import_folder`)：FOLDER 对话框 → `os.walk` 递归收集图片（扩展名过滤）→ **后台线程导入**（`start_import_job` + `_IMPORT_JOB_STATE`，前端 `ImportProgressOverlay` 300ms 轮询进度条 + 取消，取消时 `progress_cb` 返回 False 中断 `_do_import`，保留实际进度）→ `make_collection`（前端导入菜单「自动创建分组」勾选，默认开）时以文件夹名 `create_collection` + 批量 `add_to_collection`（同名分组复用，重复导入并入）。`import_memes`（文件对话框）同样后台化，走同一 job；`import_from_clipboard`（剪贴板，通常单张瞬时）保持同步返回 id。`_do_import` 提供可选 `progress_cb`（逐文件回调，返回 False 中断）
 - **渠道自动分组**：3 个入库渠道导入后调 `WebUI.ensure_import_collection(ids, 固定名)` 自动归入固定名分组——TG→「Telegram」、抖音→「抖音」、微信→「微信」；同一渠道不同时间导入复用同名分组。QQ（导出 ZIP 到外部）、QQNT（提取到输出文件夹）不入库故不建组。`create_collection` 现为「先按 name+parent_id 查已存在→返回既有 id，否则 INSERT」——**不再产生重复空分组**（仓库同名字段多次导入只一个分组，成员靠 meme_collections 的 PRIMARY KEY 去重），测试 `test_ensure_collection_same_name_reused`/`empty_args`
 
 ### 本地备份与恢复 (backup.py)
 - **定位**: 仅 PC 间整库迁移（导出 ZIP → 拷贝 → 恢复），手动触发，不做增量/自动清理/加密包；不碰手机 LAN 端
-- **备份** (`create_backup`): 打包 cache_dir 全部原图（跳过 thumbnails，文件名即 hash 前缀跨机稳定）+ memes.db（`MemeDB.backup_to`，sqlite backup API 保证 WAL 一致快照）+ meme-index.json + backup.json 清单（app 版本/导出时间/文件数）；ZIP_STORED 不压缩（图片已是压缩格式）；先写 .tmp 再 os.replace 原子落盘。包结构：`db/memes.db`、`files/<文件名>`、`meme-index.json`、`backup.json`
-- **恢复** (`restore_backup`): 仅允许空库（`has_any_data()`——memes/collections/tags/favorites 任一有数据即非空，含 stego 载体行与空分组；SettingsApi 前置校验，落库前 `restore_from` 锁内复查）；恢复 worker 全程持有 `_IMPORT_LOCK`（与 `_do_import`/同步 pull 同锁），恢复期间导入请求阻塞等待；`create_backup` 与 `apply_storage_dir` 均校验备份目录与 cache_dir 不得相同/互为嵌套（防备份递归自包含）；ZIP 安全限制（成员数 ≤100k 且不得重名、单成员解压 ≤64MB、总解压 ≤20GB、仅 STORED/DEFLATED）；解包到 `data_dir/backup_restore_tmp` staging，成员名安全校验（防路径穿越，只取 files/ 下 basename）+ 文件数与 backup.json 核对（防不完整包）→ **候选库先在隔离连接上 `MemeDB.prepare_restore_source`（integrity_check + 必需表存在性 + `_migrate` 预迁移），通过后才移动缓存文件**（记录本次新增文件，`restore_from` 失败即回滚删除；同名覆盖文件内容一致无需还原）→ `MemeDB.restore_from` 经 backup API 原子替换库内容 + `_migrate` 补齐旧版本缺失列 + 重设 WAL → `build_manifest()`；staging 任一步失败自动清理，不留半成品
+- **备份** (`create_backup`): 打包 cache_dir 全部原件（文件名即 hash 前缀跨机稳定，保留类别子目录）+ memes.db（`MemeDB.backup_to`，sqlite backup API 保证 WAL 一致快照）+ meme-index.json + backup.json 清单；`derivatives` 日常副本可再生，不重复打包。ZIP_STORED 不压缩（图片已是压缩格式）；先写 .tmp 再 os.replace 原子落盘。包结构：`db/memes.db`、`files/<类别路径>/<文件名>`、`meme-index.json`、`backup.json`
+- **恢复** (`restore_backup`): 仅允许空库（`has_any_data()`——memes/collections/categories/tags/favorites 任一有数据即非空，含 stego 载体行与空类别/分组；SettingsApi 前置校验，落库前 `restore_from` 锁内复查）；恢复 worker 全程持有 `_IMPORT_LOCK`（与 `_do_import`/同步 pull 同锁），恢复期间导入请求阻塞等待；`create_backup` 与 `apply_storage_dir` 均校验备份目录与 cache_dir 不得相同/互为嵌套（防备份递归自包含）；ZIP 安全限制（成员数 ≤100k 且不得重名、单成员解压 ≤256MB、总解压 ≤20GB、仅 STORED/DEFLATED）；解包到 `data_dir/backup_restore_tmp` staging，成员名安全校验（防路径穿越，允许已校验类别子路径）+ 文件数与 backup.json 核对（防不完整包）→ **候选库先在隔离连接上 `MemeDB.prepare_restore_source`（integrity_check + 必需表存在性 + `_migrate` 预迁移），通过后才移动缓存文件**（记录本次新增文件，`restore_from` 失败即回滚删除；同名覆盖文件内容一致无需还原）→ `MemeDB.restore_from` 经 backup API 原子替换库内容 + `_migrate` 补齐旧版本缺失列 + 重设 WAL → `build_manifest()`；日常副本在首次使用时重建，staging 任一步失败自动清理，不留半成品
 - **备份目录**: config `backup_dir`（空=默认 data_dir/backups），设置页选择立即生效（校验可创建/可写）
 - **SettingsApi**: `backup_get_info`/`backup_pick_dir`/`backup_create`/`backup_delete`（文件名白名单校验防穿越）/`backup_pick_zip`/`backup_restore`/`backup_progress`；后台线程 + 前端 300ms 轮询进度（`_BACKUP_STATE`，与存储迁移同模式），恢复成功后自动 build_manifest
 - **设置页 UI**: 独立「备份与恢复」导航分组（日志与关于之间）：备份目录选择、立即备份、备份列表（文件名/大小/删除，删除走 showConfirm 危险确认）、从 ZIP 恢复（pick_zip → showConfirm → 恢复）；`backup-progress-overlay` 进度弹窗（运行中不可关闭，完成后"关闭"按钮 + Esc）；列入 _SETTINGS_OVERLAY_IDS 做 Tab 焦点陷阱
@@ -269,6 +297,7 @@ tests/
 ### Sync pull 集合合并
 - `_apply_remote_collections` 以**并集**方式合并远端分组，不清除本地已有成员
 - 远端 manifest 中的 `collections` 用文件名关联（非 ID），跨设备稳定
+- `categories` 以名称树和每个 meme 的 `category_path` 同步，pull 会创建空类别，并把下载/已有原件移动到类别目录；远端图片文件仍保持 `memes/<filename>` 平铺以兼容旧后端。
 - `_apply_remote_order` 按远端 manifest 的 `memes` 顺序重排本地 `sort_order`（`reorder_memes`），确保 pull 后本地显示顺序与云端一致，再次 push 不致覆盖云端排序
 
 ### 排序同步闭环
@@ -279,6 +308,7 @@ tests/
 ### Manifest
 - `build()` 递归遍历嵌套分组树，空分组自动 `delete_collection`
 - 远端 manifest 中的 `collections` 以嵌套格式存储（`name`/`filenames`/`children`），version 2 旧格式启动时自动转换
+- version 4 额外保存 `categories` 名称树、`category_path` 与本地 `storage_path`；旧 version 3 清单仍可读取，缺省类别按根目录处理。
 
 ### 自定义排序
 - `memes.sort_order` 字段存储全局展示顺序；前端可拖拽排序仅在正 ID 分组/子分组内进行，成员顺序存 `meme_collections.sort_order`
@@ -288,7 +318,7 @@ tests/
 - **网格感知插入点**：`gridMetrics()` 按首卡片实测宽/高 + `columnGap` 推算 `cols`，`gridSlotIndex(x,y)` 先定位绝对格子（含 folder-card 占位）再映射到非 folder 的 meme 卡数组索引并 clamp（分组内 folder 卡混排时插槽不串位）
 - **FLIP 让位动画**：跨槽时对被挤开卡片记录 First/Last rect，invert 后靠 `#meme-grid.drag-active .meme-card` 的 `transition: transform 200ms` 归位，实时显示空位跟随指针
 - 落点持久化：前端可拖拽排序仅在正 ID 分组/子分组内调用 `reorder_collection_members(collection_id, id[])` 更新 `meme_collections.sort_order`；`reorder_memes(id[])` 仍用于维护全局 `sort_order`；API 失败回滚 `originalOrder` 并重渲染 + toast
-- `canReorderMemes()`: 搜索或标签筛选时禁用；**全局开关 `dragSortEnabled`（标题栏「拖拽排序」图标按钮，位于上传/下载左侧，图标蓝色高亮=开，灰色=关）关闭时禁用排序**；仅正 ID 分组（含子分组）、全部（null）与未分类（-4）视图可排序，收藏夹/最近使用等特殊集合（-2/-3）不可排
+- `canReorderMemes()`: 搜索或标签筛选时禁用；**全局开关 `dragSortEnabled`（标题栏「拖拽排序」图标按钮，位于上传/下载左侧，图标蓝色高亮=开，灰色=关）关闭时禁用排序**；仅正 ID 分组（含子分组）、全部（null）与未分组（-4）视图可排序，收藏夹/最近使用等特殊集合（-2/-3）不可排
 - **整理/多选模式拆分（互斥）**：`sortEnabled`（拖拽排序）与 `selectMode`（多选）为两个独立标题栏按钮状态，开启一个自动关闭另一个（`toggleSort`/`toggleSelect` 用 `drag.enable()/drag.disable()` 而非 `drag.toggle()`）。排序模式：drag-select `:click-option-to-select=false`，点击卡不复制不勾选，仅拖拽换位；多选模式：drag-select `:click-option-to-select=true` 支持点选/框选，`#batch-bar`（`v-if="selectMode"`：全选当前页/取消选择/加入分组/打标签/移动到分组（仅正 ID 分组视图显示）/批量删除）显示，`#meme-grid.select-enabled` 生效。批量操作作用于 `selectedIds`：`batchAddToCollection`/`batchMoveToCollection` 复用 CollectionBuilder 选择模式（`cb.openPick(mode, ids, fromId)`，仅显示可搜索分组下拉 + 新建分组，无双栏表情列表）调 JsApi `batch_add_to_collection`/`batch_move_to_collection`（追加/移出+加入语义，`collection_id<=0` 时按 name 创建/复用顶层分组；move 模式下拉排除源分组及其整棵子树，后端同样拒绝后代分组作目标——移入后代等于移出后又加回递归视图；批量移动后原分组移空且无子分组时自动删除）；`batchTag` 用 TagEditor 批量模式（`openBatch()`，不加载单图已有标签）调 JsApi `batch_add_tags` 合并追加。ESC 顺序：右键菜单 → 多选 → 整理 → 隐藏窗口；`handleCopy`/`onCardPointerDown`/`onDocPointerMove` 均以 `sortEnabled || selectMode` 守卫（多选/整理中不复制、不走原生拖拽）
 - **排序视觉反馈**：`renderGrid()` 按 `canReorderMemes()` 切换 `sort-enabled`；启用时仅普通 meme 卡（排除 `.folder-card` 和 `.dragging`）最终显示 `scale(0.95)`、3px `var(--border-light)` 描边及 3px 偏移。稳定卡使用独立 `rotate` 属性作轻微快速晃动，且必须排除 `.drag-active`、`.sort-enter`、`.folder-card` 和 `.dragging`；`prefers-reduced-motion: reduce` 时禁用晃动。不得用 `transform` 实现晃动，避免覆盖拖拽和 FLIP 的变换。正在拖拽的卡内联变换固定为最终 `translate(...) scale(0.90)`，与现有透明度、阴影和 FLIP 效果并存，CSS 与内联变换不得叠加。多选模式选中态独立：`#meme-grid.select-enabled .meme-card.selected` 为 `2px solid var(--primary-strong)` outline（与整理模式选中态规则并存，后者仅作用于 `sort-enabled`）。开启工具栏排序开关时沿用现有入场反馈，只有明确关闭该开关才保留当前卡片播放退场动画。搜索、标签、分组或虚拟分组导致的资格变化均按普通刷新处理，不播放退场动画；文件夹卡不显示排序反馈
 - **拖拽到外部应用**：关闭拖拽排序后 meme 卡**不用 HTML5 拖拽**（WebView2 http 源的 `text/uri-list`/`DownloadURL` 不生成 CF_HDROP，QQ/微信会报"图片拖拽失败"或资源管理器无反应）；改用 **WinForms 原生文件拖拽**（`native_drag.py`）：`pointerdown` 记录起点 → `pointermove` 位移 >8px 时 `JsApi.start_native_drag(id)` → 后端用 `webview.windows[0].native`（主 Form）`Invoke` 在 UI 线程执行 `DoDragDrop`（`DataObject` + `DataFormats.FileDrop` → CF_HDROP）→ 拖到 QQ/微信/桌面是真实本地文件；`DoDragDrop` 返回 `DragDropEffects.None`（拖回取消）时 `start_native_drag` 返回 False，不触发 `schedule_hide`；`native_drag.py` 懒加载 pythonnet/WinForms，非 Windows 或无 .NET 时返回 False，JS 端 toast 提示；**原生拖拽进行中回拖到窗口**用全局 `nativeDragActive` 标志抑制 drop 导入处理器（dragenter/dragover/dragleave/drop 均忽略，视为取消，不弹导入浮层）；`nativeDragActive` 在 `pointermove` 位移 >8px 触发原生拖拽**前**置 true，`start_native_drag` Promise `.then/.catch` 中重置，拖拽期间（后端 `DoDragDrop` 阻塞 UI 线程）保持 true，确保拖回窗口不会误触发导入
@@ -306,6 +336,9 @@ tests/
 - 右键表情包 → 加入分组 → 弹窗列出当前大分组下的子分组
 
 ### 主窗口 UI/UX
+- **统一内容库与体裁**：`useMemes` 通过 `JsApi.search_library` 统一分页，状态分存 `memes` 与 `chatRecords`；`activeGenre` 为 `all|image|gif|chat_record`。`#tagbar` 首行「体裁」是不可编辑系统筛选（不进入 tags/meme_tags、TagEditor 或 MemeDetails），普通分组/类别/标签筛选会自然排除聊天记录；切到聊天记录时主动清空这些图片专属筛选。`all` 分页中聊天记录按更新时间置前，剩余名额再接图片。聊天记录卡点击打开 `ChatRecordDetails`，显示来源/统计/扁平消息预览，并可复制 `/omm send <ID>`；聊天记录参与网格时禁用图片拖拽排序
+- **后台入库即时刷新**：`library_events` 用弱引用保存当前 `WebUI` 回调；NapCat 归档与 LAN 推送完成后发布内容变化事件。`WebUI` 在 120ms 内合并连续通知并调用前端 `window.refreshLibrary`，只重新执行当前筛选并回到第一页，不整页 reload、不重新扫描图库
+- **表情包详情**：右键菜单「查看表情包详情」或在非整理/非多选模式下长按卡片 500ms 打开 `MemeDetails`；长按期间移动超过 8px 即取消并继续原生拖拽，成功触发后屏蔽该次 click/contextmenu，绝不复制到剪贴板。弹窗使用 `/api/original`（历史路由名，实际返回日常副本）在左侧按原始比例 `object-fit: contain` 大图展示；图片框 hover 显示前后按钮，非输入控件焦点下 ←/→ 按全图库稳定的 `sort_order ASC, id DESC` 顺序切图（详情编辑更新 `updated_at` 时不会跳序），首尾禁用。右侧明确标注并可编辑标题和文件名（文件名同步磁盘原件，禁止改扩展名/路径/保留名并检查冲突）；所属分组显示所有直接归属的完整层级路径，可移除或通过项目风格的搜索下拉框添加已有分组，支持多分组且不移动磁盘文件。搜索名称没有精确命中时，详情可调用 `create_collection`/`create_category` 就地创建顶层或子节点并立即选中；分组只允许顶层加一层小分组，类别可选择任意既有类别作为父节点。结构节点创建后立即持久化并刷新侧边栏，但当前表情的分组关系或类别归属仍只在显式保存/切图保存时由 `update_meme_details` 写入。详情也可添加/移除/全局编辑标签，并分别编辑人工/AI 图片描述及人工/AI 图片文字，不适用的一侧可留空以明确来源。已选标签与自绘建议下拉层均提供编辑入口，可同时修改名称和种类，修改影响所有表情，目标标签已存在时自动合并。标签及分组建议样式与项目分组选择器一致（不用系统 `datalist`），支持搜索、鼠标选择及 ↑/↓/Enter。显式保存与切图前保存走 `update_meme_details`，失败则保留当前页面；纯标题变化调用 `manifest.update_meme_name` 原子更新本地清单，不访问原件，只有文件名/类别/分组结构变化或增量更新无法定位条目时才完整重建 manifest。关闭、遮罩点击与 Esc 直接放弃未保存修改。支持 Ctrl/Cmd+S 保存、Tab 焦点循环及关闭后焦点归还
 - **折叠侧边栏分组可辨识**：`CollectionTreeNode.vue` 在折叠态（`collapsed`）以 `.tree-avatar`（26px 圆角块，取分组名首 1-2 字符，`avatarText` computed）替代统一文件夹图标，active 行高亮；展开态保持原图标
 - **功能发现性**：meme 卡左上 `.fav-btn` 心形快捷收藏（hover/active/focus-visible 显示，selectMode/sortEnabled 时隐藏，`@click.stop`+`@pointerdown.stop`，调 `JsApi.toggle_favorite` 并本地翻转 `meme.favorited` 后 `refreshCollections`）；侧边栏树行 hover 显示 `.tree-more`「⋯」按钮（展开态，`@click.stop` 发 folder-context 复用右键菜单）
 - **空状态**：`#empty` 从 kaomoji 改为 SVG 插画（`.empty-svg`）+「导入表情包」按钮（`showImportMenu`）
@@ -313,15 +346,15 @@ tests/
 - **垂直空间压缩**：titlebar 38px、`#search-wrap` padding 6px 12px、`#search` padding 7px 12px、`#tagbar` padding 4px 12px + max-height 52px、`#breadcrumb` padding 2px 12px、`#grid-wrap` padding 10px、pager padding 5px 10px
 - **标题栏统一**：主/设置窗口关闭按钮均为 `×`；拖拽排序图标为上下箭头（非汉堡线）
 - **右键子菜单点击展开**：`ContextMenu.vue` 的「加入分组/新建子分组」从 hover 触发改为 click 切换（`onItemClick`，展开时锚定点击项右缘 `getBoundingClientRect().right + 4`，再次点击 `hide-submenu` 收起），保留越界 clamp，`has-submenu` 项显示 `▸` 指示符
-- **加入分组任意视图可用**：表情右键「加入分组」不再要求处于分组视图，`onShowSubmenu` 列出全部分组树（顶层直显、子分组带「父/子」路径扁平列表，子菜单仅一层故扁平化），顶部保留「新建分组/新建小分组」（分组视图内在当前分组下创建，其他视图创建顶层分组）；文件夹右键分支仅保留「新建子分组」单项，在**右键的分组**（`trigger.folderId`）下创建（不再依赖 `t.memeId` 的 `subgroup-*` 项与 `activeCollection` 目标）
+- **加入分组任意视图可用**：表情右键「加入分组」不再要求处于分组视图，`onShowSubmenu` 列出全部分组树（顶层直显、子分组带「父/子」路径扁平列表，子菜单仅一层故扁平化）；只要存在可选分组，`ContextMenu` 就在子菜单顶部显示固定搜索框，按完整路径即时过滤，Enter 选择首个结果，Esc 先清空再关闭，选项区独立滚动。顶部保留「新建分组/新建小分组」（分组视图内在当前分组下创建，其他视图创建顶层分组）；文件夹右键分支仅保留「新建子分组」单项，在**右键的分组**（`trigger.folderId`）下创建（不再依赖 `t.memeId` 的 `subgroup-*` 项与 `activeCollection` 目标）
 - **CollectionBuilder 分组下拉搜索**：`collectionOptions` 由分组树扁平化（含子分组，label 带「父/子」路径），`filteredCollectionOptions` computed 按 `#cb-name` 输入词过滤（匹配组名或父路径），无匹配显示「无匹配分组」；`createNew` 点击「创建新分组」后保留已输入名称不再清空；`selectCollection` 的 `selectedName` 与输入框显示值保持一致避免 watch 误判手动改名
 
-### 未分类（虚拟分组）
-- **`collection_id = -4`** 标识「未分类」虚拟分组：展示未加入任何分组的表情包（`meme_collections` 无记录），**不写入 DB/manifest，动态生成**
+### 未分组（虚拟分组）
+- **`collection_id = -4`** 标识「未分组」虚拟分组：展示未加入任何分组的表情包（`meme_collections` 无记录），**不写入 DB/manifest，动态生成**
 - `MemeDB.search()/count()` 新增 `uncategorized_only` 参数（`NOT EXISTS` 于 `meme_collections`），`search_memes` 中 `collection_id == -4` 路由到该参数，同时过滤隐写载体
-- `get_init_data`/`get_collections` 按配置 `show_uncategorized`（默认开）决定是否追加 `-4` 条目（`get_collections` 中放于 `-2`/`-3` 之后）；设置页「分组显示 → 显示未分类分组」开关（`s-show-uncategorized`），保存到 `save_settings` 的 `show_uncategorized`
+- `get_init_data`/`get_collections` 按配置 `show_uncategorized`（默认开）决定是否追加 `-4` 条目（`get_collections` 中放于 `-2`/`-3` 之后）；设置页「分组显示 → 显示未分组分组」开关（`s-show-uncategorized`），保存到 `save_settings` 的 `show_uncategorized`
 - 前端走通用集合渲染路径：计数为 0 时自动隐藏（`renderCollections` 的 `count === 0` 过滤）；可拖拽排序（复用全局 `sort_order`，走 `reorder_memes` 持久化，`canReorderMemes` 对 -4 返回 true）；无特殊右键菜单
-- 未分类集合内的删除/加入分组等操作经 `refreshCollections` 后计数自动刷新，全部归类后 `-4` 从标签栏消失
+- 未分组集合内的删除/加入分组等操作经 `refreshCollections` 后计数自动刷新，全部归类后 `-4` 从标签栏消失
 
 ### 最近使用
 - `recent_uses` 表：`meme_id` + `used_at`
@@ -340,6 +373,16 @@ tests/
 - **保存**: `save_qq_zip()` 通过系统另存为对话框保存 ZIP 到用户位置
 - **前端 UI**: 设置页「导入」分组下 `.import-row` 列表行（硬编码 SVG 图标 + 名称），点击手机版 QQ 行直接开始导入并弹进度覆盖层；其余导入来源点击先弹配置对话框再开始
 - `.adb/` 文件夹同时供 ADB 检测和 QQ 导入共用
+
+### Notion 数据库导入 (notion_import.py)
+- **定位**: 只读导入，不向 Notion 写入或删除数据；主窗口「导入表情包 → 从 Notion 数据库导入」弹窗填写 Internal Integration Token、数据库 URL/ID、可选 data source ID 及属性映射
+- **API**: `Notion-Version: 2026-03-11`；数据库只有一个 data source 时由 `GET /databases/{id}` 自动解析，页面通过 `POST /data_sources/{id}/query` 分页读取；429/5xx 与网络错误有限重试
+- **映射**: 必填 Files & media 图片属性；Title 可留空自动识别；`notion_tag_mappings` 是可增删的 `{category, property}` 列表，每个 Multi-select/Select/Status/Rich text/Relation 属性独立映射为一个本地标签分类，分类留空时取属性标题；旧 `notion_tags_property` 自动兼容为同名分类。Select/Status/Multi-select/Relation 仍可映射到「Notion」顶层分组下的子分组。Relation 跨全部标签列与分组列去重收集 page id，经 `GET /pages/{id}` 读取关联页面 Title 并缓存为名称
+- **媒体落地与增量跳过**: 首次下载后走 WebUI `_do_import` 的大小/分辨率限制、魔数识别、SHA-256 去重和本地缓存，并把 data source/page/property/file index+name/`last_edited_time` → `meme_id` 写入 `notion_sources`。再次导入时仅当页面版本一致且本地缓存文件仍存在，才在下载前跳过；页面变化、映射缺失或本地文件缺失时重新下载并以 SHA-256 兜底。旧数据需再下载一次建立映射；外部 URL 内容可原地变化，始终下载校验
+- **来源安全**: 不保存约一小时失效的 Notion 签名 URL；来源映射随 SQLite 本地备份保存，但不写入远程同步 manifest
+- **下载安全**: 仅允许公网 HTTPS，初始 URL及每次重定向均做 DNS/IP 校验并拒绝私网、回环、链路本地和保留地址；流式下载原件硬限制 200 MiB，只接受 PNG/JPG/GIF/WebP/BMP 魔数
+- **进度与取消**: `start_notion_import` 后台线程 + `_NOTION_STATE`，主窗口 `NotionImportDialog` 350ms 轮询；取消在分页之间、逐文件之间和下载分块间检查
+- **主窗口弹窗**: `ImportMenu` 提供入口，`NotionImportDialog.vue` 提供连接测试、属性自动识别、动态增删标签列、开始/取消与内联进度；Token 通过 Config 加密保存
 
 ### QQNT 提取 (qqnt_extract.py)
 - **来源**: 改编自 GPL-3.0 项目 QQFavoriteExtract (main_gui.py)，**GPL-3.0 合规**：该模块按 GPL-3.0 分发（头部含原作者署名与协议链接），引入后整体作品再分发需按 GPL-3.0 处理
