@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
-import { deflateSync } from 'node:zlib'
+import { deflateSync, gzipSync, gunzipSync } from 'node:zlib'
 
 import {
   __test,
@@ -12,6 +12,656 @@ import {
   plugin_cleanup,
   plugin_init,
 } from '../napcat-plugin-ohmymeme-current-peer/index.mjs'
+
+function fakeForwardArk(extra = { filename: 'test-forward', tsum: 2 }) {
+  return {
+    elementType: 10,
+    elementId: '',
+    arkElement: {
+      bytesData: JSON.stringify({
+        app: 'com.tencent.multimsg',
+        config: { forward: 1, type: 'normal' },
+        extra,
+        meta: { detail: { resid: 'test-resource', uniseq: 'test-forward' } },
+        ver: '0.0.0.5',
+        view: 'contact',
+      }),
+    },
+  }
+}
+
+test('normalizes NapCat forward card extra to the native QQNT string form', () => {
+  const element = fakeForwardArk()
+  const normalized = __test.normalizeForwardArkElement(element)
+
+  assert.equal(normalized.changed, true)
+  assert.notEqual(normalized.value, element)
+  const card = JSON.parse(normalized.value.arkElement.bytesData)
+  assert.equal(typeof card.extra, 'string')
+  assert.equal(card.extra.endsWith('\n'), true)
+  assert.deepEqual(JSON.parse(card.extra), { filename: 'test-forward', tsum: 2 })
+  assert.equal(typeof JSON.parse(element.arkElement.bytesData).extra, 'object')
+})
+
+test('leaves native forward cards and unrelated ARK cards unchanged', () => {
+  const native = fakeForwardArk('{"filename":"native","tsum":1}\n')
+  const unrelated = {
+    arkElement: { bytesData: JSON.stringify({ app: 'com.tencent.music.lua', extra: {} }) },
+  }
+
+  assert.equal(__test.normalizeForwardArkElement(native).changed, false)
+  assert.equal(__test.normalizeForwardArkElement(unrelated).changed, false)
+})
+
+test('plugin normalizes outer and nested packet forward cards and restores hooks', async () => {
+  const sent = []
+  const converted = []
+  const listener = {}
+  const msgApi = {
+    async sendMsg(peer, elements) {
+      sent.push({ peer, elements })
+      return { msgId: 'sent-message' }
+    },
+  }
+  const converter = {
+    rawMsgWithSendMsgToPacketMsg(raw) {
+      converted.push(raw)
+      return { converted: true }
+    },
+    rawMsgToPacketMsg(raw) {
+      converted.push(raw)
+      return { converted: true }
+    },
+  }
+  const originalSendMsg = msgApi.sendMsg
+  const originalRawConvert = converter.rawMsgWithSendMsgToPacketMsg
+  const ctx = {
+    logger: { info() {}, error() {} },
+    router: { get() {} },
+    core: {
+      eventWrapper: { createListenerFunction() { return listener } },
+      apis: {
+        MsgApi: msgApi,
+        PacketApi: { pkt: { msgConverter: converter } },
+        UserApi: {},
+      },
+    },
+  }
+
+  await plugin_init(ctx)
+  try {
+    await msgApi.sendMsg({ chatType: 2, peerUid: 'group' }, [fakeForwardArk()])
+    converter.rawMsgWithSendMsgToPacketMsg({ msg: [fakeForwardArk()] })
+
+    const outer = JSON.parse(sent[0].elements[0].arkElement.bytesData)
+    const nested = JSON.parse(converted[0].msg[0].arkElement.bytesData)
+    assert.equal(typeof outer.extra, 'string')
+    assert.equal(typeof nested.extra, 'string')
+    assert.equal(__test.state.forwardCardRewriteCount, 2)
+  } finally {
+    await plugin_cleanup()
+  }
+  assert.equal(msgApi.sendMsg, originalSendMsg)
+  assert.equal(converter.rawMsgWithSendMsgToPacketMsg, originalRawConvert)
+})
+
+test('raw native forward patch preserves unknown protobuf fields and native flags', () => {
+  const b = __test.protoBytesField
+  const v = __test.protoVarintField
+  const text = (field, value) => b(field, Buffer.from(value, 'utf8'))
+  const responseUnknown = text(99, 'opaque-response')
+  const contentUnknown = text(77, 'opaque-content')
+  const bodyUnknown = text(55, 'opaque-body')
+  const actionUnknown = text(88, 'opaque-action')
+  const payloadUnknown = text(90, 'opaque-payload')
+  const response = Buffer.concat([
+    v(1, 10000),
+    text(2, 'self-uid'),
+    b(7, text(6, 'Me')),
+    responseUnknown,
+  ])
+  const forward = Buffer.concat([
+    v(1, 0),
+    v(2, 0),
+    v(3, 2),
+    text(5, 'self-avatar'),
+    text(101, 'opaque-forward'),
+  ])
+  const content = Buffer.concat([
+    v(1, 9),
+    v(3, 4),
+    v(6, 999),
+    b(15, forward),
+    contentUnknown,
+  ])
+  const body = Buffer.concat([
+    b(1, response),
+    b(2, content),
+    b(3, text(44, 'message-body')),
+    bodyUnknown,
+  ])
+  const data = b(1, body)
+  const action = Buffer.concat([
+    text(1, 'MultiMsg'),
+    b(2, data),
+    actionUnknown,
+  ])
+  const payload = Buffer.concat([b(2, action), payloadUnknown])
+
+  const patched = __test.patchNativeForwardProtoPayload(payload, [{
+    senderUin: '301',
+    senderUid: 'uid-301',
+    senderName: 'Alice',
+    time: 1710000001,
+    sourceType: 'private',
+    sourcePeerId: '',
+  }])
+  const fields = (value) => __test.protoWireFields(value)
+  const firstBytes = (value, field) => (
+    fields(value).find((item) => item.number === field && item.wire === 2)?.value
+  )
+  const firstVarint = (value, field) => (
+    fields(value).find((item) => item.number === field && item.wire === 0)?.value
+  )
+  const patchedAction = firstBytes(patched, 2)
+  const patchedData = firstBytes(patchedAction, 2)
+  const patchedBody = firstBytes(patchedData, 1)
+  const patchedResponse = firstBytes(patchedBody, 1)
+  const patchedContent = firstBytes(patchedBody, 2)
+  const patchedForward = firstBytes(patchedContent, 15)
+
+  assert.equal(firstVarint(patchedResponse, 1), 301n)
+  assert.equal(firstBytes(patchedResponse, 2).toString(), 'uid-301')
+  assert.equal(firstBytes(firstBytes(patchedResponse, 7), 6).toString(), 'Alice')
+  assert.equal(firstVarint(patchedContent, 6), 1710000001n)
+  assert.equal(firstVarint(patchedForward, 3), 2n)
+  assert.equal(firstBytes(patchedForward, 101).toString(), 'opaque-forward')
+  assert.equal(firstBytes(patchedResponse, 99).toString(), 'opaque-response')
+  assert.equal(firstBytes(patchedContent, 77).toString(), 'opaque-content')
+  assert.equal(firstBytes(patchedBody, 55).toString(), 'opaque-body')
+  assert.equal(firstBytes(patchedAction, 88).toString(), 'opaque-action')
+  assert.equal(firstBytes(patched, 90).toString(), 'opaque-payload')
+})
+
+test('raw native forward patch rebuilds a group-compatible source header', () => {
+  const b = __test.protoBytesField
+  const v = __test.protoVarintField
+  const text = (field, value) => b(field, Buffer.from(value, 'utf8'))
+  const response = Buffer.concat([
+    v(1, 10000),
+    text(2, 'self-uid'),
+    text(6, 'self-uid'),
+    b(7, text(6, 'Me')),
+  ])
+  const forward = Buffer.concat([v(1, 0), v(2, 0), v(3, 2)])
+  const content = Buffer.concat([
+    v(1, 9),
+    v(2, 175),
+    v(3, 4),
+    v(6, 999),
+    v(9, 4),
+    v(12, 123),
+    b(15, forward),
+  ])
+  const messageBody = b(1, b(2, text(1, 'message')))
+  const body = Buffer.concat([b(1, response), b(2, content), b(3, messageBody)])
+  const action = Buffer.concat([text(1, 'MultiMsg'), b(2, b(1, body))])
+  const payload = b(2, action)
+
+  const patched = __test.patchNativeForwardProtoPayload(payload, [{
+    senderUin: '301',
+    senderUid: 'uid-301',
+    senderName: 'Alice',
+    time: 1710000001,
+    sourceType: 'group',
+    sourcePeerId: '90001',
+    sourcePeerName: 'Source Group',
+  }])
+  const fields = (value) => __test.protoWireFields(value)
+  const firstBytes = (value, field) => (
+    fields(value).find((item) => item.number === field && item.wire === 2)?.value
+  )
+  const firstVarint = (value, field) => (
+    fields(value).find((item) => item.number === field && item.wire === 0)?.value
+  )
+  const patchedAction = firstBytes(patched, 2)
+  const patchedData = firstBytes(patchedAction, 2)
+  const patchedBody = firstBytes(patchedData, 1)
+  const patchedResponse = firstBytes(patchedBody, 1)
+  const patchedContent = firstBytes(patchedBody, 2)
+  const group = firstBytes(patchedResponse, 8)
+  const patchedForward = firstBytes(patchedContent, 15)
+  const patchedMessageBody = firstBytes(patchedBody, 3)
+  const richText = firstBytes(patchedMessageBody, 1)
+  const elements = fields(richText).filter((item) => item.number === 2)
+
+  assert.equal(firstBytes(patchedResponse, 6), undefined)
+  assert.equal(firstBytes(patchedResponse, 7).length, 0)
+  assert.equal(firstVarint(group, 1), 90001n)
+  assert.equal(firstBytes(group, 4).toString(), 'Alice')
+  assert.equal(firstVarint(group, 5), 2n)
+  assert.equal(firstBytes(group, 7).toString(), 'Source Group')
+  assert.equal(firstVarint(patchedContent, 1), 82n)
+  assert.equal(firstVarint(patchedContent, 2), undefined)
+  assert.equal(firstVarint(patchedContent, 3), undefined)
+  assert.equal(firstVarint(patchedContent, 9), undefined)
+  assert.equal(firstVarint(patchedContent, 12), undefined)
+  assert.equal(firstVarint(patchedForward, 3), 1n)
+  assert.equal(fields(elements[0].value)[0].number, 37)
+  assert.equal(fields(elements[1].value)[0].number, 9)
+})
+
+test('raw native forward transport uses QQ long-message packet envelopes', async () => {
+  const b = __test.protoBytesField
+  const v = __test.protoVarintField
+  const text = (field, value) => b(field, Buffer.from(value, 'utf8'))
+  const payload = Buffer.concat([text(90, 'native-payload'), v(91, 7)])
+  let uploadRequest = null
+  const operation = {
+    async sendPacket(packet) {
+      if (packet.cmd.endsWith('.SsoRecvLongMsg')) {
+        const result = Buffer.concat([text(3, 'template-res'), b(4, gzipSync(payload))])
+        return b(1, result)
+      }
+      if (packet.cmd.endsWith('.SsoSendLongMsg')) {
+        uploadRequest = packet.data
+        return b(2, text(3, 'rebuilt-res'))
+      }
+      throw new Error('unexpected packet')
+    },
+  }
+  const ctx = {
+    logger: { info() {}, error() {} },
+    router: { get() {} },
+    core: {
+      selfInfo: { uid: 'self-uid', uin: '10000' },
+      eventWrapper: { createListenerFunction() { return {} } },
+      apis: {},
+    },
+  }
+
+  try {
+    await plugin_init(ctx)
+    const downloaded = await __test.downloadNativeForwardProto(
+      operation,
+      'template-res',
+    )
+    assert.deepEqual(downloaded, payload)
+    const newResId = await __test.uploadNativeForwardProto(
+      operation,
+      payload,
+      { chatType: 1, peerUid: 'friend-uid', guildId: '' },
+    )
+    assert.equal(newResId, 'rebuilt-res')
+    const firstBytes = (value, field) => (
+      __test.protoWireFields(value)
+        .find((item) => item.number === field && item.wire === 2)?.value
+    )
+    const info = firstBytes(uploadRequest, 2)
+    assert.deepEqual(gunzipSync(firstBytes(info, 4)), payload)
+    assert.equal(firstBytes(firstBytes(info, 2), 2).toString(), 'self-uid')
+  } finally {
+    await plugin_cleanup()
+  }
+})
+
+test('native replay accepts one untouched non-empty MultiMsg action', () => {
+  const b = __test.protoBytesField
+  const text = (field, value) => b(field, Buffer.from(value, 'utf8'))
+  const body = b(1, b(1, Buffer.alloc(0)))
+  const action = Buffer.concat([
+    text(1, 'MultiMsg'),
+    b(2, b(1, body)),
+  ])
+  const payload = b(2, action)
+
+  assert.equal(__test.validateNativeForwardProtoPayload(payload), 1)
+  assert.throws(
+    () => __test.validateNativeForwardProtoPayload(b(2, text(1, 'Other'))),
+    /MultiMsg/,
+  )
+})
+
+test('native replay uploads the archived payload without rewriting its nodes', async () => {
+  const b = __test.protoBytesField
+  const text = (field, value) => b(field, Buffer.from(value, 'utf8'))
+  const archivedPayload = b(2, Buffer.concat([
+    text(1, 'MultiMsg'),
+    b(2, b(1, b(1, b(1, Buffer.alloc(0))))),
+  ]))
+  let uploadedPayload = null
+  let uploadType = null
+  let uploadGroup = null
+  let sent = null
+  const templateArk = fakeForwardArk('{"filename":"template","tsum":1}\n')
+  templateArk.multiForwardMsgElement = { resId: 'template-resource' }
+  const templateCard = JSON.parse(templateArk.arkElement.bytesData)
+  templateCard.meta.detail.resid = 'template-resource'
+  templateArk.arkElement.bytesData = JSON.stringify(templateCard)
+  const ctx = {
+    logger: { info() {}, error() {} },
+    router: { get() {} },
+    core: {
+      selfInfo: { uid: 'self-uid', uin: '10000', nick: 'Me' },
+      eventWrapper: {
+        createListenerFunction() { return {} },
+        async callNormalEventV2() {
+          return [null, [{
+            msgId: 'template-card',
+            peerUid: 'self-uid',
+            senderUid: 'self-uid',
+            elements: [templateArk],
+          }]]
+        },
+      },
+      apis: {
+        MsgApi: {
+          async sendMsg(peer, elements) {
+            sent = { peer, elements }
+            return { msgId: 'sent-card' }
+          },
+        },
+        PacketApi: {
+          pkt: {
+            operation: {
+              async sendPacket(packet) {
+                assert.match(packet.cmd, /SsoSendLongMsg$/)
+                const info = __test.firstProtoBytes(packet.data, 2)
+                uploadedPayload = gunzipSync(__test.firstProtoBytes(info, 4))
+                const infoFields = __test.protoWireFields(info)
+                uploadType = infoFields.find((field) => field.number === 1)?.value
+                uploadGroup = infoFields.find((field) => field.number === 3)?.value
+                return b(2, text(3, 'replayed-resource'))
+              },
+            },
+          },
+        },
+      },
+    },
+    oneBot: {
+      apis: {
+        MsgApi: {
+          async createSendElements() {
+            return {
+              sendElements: [{ elementType: 1, textElement: { content: 'seed' } }],
+              deleteAfterSentFiles: [],
+            }
+          },
+          async sendMsgWithOb11UniqueId() { return { msgId: 'seed-message' } },
+        },
+      },
+    },
+  }
+  const archivedCard = {
+    app: 'com.tencent.multimsg',
+    config: { forward: 1, type: 'normal' },
+    extra: '{"filename":"old","tsum":3}\n',
+    meta: {
+      detail: {
+        resid: 'old-resource',
+        source: 'Archived source title',
+        uniseq: 'old',
+      },
+    },
+    ver: '0.0.0.5',
+    view: 'contact',
+  }
+
+  try {
+    await plugin_init(ctx)
+    const result = await __test.replayNativeForwardPayload(
+      { chatType: 1, peerUid: 'friend-uid', guildId: '' },
+      archivedPayload,
+      archivedCard,
+      { chatType: 2, peerUid: '90001', guildId: '' },
+    )
+    assert.equal(result.msgId, 'sent-card')
+    assert.deepEqual(uploadedPayload, archivedPayload)
+    assert.equal(uploadType, 3n)
+    assert.equal(uploadGroup, 90001n)
+    assert.equal(sent.peer.peerUid, 'friend-uid')
+    const finalCard = JSON.parse(sent.elements[0].arkElement.bytesData)
+    assert.equal(finalCard.meta.detail.resid, 'replayed-resource')
+    assert.equal(finalCard.meta.detail.source, 'Archived source title')
+    assert.equal(JSON.parse(finalCard.extra).tsum, 3)
+    assert.equal(
+      sent.elements[0].multiForwardMsgElement.resId,
+      'replayed-resource',
+    )
+  } finally {
+    await plugin_cleanup()
+  }
+})
+
+test('native rebuild route asks QQNT to build nested desktop-compatible forwards', async () => {
+  const routes = new Map()
+  const listener = {}
+  const staged = []
+  const forwarded = []
+  const uploaded = []
+  const finalCards = []
+  const templateActions = new Map()
+  const storedTemplates = new Map()
+  let cardIndex = 0
+  const ctx = {
+    logger: { info() {}, error() {} },
+    router: { get(path, handler) { routes.set(path, handler) } },
+    core: {
+      selfInfo: { uid: 'self-uid', uin: '10000', nick: 'Me' },
+      eventWrapper: {
+        createListenerFunction() { return listener },
+        async callNormalEventV2(_service, _listener, args) {
+          const [msgInfos, , destination] = args
+          forwarded.push({ msgInfos, destination })
+          cardIndex += 1
+          const resId = `template-${cardIndex}`
+          templateActions.set(resId, [{
+            actionCommand: 'MultiMsg',
+            actionData: {
+              msgBody: msgInfos.map(() => ({
+                responseHead: {
+                  fromUin: 10000,
+                  fromUid: 'self-uid',
+                  forward: { friendName: 'Me' },
+                },
+                contentHead: {
+                  type: 9,
+                  timeStamp: 999,
+                  forward: { field1: 0, field2: 0, field3: 2 },
+                },
+                body: { richText: { elems: [] } },
+              })),
+            },
+          }])
+          const msgId = `card-${cardIndex}`
+          const storedArk = fakeForwardArk('{"filename":"native","tsum":1}\n')
+          const storedCard = JSON.parse(storedArk.arkElement.bytesData)
+          storedCard.meta.detail.resid = resId
+          storedArk.arkElement.bytesData = JSON.stringify(storedCard)
+          storedTemplates.set(msgId, {
+            msgId,
+            msgSeq: String(cardIndex),
+            peerUid: destination.peerUid,
+            senderUid: 'self-uid',
+            elements: [storedArk],
+          })
+          const callbackArk = fakeForwardArk('{"filename":"native","tsum":1}\n')
+          const callbackCard = JSON.parse(callbackArk.arkElement.bytesData)
+          // QQNT 的即时回调可能只有未补齐 resid 的 ARK；
+          // 消息落库后再按 msgId 读取完整元素。
+          callbackCard.meta.detail.resid = ''
+          callbackArk.arkElement.bytesData = JSON.stringify(callbackCard)
+          return [null, [{
+            msgId,
+            msgSeq: String(cardIndex),
+            peerUid: destination.peerUid,
+            senderUid: 'self-uid',
+            elements: [callbackArk],
+          }]]
+        },
+      },
+      apis: {
+        MsgApi: {
+          async getMsgsByMsgId(_peer, msgIds) {
+            return { msgList: msgIds.map((id) => storedTemplates.get(id)).filter(Boolean) }
+          },
+          async sendMsg(peer, elements) {
+            const msgId = `sent-${finalCards.length + 1}`
+            finalCards.push({ peer, elements, msgId })
+            return { msgId }
+          },
+        },
+        PacketApi: {
+          pkt: {
+            operation: {
+              async FetchForwardMsgRaw(resId) {
+                return templateActions.get(resId)
+              },
+              async UploadForwardMsgV2(actions, groupUin) {
+                const resId = `rebuilt-${uploaded.length + 1}`
+                uploaded.push({ actions, groupUin, resId })
+                return resId
+              },
+            },
+          },
+        },
+        UserApi: {
+          async getUidByUinV2(uin) {
+            return {
+              20000: 'friend-uid',
+              302: 'uid-302',
+            }[uin] || ''
+          },
+        },
+      },
+    },
+    oneBot: {
+      apis: {
+        MsgApi: {
+          async createSendElements(content) {
+            return {
+              sendElements: content.map((segment) => ({
+                elementType: 1,
+                textElement: { content: segment.data.text },
+              })),
+              deleteAfterSentFiles: [],
+            }
+          },
+          async sendMsgWithOb11UniqueId(peer, elements) {
+            const msgId = `stage-${staged.length + 1}`
+            staged.push({ peer, elements, msgId })
+            return { msgId }
+          },
+        },
+      },
+    },
+  }
+  const payloadPath = join(
+    tmpdir(),
+    `ohmymeme-native-forward-${process.pid}-${Date.now()}.json`,
+  )
+  writeFileSync(payloadPath, JSON.stringify({
+    schema_version: 1,
+    destination_type: 'private',
+    destination_peer_id: '20000',
+    messages: [
+      {
+        type: 'node',
+        data: {
+          nickname: 'Alice',
+          user_id: '301',
+          omm_sender_uid: 'uid-301',
+          omm_source_type: 'group',
+          omm_source_peer_id: '90001',
+          time: '1710000001',
+          content: [{ type: 'text', data: { text: 'outer' } }],
+        },
+      },
+      {
+        type: 'node',
+        data: {
+          nickname: 'Bob',
+          user_id: '302',
+          time: '1710000002',
+          content: [{
+            type: 'node',
+            data: {
+              nickname: 'Carol',
+              user_id: '303',
+              omm_sender_uid: 'uid-303',
+              time: '1710000003',
+              content: [{ type: 'text', data: { text: 'inner' } }],
+            },
+          }],
+        },
+      },
+    ],
+  }), 'utf8')
+
+  await plugin_init(ctx)
+  try {
+    const response = {}
+    await routes.get('/send-native-forward')(
+      { query: { payload_path: payloadPath } },
+      {
+        json(value) { response.value = value },
+        status() { return this },
+      },
+    )
+
+    assert.equal(response.value.ok, true)
+    assert.equal(response.value.strategy, 'qqnt_native_rebuild')
+    assert.equal(staged.length, 2)
+    assert.deepEqual(
+      forwarded.map((call) => call.msgInfos.map((item) => item.senderShowName)),
+      [['Carol'], ['Alice', 'Bob']],
+    )
+    assert.deepEqual(
+      forwarded.map((call) => call.destination.peerUid),
+      ['self-uid', 'self-uid'],
+    )
+    assert.equal(uploaded.length, 2)
+    const innerBody = uploaded[0].actions[0].actionMsgBody[0]
+    assert.equal(innerBody.responseHead.fromUin, 303)
+    assert.equal(innerBody.responseHead.fromUid, 'uid-303')
+    assert.equal(innerBody.responseHead.forward.friendName, 'Carol')
+    assert.equal(innerBody.contentHead.timeStamp, 1710000003)
+    const outerBodies = uploaded[1].actions[0].actionMsgBody
+    assert.deepEqual(
+      outerBodies.map((body) => body.responseHead.fromUin),
+      [301, 302],
+    )
+    assert.deepEqual(
+      outerBodies.map((body) => body.responseHead.fromUid),
+      ['uid-301', 'uid-302'],
+    )
+    assert.equal(outerBodies[0].responseHead.forward.friendName, undefined)
+    assert.deepEqual(outerBodies[0].responseHead.grp, {
+      groupUin: 90001,
+      memberName: 'Alice',
+      unknown5: 2,
+    })
+    assert.equal(outerBodies[0].contentHead.type, 82)
+    assert.equal(outerBodies[0].contentHead.forward.field3, 1)
+    assert.deepEqual(
+      outerBodies[0].body.richText.elems.slice(0, 2),
+      [{ generalFlags: {} }, { elemFlags2: {} }],
+    )
+    assert.equal(outerBodies[1].responseHead.forward.friendName, 'Bob')
+    assert.deepEqual(
+      finalCards.map((item) => item.peer.peerUid),
+      ['self-uid', 'friend-uid'],
+    )
+    const finalCard = JSON.parse(finalCards[1].elements[0].arkElement.bytesData)
+    assert.equal(finalCard.meta.detail.resid, 'rebuilt-2')
+    assert.equal(typeof finalCard.extra, 'string')
+    assert.equal(JSON.parse(finalCard.extra).tsum, 2)
+    assert.equal(existsSync(payloadPath), false)
+  } finally {
+    if (existsSync(payloadPath)) rmSync(payloadPath, { force: true })
+    await plugin_cleanup()
+  }
+})
 
 test('extracts an explicitly selected group peer', () => {
   const payload = {
@@ -476,8 +1126,10 @@ test('plugin restores nested forward actions from one long-message resource', as
 
   assert.equal(response.value.ok, true)
   assert.equal(response.value.action_count, 2)
+  assert.equal(response.value.messages[0].omm_sender_uid, 'uid-111')
   const forward = response.value.messages[0].message[0]
   assert.equal(forward.type, 'forward')
+  assert.equal(forward.data.content[0].omm_sender_uid, 'uid-111')
   assert.equal(forward.data.content[0].message[0].data.text, 'inside')
   await plugin_cleanup()
 })

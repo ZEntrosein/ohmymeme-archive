@@ -326,8 +326,10 @@ class TestOneBot(unittest.TestCase):
             )
 
         self.assertFalse(data["available"])
-        self.assertEqual(opener.call_args_list[0].args[0].full_url,
-                         "http://127.0.0.1:6099/api/auth/login")
+        self.assertEqual(
+            opener.call_args_list[0].args[0].full_url,
+            "http://127.0.0.1:6099/api/auth/login",
+        )
         self.assertEqual(
             opener.call_args_list[1].args[0].get_header("Authorization"),
             "Bearer signed-credential",
@@ -375,9 +377,10 @@ class TestOneBot(unittest.TestCase):
         response = mock.MagicMock()
         response.__enter__.return_value = response
         response.read.return_value = json.dumps({"ok": True}).encode("utf-8")
-        onebot._WEBUI_CREDENTIAL_CACHE[
-            ("http://127.0.0.1:6099", "secret")
-        ] = (time.monotonic() + 60, "credential")
+        onebot._WEBUI_CREDENTIAL_CACHE[("http://127.0.0.1:6099", "secret")] = (
+            time.monotonic() + 60,
+            "credential",
+        )
 
         with mock.patch("src.onebot._open_request", return_value=response) as opener:
             onebot.call_webui_plugin_api(
@@ -567,21 +570,26 @@ class TestOneBot(unittest.TestCase):
     def test_send_chat_record_rebuilds_archive_when_original_is_unavailable(self):
         package = {
             "title": "测试记录",
+            "native_card": {
+                "app": "com.tencent.multimsg",
+                "meta": {"detail": {"resid": "old"}},
+            },
             "source": {
                 "self_id": 123,
                 "message_id": 99,
+                "message_type": "group",
+                "group_id": 987,
                 "message": [{"type": "forward", "data": {"id": "root"}}],
             },
             "forward_records": {
                 "root": {
+                    "omm_native_payload_b64": "bmF0aXZl",
                     "messages": [
                         {
                             "sender": {"user_id": 456, "nickname": "Alice"},
-                            "message": [
-                                {"type": "text", "data": {"text": "你好"}}
-                            ],
+                            "message": [{"type": "text", "data": {"text": "你好"}}],
                         }
-                    ]
+                    ],
                 }
             },
         }
@@ -602,7 +610,9 @@ class TestOneBot(unittest.TestCase):
                     raise onebot.OneBotError("原消息已失效")
                 return {"message_id": 100}
 
-            with mock.patch("src.onebot.call_action", side_effect=fake_action) as action:
+            with mock.patch(
+                "src.onebot.call_action", side_effect=fake_action
+            ) as action:
                 result = onebot.send_chat_record(
                     "http://127.0.0.1:3000",
                     "token",
@@ -623,11 +633,96 @@ class TestOneBot(unittest.TestCase):
             "你好",
         )
 
+    def test_send_chat_record_uses_qqnt_native_rebuild_when_webui_is_available(self):
+        package = {
+            "title": "测试记录",
+            "native_card": {
+                "app": "com.tencent.multimsg",
+                "meta": {"detail": {"resid": "old"}},
+            },
+            "source": {
+                "self_id": 123,
+                "message_id": 99,
+                "message_type": "group",
+                "group_id": 987,
+                "real_seq": 9988,
+                "time": 1710000099,
+                "sender": {"user_id": 654},
+                "message": [{"type": "forward", "data": {"id": "root"}}],
+            },
+            "forward_records": {
+                "root": {
+                    "omm_native_payload_b64": "bmF0aXZl",
+                    "messages": [
+                        {
+                            "sender": {
+                                "user_id": 456,
+                                "uid": "uid-456",
+                                "nickname": "Alice",
+                            },
+                            "message_type": "group",
+                            "group_id": 987,
+                            "time": 1710000000,
+                            "message": [{"type": "text", "data": {"text": "你好"}}],
+                        }
+                    ],
+                }
+            },
+        }
+        db = mock.MagicMock()
+        db.get_chat_record.return_value = package
+        captured = {}
+
+        def fake_plugin(http_url, token, plugin_id, route, timeout=5, params=None):
+            payload_path = Path(params["payload_path"])
+            captured.update(json.loads(payload_path.read_text(encoding="utf-8")))
+            # 桥接插件读取后会立即删除临时文件。
+            payload_path.unlink()
+            return {
+                "ok": True,
+                "message_id": "native-card-id",
+                "strategy": "qqnt_native_replay",
+            }
+
+        with mock.patch(
+            "src.onebot.call_webui_plugin_api", side_effect=fake_plugin
+        ) as plugin:
+            with mock.patch("src.onebot.call_action") as action:
+                result = onebot.send_chat_record(
+                    "http://127.0.0.1:3000",
+                    "token",
+                    7,
+                    {
+                        "self_id": 123,
+                        "message_type": "private",
+                        "target_id": 789,
+                    },
+                    db=db,
+                    send_mode="archive_rebuild",
+                    webui_url="http://127.0.0.1:6099",
+                    webui_token="webui-token",
+                )
+
+        action.assert_not_called()
+        self.assertEqual(plugin.call_args.args[3], "send-native-forward")
+        self.assertEqual(captured["destination_type"], "private")
+        self.assertEqual(captured["destination_peer_id"], "789")
+        self.assertEqual(captured["messages"][0]["data"]["nickname"], "Alice")
+        self.assertEqual(captured["messages"][0]["data"]["omm_sender_uid"], "uid-456")
+        self.assertEqual(captured["messages"][0]["data"]["omm_source_type"], "group")
+        self.assertEqual(captured["messages"][0]["data"]["omm_source_peer_id"], "987")
+        self.assertEqual(captured["messages"][0]["data"]["time"], "1710000000")
+        self.assertEqual(captured["native_payload_b64"], "bmF0aXZl")
+        self.assertEqual(captured["native_card"]["app"], "com.tencent.multimsg")
+        self.assertEqual(captured["native_source_type"], "group")
+        self.assertEqual(captured["native_source_peer_id"], "987")
+        self.assertEqual(result["message_id"], "native-card-id")
+        self.assertTrue(result["native_rebuild"])
+        self.assertTrue(result["native_replay"])
+
     def test_forward_nodes_preserves_nested_forward_tree(self):
         package = {
-            "source": {
-                "message": [{"type": "forward", "data": {"id": "root"}}]
-            },
+            "source": {"message": [{"type": "forward", "data": {"id": "root"}}]},
             "forward_records": {
                 "root": {
                     "messages": [
@@ -650,9 +745,7 @@ class TestOneBot(unittest.TestCase):
                     "messages": [
                         {
                             "sender": {"user_id": 789, "nickname": "Bob"},
-                            "message": [
-                                {"type": "text", "data": {"text": "内层内容"}}
-                            ],
+                            "message": [{"type": "text", "data": {"text": "内层内容"}}],
                         }
                     ]
                 },
@@ -666,17 +759,13 @@ class TestOneBot(unittest.TestCase):
         self.assertEqual(nodes[0]["data"]["content"][0]["data"]["text"], "外层说明")
         nested_wrapper = nodes[1]
         self.assertEqual(nested_wrapper["data"]["nickname"], "Alice")
-        self.assertEqual(
-            nested_wrapper["data"]["prompt"], "[聊天记录] Bob：内层内容"
-        )
+        self.assertEqual(nested_wrapper["data"]["prompt"], "[聊天记录] Bob：内层内容")
         self.assertEqual(nested_wrapper["data"]["content"][0]["type"], "node")
         self.assertEqual(
             nested_wrapper["data"]["content"][0]["data"]["nickname"], "Bob"
         )
         self.assertEqual(
-            nested_wrapper["data"]["content"][0]["data"]["content"][0]["data"][
-                "text"
-            ],
+            nested_wrapper["data"]["content"][0]["data"]["content"][0]["data"]["text"],
             "内层内容",
         )
 
@@ -721,9 +810,7 @@ class TestOneBot(unittest.TestCase):
 
         collect(nodes)
         self.assertIn("最深内容", texts)
-        self.assertIn(
-            "[更深层嵌套记录受 NapCat 层级限制，已在本层展开]", texts
-        )
+        self.assertIn("[更深层嵌套记录受 NapCat 层级限制，已在本层展开]", texts)
 
     def test_send_chat_record_forwards_existing_outer_message_natively(self):
         package = {
@@ -792,15 +879,18 @@ class TestOneBot(unittest.TestCase):
 
         self.assertTrue(result["reindexed"])
         self.assertEqual(result["source"], "original_native")
-        self.assertEqual(plugin.call_args.kwargs["params"], {
-            "source_type": "group",
-            "source_peer_id": 555,
-            "source_real_seq": 7788,
-            "source_time": 1710000000,
-            "source_sender_id": 111222,
-            "destination_type": "group",
-            "destination_peer_id": 999,
-        })
+        self.assertEqual(
+            plugin.call_args.kwargs["params"],
+            {
+                "source_type": "group",
+                "source_peer_id": 555,
+                "source_real_seq": 7788,
+                "source_time": 1710000000,
+                "source_sender_id": 111222,
+                "destination_type": "group",
+                "destination_peer_id": 999,
+            },
+        )
 
     def test_send_chat_record_can_force_original_rebuild(self):
         archived = {
@@ -819,9 +909,7 @@ class TestOneBot(unittest.TestCase):
                     "messages": [
                         {
                             "sender": {"user_id": 456, "nickname": "Alice"},
-                            "message": [
-                                {"type": "text", "data": {"text": "刷新内容"}}
-                            ],
+                            "message": [{"type": "text", "data": {"text": "刷新内容"}}],
                         }
                     ]
                 }
@@ -926,7 +1014,9 @@ class TestOneBot(unittest.TestCase):
                     send_mode="archive_rebuild",
                 )
 
-        self.assertEqual([item[0] for item in attempts], ["download_file", "send_group_forward_msg"])
+        self.assertEqual(
+            [item[0] for item in attempts], ["download_file", "send_group_forward_msg"]
+        )
         self.assertEqual(
             attempts[1][1]["messages"][0]["data"]["content"][0]["data"]["text"],
             "[图片，资源已失效]",
@@ -1137,9 +1227,9 @@ class TestOneBot(unittest.TestCase):
             }
             reused = onebot._reuse_archived_image_paths(archived, refreshed)
 
-            new_data = refreshed["forward_records"]["root"]["messages"][0][
-                "message"
-            ][0]["data"]
+            new_data = refreshed["forward_records"]["root"]["messages"][0]["message"][
+                0
+            ]["data"]
             self.assertEqual(reused, 1)
             self.assertEqual(new_data["local_path"], str(local_path))
 
@@ -1191,12 +1281,16 @@ class TestOneBot(unittest.TestCase):
 
             entries = onebot._archive_media_entries(package)
             self.assertEqual(count, 3)
-            self.assertEqual([kind for kind, _data in entries], ["image", "video", "record"])
+            self.assertEqual(
+                [kind for kind, _data in entries], ["image", "video", "record"]
+            )
             self.assertEqual(
                 [Path(data["local_path"]).suffix for _kind, data in entries],
                 [".jpg", ".mp4", ".silk"],
             )
-            self.assertTrue(all(Path(data["local_path"]).is_file() for _kind, data in entries))
+            self.assertTrue(
+                all(Path(data["local_path"]).is_file() for _kind, data in entries)
+            )
             self.assertEqual(package["summary"]["media_localized_count"], 3)
             self.assertTrue(package["summary"]["media_localized"])
 
@@ -1240,9 +1334,9 @@ class TestOneBot(unittest.TestCase):
                     storage_root=cache,
                 )
 
-            data = package["forward_records"]["root"]["messages"][0]["message"][
-                0
-            ]["data"]
+            data = package["forward_records"]["root"]["messages"][0]["message"][0][
+                "data"
+            ]
             parts = Path(data["local_path"]).parts
             self.assertEqual(count, 1)
             self.assertEqual(parts[0], "chat-record-media")
@@ -1281,7 +1375,9 @@ class TestOneBot(unittest.TestCase):
                 package, cache / "chat-record-media"
             )
             # 使用真实记录哈希目录，模拟虚拟盘刚写完时 is_file/resolve 暂时失败。
-            data = package["forward_records"]["root"]["messages"][0]["message"][0]["data"]
+            data = package["forward_records"]["root"]["messages"][0]["message"][0][
+                "data"
+            ]
             data["local_path"] = (
                 Path("chat-record-media") / archive_dir.name / "00001.jpg"
             ).as_posix()
@@ -1349,9 +1445,9 @@ class TestOneBot(unittest.TestCase):
                 )
                 result = onebot.migrate_legacy_chat_record_media(db=db, cfg=cfg)
                 migrated = db.get_chat_record(saved["id"])
-                data = migrated["forward_records"]["root"]["messages"][0][
-                    "message"
-                ][0]["data"]
+                data = migrated["forward_records"]["root"]["messages"][0]["message"][0][
+                    "data"
+                ]
                 migrated_path = cache / data["local_path"]
 
                 self.assertEqual(result, {"records": 1, "files": 1})
@@ -1637,9 +1733,7 @@ class TestOneBot(unittest.TestCase):
 
         with mock.patch("src.onebot.call_action", side_effect=fake_action):
             with self.assertRaisesRegex(onebot.OneBotError, "parseMultMsg"):
-                onebot.build_chat_record_package(
-                    "http://127.0.0.1:3000", "token", "99"
-                )
+                onebot.build_chat_record_package("http://127.0.0.1:3000", "token", "99")
 
     def test_build_chat_record_package_recovers_nested_actions_with_plugin(self):
         def fake_action(http_url, token, action, params=None, timeout=5):
@@ -1675,6 +1769,7 @@ class TestOneBot(unittest.TestCase):
 
         recovered = {
             "ok": True,
+            "native_payload_b64": "bmF0aXZlLXByb3Rv",
             "messages": [
                 {
                     "sender": {"nickname": "Alice"},
@@ -1726,9 +1821,7 @@ class TestOneBot(unittest.TestCase):
             )
 
         plugin.assert_called_once()
-        self.assertEqual(
-            plugin.call_args.args[3], "recover-forward-resource"
-        )
+        self.assertEqual(plugin.call_args.args[3], "recover-forward-resource")
         self.assertEqual(
             plugin.call_args.kwargs["params"],
             {
@@ -1741,6 +1834,10 @@ class TestOneBot(unittest.TestCase):
             },
         )
         self.assertEqual(package["summary"]["node_count"], 3)
+        self.assertEqual(
+            package["forward_records"]["root"]["omm_native_payload_b64"],
+            "bmF0aXZlLXByb3Rv",
+        )
         self.assertEqual(package["summary"]["max_depth"], 2)
         self.assertEqual(
             [item["preview"] for item in onebot.chat_record_view(package)],
@@ -1827,9 +1924,7 @@ class TestOneBot(unittest.TestCase):
         self.assertEqual(image["data"]["path"], "C:/cache/image.jpg")
         self.assertEqual(video["data"]["path"], "C:/cache/video.mp4")
         self.assertEqual(video["data"]["url"], "https://fresh/video")
-        self.assertEqual(
-            video["data"]["omm_fallback_urls"], ["https://old/video"]
-        )
+        self.assertEqual(video["data"]["omm_fallback_urls"], ["https://old/video"])
 
     def test_download_archive_image_tries_fallback_urls(self):
         attempts = []
@@ -1854,15 +1949,11 @@ class TestOneBot(unittest.TestCase):
                 )
 
         self.assertEqual(result, str(downloaded))
-        self.assertEqual(
-            attempts, ["https://primary/x", "https://fallback/x"]
-        )
+        self.assertEqual(attempts, ["https://primary/x", "https://fallback/x"])
 
     def test_existing_empty_nodes_show_and_send_as_placeholder(self):
         package = {
-            "source": {
-                "message": [{"type": "forward", "data": {"id": "root"}}]
-            },
+            "source": {"message": [{"type": "forward", "data": {"id": "root"}}]},
             "forward_records": {
                 "root": {
                     "messages": [
@@ -1885,6 +1976,113 @@ class TestOneBot(unittest.TestCase):
             nodes[0]["data"]["content"][0]["data"]["text"],
             "[空消息或未解析的嵌套聊天记录]",
         )
+
+    def test_chat_record_view_exposes_saved_image_media_urls_in_archive_order(self):
+        package = {
+            "source": {"message": [{"type": "forward", "data": {"id": "root"}}]},
+            "forward_records": {
+                "root": {
+                    "messages": [
+                        {
+                            "sender": {"nickname": "Alice"},
+                            "message": [
+                                {
+                                    "type": "image",
+                                    "data": {
+                                        "file": "first.jpg",
+                                        "local_path": "chat-record-media/r/00001.jpg",
+                                    },
+                                },
+                                {
+                                    "type": "video",
+                                    "data": {
+                                        "file": "clip.mp4",
+                                        "local_path": "chat-record-media/r/00002.mp4",
+                                    },
+                                },
+                            ],
+                        },
+                        {
+                            "sender": {"nickname": "Bob"},
+                            "message": [
+                                {
+                                    "type": "image",
+                                    "data": {
+                                        "file": "second.gif",
+                                        "local_path": "chat-record-media/r/00003.gif",
+                                    },
+                                }
+                            ],
+                        },
+                    ]
+                }
+            },
+        }
+
+        view = onebot.chat_record_view(
+            package,
+            media_url_factory=lambda index, _kind: f"/api/chat-record-media/7/{index}",
+        )
+
+        self.assertEqual(view[0]["media"][0]["index"], 1)
+        self.assertEqual(view[0]["media"][0]["url"], "/api/chat-record-media/7/1")
+        self.assertEqual(view[0]["media"][0]["alt"], "first.jpg")
+        self.assertEqual(view[1]["media"][0]["index"], 3)
+        self.assertEqual(view[1]["media"][0]["url"], "/api/chat-record-media/7/3")
+
+    def test_chat_record_media_path_only_serves_saved_images_under_media_root(self):
+        from types import SimpleNamespace
+
+        from src.webui import WebUI
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cache = root / "cache"
+            media = cache / "chat-record-media" / "record"
+            media.mkdir(parents=True)
+            image = media / "00001.gif"
+            image.write_bytes(b"GIF89a")
+            package = {
+                "source": {
+                    "self_id": 123,
+                    "message_id": 456,
+                    "message": [{"type": "forward", "data": {"id": "root"}}],
+                },
+                "forward_records": {
+                    "root": {
+                        "messages": [
+                            {
+                                "message": [
+                                    {
+                                        "type": "image",
+                                        "data": {
+                                            "local_path": "chat-record-media/record/00001.gif"
+                                        },
+                                    }
+                                ]
+                            }
+                        ]
+                    }
+                },
+                "summary": {"node_count": 1, "record_count": 1, "media_count": 1},
+            }
+            db = MemeDB(root / "memes.db")
+            try:
+                saved = db.save_chat_record(package)
+                cfg = SimpleNamespace(
+                    cache_dir=cache,
+                    data_dir=root / "data",
+                    get=lambda _key, default=None: default,
+                )
+                ui = WebUI.__new__(WebUI)
+                ui._cfg = cfg
+                with mock.patch("src.webui.get_db", return_value=db):
+                    result = ui._get_chat_record_media_path(saved["id"], 1)
+                    video_result = ui._get_chat_record_media_path(saved["id"], 2)
+                self.assertTrue(os.path.samefile(result, image))
+                self.assertEqual(video_result, "")
+            finally:
+                db.close()
 
     def test_build_chat_record_package_probes_outer_id_when_forward_segment_is_lost(
         self,
@@ -1966,6 +2164,7 @@ class TestOneBot(unittest.TestCase):
             )
 
         self.assertEqual(package["title"], "[聊天记录] Alice：你好")
+        self.assertEqual(package["native_card"], card)
         self.assertEqual(set(package["forward_records"]), {"forward-resource+/="})
         self.assertEqual(package["summary"]["node_count"], 1)
         self.assertEqual(

@@ -946,10 +946,13 @@ function onDocPointerMove(e: PointerEvent) {
         const suffix = result.degraded_media_count
           ? `（${result.degraded_media_count} 个媒体已转为占位）`
           : ''
+        const rebuildSource = result.native_replay
+          ? '（原生负载重放）'
+          : result.native_rebuild ? '（QQNT 原生重组）' : ''
         const targetSource = result.target_source === 'napcat_plugin'
           ? '（NapCat 会话 ID）'
           : ''
-        showToast(`已发送到 ${result.target_label || '当前 QQ 会话'}${targetSource}${suffix}`)
+        showToast(`已发送到 ${result.target_label || '当前 QQ 会话'}${targetSource}${rebuildSource}${suffix}`)
       }).catch(() => {
         nativeDragActive = false
         showToast('聊天记录拖拽发送失败')

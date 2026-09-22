@@ -12,22 +12,34 @@
 
 export const PLUGIN_ID = 'napcat-plugin-ohmymeme-current-peer'
 
-import { inflateSync } from 'node:zlib'
+import { gzipSync, gunzipSync, inflateSync } from 'node:zlib'
 import {
   existsSync,
   mkdirSync,
+  readFileSync,
+  realpathSync,
   renameSync,
   statSync,
   unlinkSync,
   writeFileSync,
 } from 'node:fs'
 import { createHash, randomUUID } from 'node:crypto'
-import { dirname, isAbsolute } from 'node:path'
+import { tmpdir } from 'node:os'
+import { basename, dirname, isAbsolute, sep } from 'node:path'
 
 const CHAT_TYPE_C2C = 1
 const CHAT_TYPE_GROUP = 2
 const MAX_SCAN_NODES = 5000
 const MAX_ARCHIVE_IMAGE_BYTES = 64 * 1024 * 1024
+const MAX_NATIVE_FORWARD_BYTES = 64 * 1024 * 1024
+const MAX_NATIVE_FORWARD_EXPORT_BYTES = 5 * 1024 * 1024
+const MAX_NATIVE_FORWARD_DEPTH = 12
+const NATIVE_FORWARD_TEMP_PREFIX = 'ohmymeme-native-forward-'
+const FORWARD_CARD_APP = 'com.tencent.multimsg'
+const ELEMENT_TYPE_FILE = 3
+const ELEMENT_TYPE_PTT = 4
+const ELEMENT_TYPE_VIDEO = 5
+const ELEMENT_TYPE_ARK = 10
 const state = {
   active: false,
   current: null,
@@ -40,6 +52,12 @@ const state = {
   mediaUpdatedAt: 0,
   listener: null,
   listenerHandlers: null,
+  sendMsgTarget: null,
+  sendMsgOriginal: null,
+  sendMsgWrapper: null,
+  packetConverterPatches: [],
+  forwardCardRewriteCount: 0,
+  sourceGroupNames: new Map(),
   ctx: null,
 }
 
@@ -55,6 +73,141 @@ function asText(value) {
 
 function asObject(value) {
   return value !== null && typeof value === 'object' ? value : null
+}
+
+function presentKeys(value) {
+  const object = asObject(value)
+  if (!object) return []
+  return Object.entries(object)
+    .filter(([, item]) => item !== null && item !== undefined)
+    .map(([key]) => key)
+    .sort()
+}
+
+/** 将 NapCat 伪造转发卡片修正为 QQNT 原生 extra 字符串格式。 */
+export function normalizeForwardCardBytes(bytesData) {
+  if (typeof bytesData !== 'string' || !bytesData) {
+    return { value: bytesData, changed: false }
+  }
+  let card
+  try {
+    card = JSON.parse(bytesData)
+  } catch {
+    return { value: bytesData, changed: false }
+  }
+  if (
+    !card
+    || card.app !== FORWARD_CARD_APP
+    || !card.extra
+    || typeof card.extra !== 'object'
+    || Array.isArray(card.extra)
+  ) {
+    return { value: bytesData, changed: false }
+  }
+  return {
+    value: JSON.stringify({
+      ...card,
+      extra: `${JSON.stringify(card.extra)}\n`,
+    }),
+    changed: true,
+  }
+}
+
+/** 只复制并修正需要兼容处理的 ARK 元素。 */
+export function normalizeForwardArkElement(element) {
+  if (!element?.arkElement) return { value: element, changed: false }
+  const normalized = normalizeForwardCardBytes(element.arkElement.bytesData)
+  if (!normalized.changed) return { value: element, changed: false }
+  return {
+    value: {
+      ...element,
+      arkElement: {
+        ...element.arkElement,
+        bytesData: normalized.value,
+      },
+    },
+    changed: true,
+  }
+}
+
+function normalizeForwardArkElements(elements) {
+  if (!Array.isArray(elements)) return { value: elements, changed: false, count: 0 }
+  let changed = false
+  let count = 0
+  const value = elements.map((element) => {
+    const normalized = normalizeForwardArkElement(element)
+    if (normalized.changed) {
+      changed = true
+      count += 1
+    }
+    return normalized.value
+  })
+  return { value: changed ? value : elements, changed, count }
+}
+
+function normalizeForwardCardsInRawMessage(raw) {
+  if (!raw || typeof raw !== 'object') return { value: raw, changed: false, count: 0 }
+  let value = raw
+  let changed = false
+  let count = 0
+  for (const key of ['msg', 'elements']) {
+    const normalized = normalizeForwardArkElements(raw[key])
+    if (!normalized.changed) continue
+    if (!changed) value = { ...raw }
+    value[key] = normalized.value
+    changed = true
+    count += normalized.count
+  }
+  return { value, changed, count }
+}
+
+function installForwardCardCompatibility(ctx) {
+  const msgApi = ctx.core?.apis?.MsgApi
+  if (msgApi && typeof msgApi.sendMsg === 'function') {
+    const original = msgApi.sendMsg
+    const wrapper = function (peer, elements, ...args) {
+      const normalized = normalizeForwardArkElements(elements)
+      state.forwardCardRewriteCount += normalized.count
+      return original.call(this, peer, normalized.value, ...args)
+    }
+    state.sendMsgTarget = msgApi
+    state.sendMsgOriginal = original
+    state.sendMsgWrapper = wrapper
+    msgApi.sendMsg = wrapper
+  }
+
+  const converter = ctx.core?.apis?.PacketApi?.pkt?.msgConverter
+  if (!converter) return
+  for (const name of ['rawMsgWithSendMsgToPacketMsg', 'rawMsgToPacketMsg']) {
+    if (typeof converter[name] !== 'function') continue
+    const original = converter[name]
+    const wrapper = function (raw, ...args) {
+      const normalized = normalizeForwardCardsInRawMessage(raw)
+      state.forwardCardRewriteCount += normalized.count
+      return original.call(this, normalized.value, ...args)
+    }
+    state.packetConverterPatches.push({ converter, name, original, wrapper })
+    converter[name] = wrapper
+  }
+}
+
+function removeForwardCardCompatibility() {
+  if (
+    state.sendMsgTarget
+    && state.sendMsgWrapper
+    && state.sendMsgTarget.sendMsg === state.sendMsgWrapper
+  ) {
+    state.sendMsgTarget.sendMsg = state.sendMsgOriginal
+  }
+  for (const patch of state.packetConverterPatches.toReversed()) {
+    if (patch.converter[patch.name] === patch.wrapper) {
+      patch.converter[patch.name] = patch.original
+    }
+  }
+  state.sendMsgTarget = null
+  state.sendMsgOriginal = null
+  state.sendMsgWrapper = null
+  state.packetConverterPatches = []
 }
 
 function own(value, keys) {
@@ -1415,6 +1568,16 @@ export async function recoverForwardResource(resourceOrParams) {
   if (typeof parser !== 'function') {
     throw new Error('当前 NapCat 未提供 OneBot 消息转换器')
   }
+  let nativePayloadBase64 = ''
+  if (typeof operation?.sendPacket === 'function') {
+    try {
+      const nativePayload = await downloadNativeForwardProto(operation, resId)
+      if (nativePayload.length <= MAX_NATIVE_FORWARD_EXPORT_BYTES) {
+        nativePayloadBase64 = nativePayload.toString('base64')
+      }
+    } catch {
+    }
+  }
   let nativeMedia = {
     attempted: false,
     paths: new Map(),
@@ -1502,6 +1665,7 @@ export async function recoverForwardResource(resourceOrParams) {
             message_format: 'array',
           }
         if (!Array.isArray(node.message)) node.message = []
+        if (raw.senderUid) node.omm_sender_uid = asText(raw.senderUid)
         let imageIndex = 0
         const mediaIndexes = { video: 0, record: 0, file: 0 }
         for (const segment of node.message) {
@@ -1570,6 +1734,8 @@ export async function recoverForwardResource(resourceOrParams) {
   return {
     ok: true,
     messages,
+    native_payload_b64: nativePayloadBase64,
+    native_payload_preserved: Boolean(nativePayloadBase64),
     action_count: actions.size,
     media_diagnostics: mediaDiagnostics,
     native_tree_attempted: nativeMedia.attempted,
@@ -1579,6 +1745,1034 @@ export async function recoverForwardResource(resourceOrParams) {
     native_tree_media_count: nativeMedia.media,
     native_tree_resolved_count: nativeMedia.resolved,
     native_tree_diagnostics: nativeMedia.diagnostics,
+  }
+}
+
+function nativeForwardTempPath(value) {
+  const requested = asText(value).trim()
+  if (!requested || !isAbsolute(requested)) {
+    throw new Error('原生重组临时文件路径无效')
+  }
+  const root = realpathSync(tmpdir())
+  const candidate = realpathSync(requested)
+  const rootPrefix = `${root}${root.endsWith(sep) ? '' : sep}`.toLowerCase()
+  if (
+    !candidate.toLowerCase().startsWith(rootPrefix)
+    || !basename(candidate).startsWith(NATIVE_FORWARD_TEMP_PREFIX)
+  ) {
+    throw new Error('原生重组临时文件不在允许目录内')
+  }
+  const size = statSync(candidate).size
+  if (!Number.isSafeInteger(size) || size <= 0 || size > MAX_NATIVE_FORWARD_BYTES) {
+    throw new Error('原生重组数据大小无效')
+  }
+  return candidate
+}
+
+function validateNativeForwardNodes(nodes, depth = 0, counter = { value: 0 }) {
+  if (!Array.isArray(nodes) || nodes.length === 0) {
+    throw new Error('原生重组没有可发送的聊天记录节点')
+  }
+  if (depth > MAX_NATIVE_FORWARD_DEPTH) {
+    throw new Error('原生重组嵌套层级超过安全上限')
+  }
+  for (const node of nodes) {
+    counter.value += 1
+    if (counter.value > MAX_SCAN_NODES) {
+      throw new Error('原生重组节点数量超过安全上限')
+    }
+    if (node?.type !== 'node' || !asObject(node.data)) {
+      throw new Error('原生重组节点格式无效')
+    }
+    const content = node.data.content
+    if (!Array.isArray(content) || content.length === 0) {
+      throw new Error('原生重组节点正文为空')
+    }
+    const children = content.filter((item) => item?.type === 'node')
+    if (children.length && children.length !== content.length) {
+      throw new Error('嵌套聊天记录不能与普通消息段混合')
+    }
+    if (children.length) validateNativeForwardNodes(children, depth + 1, counter)
+  }
+  return counter.value
+}
+
+/** 读取并立即删除 OhMyMeme 写入系统临时目录的节点树。 */
+export function loadNativeForwardPayload(payloadPath) {
+  const candidate = nativeForwardTempPath(payloadPath)
+  let raw
+  try {
+    raw = readFileSync(candidate, 'utf8')
+  } finally {
+    try {
+      unlinkSync(candidate)
+    } catch {
+    }
+  }
+  let payload
+  try {
+    payload = JSON.parse(raw)
+  } catch {
+    throw new Error('原生重组临时文件不是有效 JSON')
+  }
+  if (!asObject(payload) || Number(payload.schema_version) !== 1) {
+    throw new Error('原生重组数据版本不受支持')
+  }
+  const destinationType = asText(payload.destination_type).trim()
+  if (!['group', 'private'].includes(destinationType)) {
+    throw new Error('原生重组目标会话类型无效')
+  }
+  const destinationPeerId = requireDigits(
+    payload.destination_peer_id,
+    destinationType === 'group' ? '群号' : 'QQ 号',
+  )
+  validateNativeForwardNodes(payload.messages)
+  const nativePayloadBase64 = asText(payload.native_payload_b64).trim()
+  let nativePayload = null
+  if (nativePayloadBase64) {
+    if (!/^[A-Za-z0-9+/]+={0,2}$/.test(nativePayloadBase64)) {
+      throw new Error('原生聊天记录负载编码无效')
+    }
+    nativePayload = Buffer.from(nativePayloadBase64, 'base64')
+    if (
+      !nativePayload.length
+      || nativePayload.length > MAX_NATIVE_FORWARD_BYTES
+      || nativePayload.toString('base64') !== nativePayloadBase64
+    ) {
+      throw new Error('原生聊天记录负载大小或编码无效')
+    }
+  }
+  const nativeCard = asObject(payload.native_card)
+  if (nativeCard && nativeCard.app !== FORWARD_CARD_APP) {
+    throw new Error('原生聊天记录卡片格式无效')
+  }
+  const nativeSourceType = asText(payload.native_source_type).trim()
+  const nativeSourcePeerId = asText(payload.native_source_peer_id).trim()
+  if (nativePayload && !['group', 'private'].includes(nativeSourceType)) {
+    throw new Error('原生聊天记录缺少资源来源会话类型')
+  }
+  if (
+    nativePayload
+    && nativeSourceType === 'group'
+    && !/^\d+$/.test(nativeSourcePeerId)
+  ) {
+    throw new Error('原生聊天记录缺少资源来源群号')
+  }
+  return {
+    destination_type: destinationType,
+    destination_peer_id: destinationPeerId,
+    messages: payload.messages,
+    nativePayload,
+    nativeCard,
+    nativeSourceType,
+    nativeSourcePeerId,
+  }
+}
+
+function forwardNodeName(node) {
+  return asText(node?.data?.nickname || node?.data?.name || 'QQ用户')
+    .trim()
+    .slice(0, 100) || 'QQ用户'
+}
+
+function isSpecialNativeForwardElement(element) {
+  return [
+    ELEMENT_TYPE_FILE,
+    ELEMENT_TYPE_PTT,
+    ELEMENT_TYPE_VIDEO,
+    ELEMENT_TYPE_ARK,
+  ].includes(Number(element?.elementType))
+}
+
+async function stageNativeForwardLeaf(conversionPeer, selfPeer, content) {
+  const msgApi = state.ctx?.oneBot?.apis?.MsgApi
+  if (
+    typeof msgApi?.createSendElements !== 'function'
+    || typeof msgApi?.sendMsgWithOb11UniqueId !== 'function'
+  ) {
+    throw new Error('当前 NapCat 未提供原生消息暂存接口')
+  }
+  const created = await msgApi.createSendElements(content, conversionPeer)
+  const elements = Array.isArray(created?.sendElements) ? created.sendElements : []
+  const ordinary = elements.filter((element) => !isSpecialNativeForwardElement(element))
+  const batches = [
+    ...(ordinary.length ? [ordinary] : []),
+    ...elements.filter(isSpecialNativeForwardElement).map((element) => [element]),
+  ]
+  if (!batches.length) throw new Error('原生重组节点没有可发送的消息元素')
+  const result = []
+  for (const batch of batches) {
+    const message = await msgApi.sendMsgWithOb11UniqueId(
+      selfPeer,
+      batch,
+      Array.isArray(created?.deleteAfterSentFiles) ? created.deleteAfterSentFiles : [],
+    )
+    const msgId = asText(message?.msgId).trim()
+    if (!msgId) throw new Error('QQNT 未返回暂存消息 ID')
+    result.push(msgId)
+  }
+  return result
+}
+
+function isForwardCardMessage(message) {
+  for (const element of Array.isArray(message?.elements) ? message.elements : []) {
+    const bytes = asText(element?.arkElement?.bytesData)
+    if (!bytes) continue
+    try {
+      if (JSON.parse(bytes)?.app === FORWARD_CARD_APP) return true
+    } catch {
+    }
+  }
+  return false
+}
+
+function tryNativeForwardCard(message) {
+  let multiForwardResId = ''
+  let arkCandidate = null
+  for (const element of Array.isArray(message?.elements) ? message.elements : []) {
+    multiForwardResId ||= asText(
+      element?.multiForwardMsgElement?.resId
+      || element?.multiForwardMsgElement?.resid,
+    ).trim()
+    const bytes = asText(element?.arkElement?.bytesData)
+    if (!bytes) continue
+    try {
+      const card = JSON.parse(bytes)
+      if (card?.app === FORWARD_CARD_APP) {
+        arkCandidate = { element, card }
+        const resId = asText(
+          card?.meta?.detail?.resid || card?.meta?.detail?.resId,
+        ).trim()
+        if (resId) return { element, card, resId }
+      }
+    } catch {
+    }
+  }
+  if (arkCandidate && multiForwardResId) {
+    return { ...arkCandidate, resId: multiForwardResId }
+  }
+  return null
+}
+
+function nativeForwardStructure(message) {
+  const elements = Array.isArray(message?.elements) ? message.elements : []
+  let arkDetailKeys = []
+  let hasForwardArk = false
+  for (const element of elements) {
+    const bytes = asText(element?.arkElement?.bytesData)
+    if (!bytes) continue
+    try {
+      const card = JSON.parse(bytes)
+      if (card?.app !== FORWARD_CARD_APP) continue
+      hasForwardArk = true
+      arkDetailKeys = presentKeys(card?.meta?.detail)
+    } catch {
+    }
+  }
+  return {
+    has_forward_ark: hasForwardArk,
+    has_multi_forward: elements.some((element) => (
+      Boolean(element?.multiForwardMsgElement)
+    )),
+    ark_detail_keys: arkDetailKeys,
+    element_keys: elements.map(presentKeys),
+  }
+}
+
+function waitForNativeForward(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds))
+}
+
+async function nativeForwardCard(message, peer) {
+  const direct = tryNativeForwardCard(message)
+  if (direct) return direct
+
+  const api = state.ctx?.core?.apis?.MsgApi
+  const msgId = asText(message?.msgId || message?.id).trim()
+  const msgSeq = asText(message?.msgSeq).trim()
+  let queried = 0
+  let queryErrors = 0
+  const delays = [0, 80, 220, 500]
+  for (const delay of delays) {
+    if (delay) await waitForNativeForward(delay)
+    const rows = []
+    if (msgId && typeof api?.getMsgsByMsgId === 'function') {
+      try {
+        rows.push(...messageList(await api.getMsgsByMsgId(peer, [msgId])))
+      } catch {
+        queryErrors += 1
+      }
+    }
+    if (msgSeq && typeof api?.getMsgsBySeqAndCount === 'function') {
+      try {
+        rows.push(...messageList(await api.getMsgsBySeqAndCount(
+          peer,
+          msgSeq,
+          1,
+          true,
+          true,
+        )))
+      } catch {
+        queryErrors += 1
+      }
+    }
+    queried += rows.length
+    const exact = rows.filter((row) => (
+      (!msgId || asText(row?.msgId || row?.id) === msgId)
+      && (!msgSeq || asText(row?.msgSeq) === msgSeq)
+    ))
+    for (const row of [...exact, ...rows]) {
+      const stored = tryNativeForwardCard(row)
+      if (stored) return stored
+    }
+  }
+
+  const shape = nativeForwardStructure(message)
+  throw new Error(
+    'QQNT 原生模板没有返回聊天记录资源；'
+    + `即时结构=${JSON.stringify(shape)}；落库候选=${queried}；查询异常=${queryErrors}`,
+  )
+}
+
+function normalizeForwardTimestamp(value) {
+  let timestamp = Number(value)
+  if (!Number.isFinite(timestamp) || timestamp <= 0) return 0
+  if (timestamp > 1e12) timestamp = Math.floor(timestamp / 1000)
+  return Math.floor(timestamp)
+}
+
+function nativeForwardEntry(node, msgId) {
+  const data = asObject(node?.data) || {}
+  return {
+    msgId: asText(msgId).trim(),
+    senderName: forwardNodeName(node),
+    senderUin: asText(data.user_id || data.uin).trim(),
+    senderUid: asText(data.omm_sender_uid).trim(),
+    time: normalizeForwardTimestamp(data.time),
+    sourceType: asText(data.omm_source_type).trim(),
+    sourcePeerId: asText(data.omm_source_peer_id).trim(),
+  }
+}
+
+async function resolveNativeForwardIdentity(entry) {
+  const selfInfo = state.ctx?.core?.selfInfo || {}
+  const selfUin = asText(selfInfo.uin).trim()
+  const senderUin = /^\d+$/.test(entry.senderUin) ? entry.senderUin : selfUin
+  let senderUid = entry.senderUid
+  if (!senderUid && senderUin && senderUin === selfUin) {
+    senderUid = asText(selfInfo.uid).trim()
+  }
+  if (!senderUid && senderUin) {
+    const converter = state.ctx?.core?.apis?.UserApi?.getUidByUinV2
+    if (typeof converter === 'function') {
+      try {
+        senderUid = asText(await converter.call(
+          state.ctx.core.apis.UserApi,
+          senderUin,
+        )).trim()
+      } catch {
+      }
+    }
+  }
+  if (!senderUin || !senderUid) {
+    throw new Error(
+      '无法把某个归档发送者转换为 QQNT 身份；'
+      + '请重新导入该聊天记录后再试',
+    )
+  }
+  let sourcePeerName = ''
+  if (entry.sourceType === 'group' && /^\d+$/.test(entry.sourcePeerId)) {
+    if (state.sourceGroupNames.has(entry.sourcePeerId)) {
+      sourcePeerName = state.sourceGroupNames.get(entry.sourcePeerId)
+    } else {
+      const getGroups = state.ctx?.core?.apis?.GroupApi?.getGroups
+      if (typeof getGroups === 'function') {
+        try {
+          const groups = await getGroups.call(state.ctx.core.apis.GroupApi, false)
+          for (const group of Array.isArray(groups) ? groups : []) {
+            const groupId = asText(
+              group?.groupCode || group?.groupUin || group?.peerUid,
+            ).trim()
+            if (!groupId) continue
+            state.sourceGroupNames.set(groupId, asText(group?.groupName).trim())
+          }
+          sourcePeerName = state.sourceGroupNames.get(entry.sourcePeerId) || ''
+        } catch {
+        }
+      }
+      state.sourceGroupNames.set(entry.sourcePeerId, sourcePeerName)
+    }
+  }
+  return { ...entry, senderUin, senderUid, sourcePeerName }
+}
+
+function patchNativeForwardBody(body, entry) {
+  const response = asObject(body?.responseHead)
+  const content = asObject(body?.contentHead)
+  if (!response || !content) {
+    throw new Error('QQNT 原生模板缺少消息头')
+  }
+  response.fromUin = Number(entry.senderUin)
+  response.fromUid = entry.senderUid
+  if (entry.sourceType === 'group' && /^\d+$/.test(entry.sourcePeerId)) {
+    delete response.toUid
+    response.forward = {}
+    response.grp = {
+      groupUin: Number(entry.sourcePeerId),
+      memberName: entry.senderName,
+      unknown5: 2,
+      ...(entry.sourcePeerName ? { groupName: entry.sourcePeerName } : {}),
+    }
+    content.type = 82
+    delete content.subType
+    delete content.c2cCmd
+    delete content.divSeq
+    if (asObject(content.forward)) content.forward.field3 = 1
+    const elems = body?.body?.richText?.elems
+    if (Array.isArray(elems)) {
+      if (!elems.some((element) => asObject(element?.generalFlags))) {
+        elems.unshift({ generalFlags: {} })
+      }
+      if (!elems.some((element) => asObject(element?.elemFlags2))) {
+        elems.splice(1, 0, { elemFlags2: {} })
+      }
+    }
+  } else {
+    delete response.grp
+    response.forward ||= {}
+    response.forward.friendName = entry.senderName
+    if (entry.sourceType === 'private') {
+      response.toUid = asText(state.ctx?.core?.selfInfo?.uid)
+      content.type = 9
+      content.subType = 4
+      delete content.c2cCmd
+      content.divSeq = 4
+      if (asObject(content.forward)) content.forward.field3 = 2
+    }
+  }
+  if (entry.time) content.timeStamp = entry.time
+  if (asObject(content.forward)) {
+    content.forward.unknownBase64 = (
+      `https://q.qlogo.cn/headimg_dl?dst_uin=${entry.senderUin}`
+      + '&spec=0&img_type=jpg'
+    )
+    delete content.forward.avatar
+  }
+}
+
+function encodeProtoVarint(value) {
+  let current = BigInt(value)
+  if (current < 0n) throw new Error('Protobuf varint 不能为负数')
+  const bytes = []
+  do {
+    let byte = Number(current & 0x7fn)
+    current >>= 7n
+    if (current) byte |= 0x80
+    bytes.push(byte)
+  } while (current)
+  return Buffer.from(bytes)
+}
+
+function readWireVarint(buffer, offset) {
+  let value = 0n
+  let shift = 0n
+  let cursor = offset
+  for (let count = 0; count < 10 && cursor < buffer.length; count += 1) {
+    const byte = buffer[cursor]
+    cursor += 1
+    value |= BigInt(byte & 0x7f) << shift
+    if (!(byte & 0x80)) return { value, next: cursor }
+    shift += 7n
+  }
+  throw new Error('Protobuf varint 无效')
+}
+
+function protoWireFields(buffer) {
+  const fields = []
+  let cursor = 0
+  while (cursor < buffer.length) {
+    const start = cursor
+    const key = readWireVarint(buffer, cursor)
+    cursor = key.next
+    const number = Number(key.value >> 3n)
+    const wire = Number(key.value & 7n)
+    let value
+    if (!number) throw new Error('Protobuf 字段号无效')
+    if (wire === 0) {
+      const scalar = readWireVarint(buffer, cursor)
+      value = scalar.value
+      cursor = scalar.next
+    } else if (wire === 1) {
+      if (cursor + 8 > buffer.length) throw new Error('Protobuf fixed64 越界')
+      value = buffer.subarray(cursor, cursor + 8)
+      cursor += 8
+    } else if (wire === 2) {
+      const size = readWireVarint(buffer, cursor)
+      cursor = size.next
+      const length = Number(size.value)
+      if (!Number.isSafeInteger(length) || length < 0 || cursor + length > buffer.length) {
+        throw new Error('Protobuf bytes 越界')
+      }
+      value = buffer.subarray(cursor, cursor + length)
+      cursor += length
+    } else if (wire === 5) {
+      if (cursor + 4 > buffer.length) throw new Error('Protobuf fixed32 越界')
+      value = buffer.subarray(cursor, cursor + 4)
+      cursor += 4
+    } else {
+      throw new Error(`Protobuf wire type ${wire} 不受支持`)
+    }
+    fields.push({ number, wire, value, raw: buffer.subarray(start, cursor) })
+  }
+  return fields
+}
+
+function protoBytesField(number, value) {
+  const bytes = Buffer.from(value)
+  return Buffer.concat([
+    encodeProtoVarint((BigInt(number) << 3n) | 2n),
+    encodeProtoVarint(bytes.length),
+    bytes,
+  ])
+}
+
+function protoVarintField(number, value) {
+  return Buffer.concat([
+    encodeProtoVarint(BigInt(number) << 3n),
+    encodeProtoVarint(value),
+  ])
+}
+
+function firstProtoBytes(buffer, number) {
+  return protoWireFields(buffer).find((field) => (
+    field.number === number && field.wire === 2
+  ))?.value
+}
+
+function firstProtoString(buffer, number) {
+  const value = firstProtoBytes(buffer, number)
+  return value ? value.toString('utf8') : ''
+}
+
+function setProtoField(buffer, number, replacement) {
+  const result = []
+  let replaced = false
+  for (const field of protoWireFields(buffer)) {
+    if (field.number !== number) {
+      result.push(field.raw)
+      continue
+    }
+    if (!replaced && replacement) result.push(replacement)
+    replaced = true
+  }
+  if (!replaced && replacement) result.push(replacement)
+  return Buffer.concat(result)
+}
+
+function setProtoBytes(buffer, number, value) {
+  return setProtoField(buffer, number, protoBytesField(number, value))
+}
+
+function setProtoString(buffer, number, value) {
+  return setProtoBytes(buffer, number, Buffer.from(value, 'utf8'))
+}
+
+function setProtoVarint(buffer, number, value) {
+  return setProtoField(buffer, number, protoVarintField(number, value))
+}
+
+function rewriteRepeatedProtoBytes(buffer, number, mapper) {
+  const result = []
+  let index = 0
+  for (const field of protoWireFields(buffer)) {
+    if (field.number !== number || field.wire !== 2) {
+      result.push(field.raw)
+      continue
+    }
+    const rewritten = mapper(field.value, index)
+    index += 1
+    if (rewritten !== null) result.push(protoBytesField(number, rewritten))
+  }
+  return { value: Buffer.concat(result), count: index }
+}
+
+function sourceCompatibleRichText(richText) {
+  const fields = protoWireFields(richText)
+  let hasGeneralFlags = false
+  let hasElemFlags2 = false
+  for (const field of fields) {
+    if (field.number !== 2 || field.wire !== 2) continue
+    const elementFields = protoWireFields(field.value)
+    hasGeneralFlags ||= elementFields.some((item) => item.number === 37)
+    hasElemFlags2 ||= elementFields.some((item) => item.number === 9)
+  }
+  const prefix = []
+  if (!hasGeneralFlags) {
+    prefix.push(protoBytesField(2, protoBytesField(37, Buffer.alloc(0))))
+  }
+  if (!hasElemFlags2) {
+    prefix.push(protoBytesField(2, protoBytesField(9, Buffer.alloc(0))))
+  }
+  return prefix.length ? Buffer.concat([...prefix, ...fields.map((field) => field.raw)]) : richText
+}
+
+function patchGroupSourceProtoBody(body, response, content, entry) {
+  response = setProtoField(response, 6, null)
+  response = setProtoBytes(response, 7, Buffer.alloc(0))
+  let group = Buffer.concat([
+    protoVarintField(1, entry.sourcePeerId),
+    protoStringMessage(4, entry.senderName),
+    protoVarintField(5, 2),
+  ])
+  if (entry.sourcePeerName) {
+    group = Buffer.concat([group, protoStringMessage(7, entry.sourcePeerName)])
+  }
+  response = setProtoBytes(response, 8, group)
+
+  content = setProtoVarint(content, 1, 82)
+  content = setProtoField(content, 2, null)
+  content = setProtoField(content, 3, null)
+  content = setProtoField(content, 9, null)
+  content = setProtoField(content, 12, null)
+  const forward = firstProtoBytes(content, 15) || Buffer.alloc(0)
+  content = setProtoBytes(content, 15, setProtoVarint(forward, 3, 1))
+
+  const messageBody = firstProtoBytes(body, 3)
+  const richText = messageBody && firstProtoBytes(messageBody, 1)
+  if (messageBody && richText) {
+    body = setProtoBytes(
+      body,
+      3,
+      setProtoBytes(messageBody, 1, sourceCompatibleRichText(richText)),
+    )
+  }
+  return { body, response, content }
+}
+
+function patchPrivateSourceProtoBody(response, content, entry) {
+  response = setProtoString(
+    response,
+    6,
+    asText(state.ctx?.core?.selfInfo?.uid).trim(),
+  )
+  response = setProtoField(response, 8, null)
+  const responseForward = firstProtoBytes(response, 7) || Buffer.alloc(0)
+  response = setProtoBytes(
+    response,
+    7,
+    setProtoString(responseForward, 6, entry.senderName),
+  )
+  content = setProtoVarint(content, 1, 9)
+  content = setProtoVarint(content, 2, 4)
+  content = setProtoField(content, 3, null)
+  content = setProtoVarint(content, 9, 4)
+  const forward = firstProtoBytes(content, 15) || Buffer.alloc(0)
+  content = setProtoBytes(content, 15, setProtoVarint(forward, 3, 2))
+  return { response, content }
+}
+
+function patchNativeForwardProtoBody(body, entry) {
+  let response = firstProtoBytes(body, 1)
+  let content = firstProtoBytes(body, 2)
+  if (!response || !content) throw new Error('QQNT 原生模板缺少消息头')
+
+  response = setProtoVarint(response, 1, entry.senderUin)
+  response = setProtoString(response, 2, entry.senderUid)
+  if (entry.sourceType === 'group' && /^\d+$/.test(entry.sourcePeerId)) {
+    const patched = patchGroupSourceProtoBody(body, response, content, entry)
+    body = patched.body
+    response = patched.response
+    content = patched.content
+  } else if (entry.sourceType === 'private') {
+    const patched = patchPrivateSourceProtoBody(response, content, entry)
+    response = patched.response
+    content = patched.content
+  } else {
+    const forward = firstProtoBytes(response, 7) || Buffer.alloc(0)
+    response = setProtoBytes(response, 7, setProtoString(forward, 6, entry.senderName))
+  }
+
+  if (entry.time) content = setProtoVarint(content, 6, entry.time)
+  const forward = firstProtoBytes(content, 15)
+  if (forward) {
+    const avatar = (
+      `https://q.qlogo.cn/headimg_dl?dst_uin=${entry.senderUin}`
+      + '&spec=0&img_type=jpg'
+    )
+    let patchedForward = setProtoString(forward, 5, avatar)
+    patchedForward = setProtoField(patchedForward, 6, null)
+    content = setProtoBytes(content, 15, patchedForward)
+  }
+  body = setProtoBytes(body, 1, response)
+  return setProtoBytes(body, 2, content)
+}
+
+function patchNativeForwardProtoPayload(payload, entries) {
+  let foundMain = false
+  let patchedCount = 0
+  const actions = rewriteRepeatedProtoBytes(payload, 2, (action) => {
+    if (firstProtoString(action, 1) !== 'MultiMsg') return action
+    if (foundMain) throw new Error('QQNT 原生资源包含多个主 action')
+    foundMain = true
+    const data = firstProtoBytes(action, 2)
+    if (!data) throw new Error('QQNT 原生资源缺少主 action 正文')
+    const bodies = rewriteRepeatedProtoBytes(data, 1, (body, index) => {
+      const entry = entries[index]
+      if (!entry) throw new Error('QQNT 原生模板节点数超出归档')
+      patchedCount += 1
+      return patchNativeForwardProtoBody(body, entry)
+    })
+    return setProtoBytes(action, 2, bodies.value)
+  })
+  if (!foundMain) throw new Error('聊天记录资源缺少主 MultiMsg action')
+  if (patchedCount !== entries.length) {
+    throw new Error(`QQNT 原生模板节点数不匹配（${patchedCount}/${entries.length}）`)
+  }
+  return actions.value
+}
+
+function longMessageSettings(download) {
+  return Buffer.concat([
+    protoVarintField(1, download ? 2 : 4),
+    protoVarintField(2, download ? 0 : 1),
+    protoVarintField(3, download ? 0 : 7),
+    protoVarintField(4, 0),
+  ])
+}
+
+async function downloadNativeForwardProto(operation, resId) {
+  if (typeof operation?.sendPacket !== 'function') {
+    throw new Error('当前 NapCat 未提供原始长消息下载接口')
+  }
+  const selfUid = asText(state.ctx?.core?.selfInfo?.uid).trim()
+  const uid = protoBytesField(1, protoStringMessage(2, selfUid))
+  const info = Buffer.concat([
+    uid,
+    protoBytesField(2, Buffer.from(resId, 'utf8')),
+    protoVarintField(3, 1),
+  ])
+  const request = Buffer.concat([
+    protoBytesField(1, info),
+    protoBytesField(15, longMessageSettings(true)),
+  ])
+  const response = await operation.sendPacket({
+    cmd: 'trpc.group.long_msg_interface.MsgService.SsoRecvLongMsg',
+    data: request,
+  }, true)
+  const result = firstProtoBytes(response, 1)
+  const compressed = result && firstProtoBytes(result, 4)
+  if (!compressed) throw new Error('QQNT 原始长消息下载结果缺少负载')
+  return gunzipSync(compressed)
+}
+
+function protoStringMessage(number, value) {
+  return protoBytesField(number, Buffer.from(value, 'utf8'))
+}
+
+async function uploadNativeForwardProto(operation, payload, destinationPeer) {
+  if (typeof operation?.sendPacket !== 'function') {
+    throw new Error('当前 NapCat 未提供原始长消息上传接口')
+  }
+  const isGroup = destinationPeer.chatType === CHAT_TYPE_GROUP
+  const groupUin = isGroup ? asText(destinationPeer.peerUid) : '0'
+  const owner = isGroup
+    ? groupUin
+    : asText(state.ctx?.core?.selfInfo?.uid).trim()
+  const info = Buffer.concat([
+    protoVarintField(1, isGroup ? 3 : 1),
+    protoBytesField(2, protoStringMessage(2, owner)),
+    protoVarintField(3, groupUin),
+    protoBytesField(4, gzipSync(payload)),
+  ])
+  const request = Buffer.concat([
+    protoBytesField(2, info),
+    protoBytesField(15, longMessageSettings(false)),
+  ])
+  const response = await operation.sendPacket({
+    cmd: 'trpc.group.long_msg_interface.MsgService.SsoSendLongMsg',
+    data: request,
+  }, true)
+  const result = firstProtoBytes(response, 2)
+  const newResId = result && firstProtoString(result, 3)
+  if (!newResId) throw new Error('QQNT 未返回原始重建资源 ID')
+  return newResId
+}
+
+function validateNativeForwardProtoPayload(payload) {
+  let mainCount = 0
+  let nodeCount = 0
+  for (const actionField of protoWireFields(payload)) {
+    if (actionField.number !== 2 || actionField.wire !== 2) continue
+    const action = actionField.value
+    if (firstProtoString(action, 1) !== 'MultiMsg') continue
+    mainCount += 1
+    const data = firstProtoBytes(action, 2)
+    if (!data) throw new Error('原生聊天记录负载缺少主 action 正文')
+    nodeCount += protoWireFields(data).filter((field) => (
+      field.number === 1 && field.wire === 2
+    )).length
+  }
+  if (mainCount !== 1 || !nodeCount) {
+    throw new Error('原生聊天记录负载缺少唯一且非空的 MultiMsg action')
+  }
+  return nodeCount
+}
+
+async function sendNativeForwardResourceCard(
+  element,
+  templateCard,
+  newResId,
+  destinationPeer,
+  nodeCount,
+  archivedCard = null,
+) {
+  let card = templateCard
+  if (archivedCard) {
+    card = JSON.parse(JSON.stringify(archivedCard))
+  }
+  if (!asObject(card?.meta?.detail)) {
+    throw new Error('QQNT 原生聊天记录卡片缺少 detail')
+  }
+  const uuid = randomUUID()
+  card.meta.detail.resid = newResId
+  card.meta.detail.uniseq = uuid
+  let extra = {}
+  try {
+    extra = typeof card.extra === 'string'
+      ? JSON.parse(card.extra)
+      : { ...(asObject(card.extra) || {}) }
+  } catch {
+    extra = {}
+  }
+  extra.filename = uuid
+  extra.tsum = archivedCard && Number(extra.tsum) > 0
+    ? Number(extra.tsum)
+    : nodeCount
+  card.extra = `${JSON.stringify(extra)}\n`
+  const finalElement = {
+    ...element,
+    elementId: '',
+    arkElement: {
+      ...element.arkElement,
+      bytesData: JSON.stringify(card),
+    },
+  }
+  if (asObject(element.multiForwardMsgElement)) {
+    finalElement.multiForwardMsgElement = {
+      ...element.multiForwardMsgElement,
+      resId: newResId,
+      resid: newResId,
+    }
+  }
+  const send = state.ctx?.core?.apis?.MsgApi?.sendMsg
+  if (typeof send !== 'function') {
+    throw new Error('当前 NapCat 未提供原生卡片发送接口')
+  }
+  return send.call(state.ctx.core.apis.MsgApi, destinationPeer, [finalElement])
+}
+
+async function rebuildNativeForwardCard(templateMessage, entries, destinationPeer) {
+  const operation = state.ctx?.core?.apis?.PacketApi?.pkt?.operation
+  if (!operation) throw new Error('当前 NapCat 未提供原生资源重建接口')
+  const { element, card, resId } = await nativeForwardCard(
+    templateMessage,
+    { chatType: CHAT_TYPE_C2C, peerUid: asText(state.ctx.core.selfInfo.uid), guildId: '' },
+  )
+  const resolvedEntries = []
+  for (const entry of entries) {
+    resolvedEntries.push(await resolveNativeForwardIdentity(entry))
+  }
+  let newResId = ''
+  if (typeof operation.sendPacket === 'function') {
+    const nativePayload = await downloadNativeForwardProto(operation, resId)
+    const patchedPayload = patchNativeForwardProtoPayload(
+      nativePayload,
+      resolvedEntries,
+    )
+    newResId = await uploadNativeForwardProto(
+      operation,
+      patchedPayload,
+      destinationPeer,
+    )
+  } else {
+    if (
+      typeof operation.FetchForwardMsgRaw !== 'function'
+      || typeof operation.UploadForwardMsgV2 !== 'function'
+    ) {
+      throw new Error('当前 NapCat 未提供原生资源重建接口')
+    }
+    const actions = await operation.FetchForwardMsgRaw(resId)
+    const main = (Array.isArray(actions) ? actions : []).find(
+      (action) => action?.actionCommand === 'MultiMsg',
+    )
+    const bodies = Array.isArray(main?.actionData?.msgBody)
+      ? main.actionData.msgBody
+      : []
+    if (bodies.length !== entries.length) {
+      throw new Error(
+        `QQNT 原生模板节点数不匹配（${bodies.length}/${entries.length}）`,
+      )
+    }
+    bodies.forEach((body, index) => {
+      patchNativeForwardBody(body, resolvedEntries[index])
+    })
+    const upload = (Array.isArray(actions) ? actions : []).map((action) => ({
+      actionCommand: asText(action?.actionCommand),
+      actionMsgBody: Array.isArray(action?.actionData?.msgBody)
+        ? action.actionData.msgBody
+        : [],
+    }))
+    const destinationGroup = destinationPeer.chatType === CHAT_TYPE_GROUP
+      ? Number(destinationPeer.peerUid)
+      : 0
+    newResId = asText(await operation.UploadForwardMsgV2(
+      upload,
+      destinationGroup,
+    )).trim()
+  }
+  if (!newResId) throw new Error('QQNT 未返回重建后的聊天记录资源')
+
+  return sendNativeForwardResourceCard(
+    element,
+    card,
+    newResId,
+    destinationPeer,
+    entries.length,
+  )
+}
+
+async function replayNativeForwardPayload(
+  destinationPeer,
+  nativePayload,
+  archivedCard,
+  uploadPeer = destinationPeer,
+) {
+  const operation = state.ctx?.core?.apis?.PacketApi?.pkt?.operation
+  if (typeof operation?.sendPacket !== 'function') {
+    throw new Error('当前 NapCat 未提供原始长消息上传接口')
+  }
+  const nodeCount = validateNativeForwardProtoPayload(nativePayload)
+  const selfUid = asText(state.ctx?.core?.selfInfo?.uid).trim()
+  if (!selfUid) throw new Error('无法读取当前 QQ 登录账号')
+  const selfPeer = { chatType: CHAT_TYPE_C2C, peerUid: selfUid, guildId: '' }
+  const [seedId] = await stageNativeForwardLeaf(
+    destinationPeer,
+    selfPeer,
+    [{ type: 'text', data: { text: '聊天记录' } }],
+  )
+  const seedEntry = nativeForwardEntry({
+    data: {
+      nickname: asText(state.ctx?.core?.selfInfo?.nick || 'QQ用户'),
+      user_id: asText(state.ctx?.core?.selfInfo?.uin),
+      omm_sender_uid: selfUid,
+    },
+  }, seedId)
+  const template = await qqNativeMultiForward(selfPeer, selfPeer, [seedEntry])
+  const { element, card } = await nativeForwardCard(template, selfPeer)
+  const newResId = await uploadNativeForwardProto(
+    operation,
+    nativePayload,
+    uploadPeer,
+  )
+  return sendNativeForwardResourceCard(
+    element,
+    card,
+    newResId,
+    destinationPeer,
+    nodeCount,
+    archivedCard,
+  )
+}
+
+async function qqNativeMultiForward(sourcePeer, destinationPeer, entries) {
+  const wrapper = state.ctx?.core?.eventWrapper
+  if (typeof wrapper?.callNormalEventV2 !== 'function') {
+    throw new Error('当前 NapCat 未提供 QQNT 原生合并转发接口')
+  }
+  const selfUid = asText(state.ctx?.core?.selfInfo?.uid)
+  const msgInfos = entries.map((entry) => ({
+    msgId: entry.msgId,
+    senderShowName: entry.senderName,
+  }))
+  const [, msgList] = await wrapper.callNormalEventV2(
+    'NodeIKernelMsgService/multiForwardMsgWithComment',
+    'NodeIKernelMsgListener/onMsgInfoListUpdate',
+    [msgInfos, sourcePeer, destinationPeer, [], new Map()],
+    () => true,
+    (records) => Array.isArray(records) && records.some((message) => (
+      asText(message?.peerUid) === asText(destinationPeer.peerUid)
+      && asText(message?.senderUid) === selfUid
+    )),
+  )
+  const message = (Array.isArray(msgList) ? msgList : []).find((item) => (
+    asText(item?.peerUid) === asText(destinationPeer.peerUid)
+    && asText(item?.senderUid) === selfUid
+    && isForwardCardMessage(item)
+  ))
+  if (!message) throw new Error('QQNT 原生合并转发没有返回可识别的卡片')
+  return message
+}
+
+async function buildQQNativeForward(destinationPeer, nodes, depth = 0) {
+  if (depth > MAX_NATIVE_FORWARD_DEPTH) {
+    throw new Error('原生重组嵌套层级超过安全上限')
+  }
+  const selfUid = asText(state.ctx?.core?.selfInfo?.uid)
+  if (!selfUid) throw new Error('无法读取当前 QQ 登录账号')
+  const selfPeer = { chatType: CHAT_TYPE_C2C, peerUid: selfUid, guildId: '' }
+  const entries = []
+  for (const node of nodes) {
+    const content = node.data.content
+    const children = content.filter((item) => item?.type === 'node')
+    if (children.length) {
+      const nested = await buildQQNativeForward(selfPeer, children, depth + 1)
+      entries.push(nativeForwardEntry(node, nested?.msgId))
+      continue
+    }
+    const msgIds = await stageNativeForwardLeaf(
+      destinationPeer,
+      selfPeer,
+      content,
+    )
+    entries.push(...msgIds.map((msgId) => nativeForwardEntry(node, msgId)))
+  }
+  if (!entries.length) throw new Error('原生重组没有生成可转发消息')
+  const template = await qqNativeMultiForward(selfPeer, selfPeer, entries)
+  return rebuildNativeForwardCard(template, entries, destinationPeer)
+}
+
+/** 用 QQNT 内核生成桌面端可识别的合并转发资源。 */
+export async function sendQQNativeForward(payload) {
+  if (!state.active || !state.ctx) throw new Error('插件尚未启动')
+  const peer = await oneBotPeer(
+    payload?.destination_type,
+    payload?.destination_peer_id,
+  )
+  validateNativeForwardNodes(payload?.messages)
+  const replay = Buffer.isBuffer(payload?.nativePayload)
+  const nativeUploadPeer = payload?.nativeSourceType === 'group'
+    ? {
+        chatType: CHAT_TYPE_GROUP,
+        peerUid: payload.nativeSourcePeerId,
+        guildId: '',
+      }
+    : {
+        chatType: CHAT_TYPE_C2C,
+        peerUid: asText(state.ctx?.core?.selfInfo?.uid),
+        guildId: '',
+      }
+  const message = replay
+    ? await replayNativeForwardPayload(
+      peer,
+      payload.nativePayload,
+      payload.nativeCard,
+      nativeUploadPeer,
+    )
+    : await buildQQNativeForward(peer, payload.messages)
+  return {
+    ok: true,
+    message_id: asText(message?.id || message?.msgId),
+    strategy: replay ? 'qqnt_native_replay' : 'qqnt_native_rebuild',
   }
 }
 
@@ -2038,6 +3232,12 @@ function debugResponse() {
     updated_at: state.updatedAt,
     event_count: state.eventCount,
     last_event: state.lastEvent,
+    forward_card_compat: {
+      active: Boolean(state.sendMsgWrapper || state.packetConverterPatches.length),
+      outer_hook: Boolean(state.sendMsgWrapper),
+      packet_hooks: state.packetConverterPatches.map((patch) => patch.name),
+      rewrite_count: state.forwardCardRewriteCount,
+    },
   }
 }
 
@@ -2087,6 +3287,8 @@ export async function plugin_init(ctx) {
   state.invalidatedAt = 0
   state.mediaDiagnostics = []
   state.mediaUpdatedAt = 0
+  state.sourceGroupNames = new Map()
+  state.forwardCardRewriteCount = 0
 
   ctx.router.get('/current-peer', async (req, res) => {
     try {
@@ -2115,6 +3317,16 @@ export async function plugin_init(ctx) {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
       ctx.logger.error('按持久索引原生转发失败', error)
+      res.json({ ok: false, error: message })
+    }
+  })
+  ctx.router.get('/send-native-forward', async (req, res) => {
+    try {
+      const payload = loadNativeForwardPayload(queryValue(req, 'payload_path'))
+      res.json(await sendQQNativeForward(payload))
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      ctx.logger.error('QQNT 原生重组发送失败', error)
       res.json({ ok: false, error: message })
     }
   })
@@ -2149,7 +3361,6 @@ export async function plugin_init(ctx) {
       res.json({ ok: false, error: message })
     }
   })
-
   const eventWrapper = ctx.core?.eventWrapper
   if (!eventWrapper || typeof eventWrapper.createListenerFunction !== 'function') {
     throw new Error('当前 NapCat 未提供 MsgListener 内部监听器')
@@ -2164,7 +3375,8 @@ export async function plugin_init(ctx) {
   // 绝不能据此覆盖当前 AIO；此前的误发正是由这类事件造成。
   state.listener = listener
   state.listenerHandlers = listenerHandlers
-  ctx.logger.info('OhMyMeme 当前会话桥接已启动')
+  installForwardCardCompatibility(ctx)
+  ctx.logger.info('OhMyMeme 当前会话桥接已启动（已启用桌面端转发卡片兼容）')
 }
 
 export async function plugin_cleanup() {
@@ -2175,12 +3387,14 @@ export async function plugin_cleanup() {
       if (state.listener[name] === handler) delete state.listener[name]
     }
   }
+  removeForwardCardCompatibility()
   state.active = false
   state.current = null
   state.source = ''
   state.updatedAt = 0
   state.mediaDiagnostics = []
   state.mediaUpdatedAt = 0
+  state.sourceGroupNames = new Map()
   state.listener = null
   state.listenerHandlers = null
   state.ctx = null
@@ -2217,4 +3431,19 @@ export const __test = {
   safeDiagnosticStack,
   mediaStatusResponse,
   mediaCapabilitiesResponse,
+  normalizeForwardCardBytes,
+  normalizeForwardArkElement,
+  normalizeForwardArkElements,
+  normalizeForwardCardsInRawMessage,
+  encodeProtoVarint,
+  protoWireFields,
+  protoBytesField,
+  protoVarintField,
+  firstProtoBytes,
+  firstProtoString,
+  patchNativeForwardProtoPayload,
+  downloadNativeForwardProto,
+  uploadNativeForwardProto,
+  validateNativeForwardProtoPayload,
+  replayNativeForwardPayload,
 }

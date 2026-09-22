@@ -1306,9 +1306,9 @@ class JsApi:
                 "target_label": target.get("label") or "当前 QQ 会话",
                 "target_source": target.get("source") or "uia",
                 "source": result.get("source"),
-                "degraded_media_count": int(
-                    result.get("degraded_media_count") or 0
-                ),
+                "native_rebuild": bool(result.get("native_rebuild")),
+                "native_replay": bool(result.get("native_replay")),
+                "degraded_media_count": int(result.get("degraded_media_count") or 0),
             }
         except (onebot.OneBotError, ValueError) as exc:
             return {"ok": False, "error": str(exc)}
