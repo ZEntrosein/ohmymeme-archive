@@ -58,10 +58,43 @@ def _build_category_tree(db, parent_id=None) -> list:
     return items
 
 
-def _write_manifest(data: dict) -> bool:
+def _write_manifest(data: dict, metadata_filenames=None) -> bool:
     """原子写入本地清单；调用方必须持有 ``_MANIFEST_LOCK``。"""
     path = _index_path()
     try:
+        if metadata_filenames is not None:
+            cfg = get_config()
+            db = get_db()
+            include_tags = bool(cfg.get("manifest_include_tags", True))
+            tags_map = db.get_tags_map() if include_tags else {}
+            records_getter = getattr(db, "get_tag_records_map", None)
+            records_map = (
+                records_getter() if include_tags and callable(records_getter) else {}
+            )
+            for entry in data.get("memes", []):
+                if not isinstance(entry, dict):
+                    continue
+                if (
+                    metadata_filenames is not True
+                    and entry.get("filename") not in metadata_filenames
+                ):
+                    continue
+                if include_tags:
+                    entry["tags"] = tags_map.get(entry.get("filename"), [])
+                    if callable(records_getter):
+                        entry["tag_records"] = records_map.get(
+                            entry.get("filename"), []
+                        )
+                else:
+                    entry.pop("tags", None)
+                    entry.pop("tag_records", None)
+            if cfg.get("manifest_include_favorites", True):
+                data["favorite"] = [
+                    row["filename"]
+                    for row in db.search(favorite_only=True, limit=999999)
+                ]
+            else:
+                data.pop("favorite", None)
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_name(path.name + ".tmp")
         tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -123,7 +156,7 @@ def _build_unlocked(read_priority="foreground") -> List[Dict]:
         "collections": collections,
         "categories": categories,
     }
-    _write_manifest(data)
+    _write_manifest(data, metadata_filenames=True)
 
     return memes
 
@@ -228,7 +261,7 @@ def add_memes(meme_ids) -> bool:
             for item in memes
             if not isinstance(item, dict) or item.get("filename") not in new_filenames
         ]
-        return _write_manifest(data)
+        return _write_manifest(data, metadata_filenames=new_filenames)
     finally:
         _MANIFEST_LOCK.release()
 
@@ -258,7 +291,7 @@ def remove_memes(filenames) -> bool:
         data["memes"] = remaining
         data["collections"] = _build_collection_tree(db)
         data["categories"] = _build_category_tree(db)
-        return _write_manifest(data)
+        return _write_manifest(data, metadata_filenames=set())
     finally:
         _MANIFEST_LOCK.release()
 
@@ -385,6 +418,6 @@ def update_meme_structure(meme_id: int, previous_filename: str = "") -> bool:
         data["version"] = 4
         data["collections"] = _build_collection_tree(db)
         data["categories"] = _build_category_tree(db)
-        return _write_manifest(data)
+        return _write_manifest(data, metadata_filenames={filename})
     finally:
         _MANIFEST_LOCK.release()

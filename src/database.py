@@ -1735,6 +1735,43 @@ class MemeDB:
         ).fetchone()
         return dict(row) if row else None
 
+    def get_all_filenames(self) -> List[str]:
+        conn = self._get_conn()
+        return [r[0] for r in conn.execute("SELECT filename FROM memes").fetchall()]
+
+    def get_tags_map(self) -> Dict[str, List[str]]:
+        """按文件名批量取全部标签（manifest 构建用，单查询避免 N+1）"""
+        conn = self._get_conn()
+        rows = conn.execute(
+            """SELECT m.filename, t.name FROM memes m
+               JOIN meme_tags mt ON mt.meme_id = m.id
+               JOIN tags t ON t.id = mt.tag_id
+               ORDER BY m.filename, t.name"""
+        ).fetchall()
+        out: Dict[str, List[str]] = {}
+        for fname, name in rows:
+            out.setdefault(fname, []).append(name)
+        return out
+
+    def get_tag_records_map(self) -> Dict[str, List[dict]]:
+        """按文件名批量读取分类标签，供清单保留同名不同分类的属性。"""
+        rows = (
+            self._get_conn()
+            .execute(
+                """SELECT m.filename, t.name, t.category FROM memes m
+               JOIN meme_tags mt ON mt.meme_id = m.id
+               JOIN tags t ON t.id = mt.tag_id
+               ORDER BY m.filename, t.category, t.name"""
+            )
+            .fetchall()
+        )
+        out: Dict[str, List[dict]] = {}
+        for filename, name, category in rows:
+            out.setdefault(filename, []).append(
+                {"name": name, "category": category or ""}
+            )
+        return out
+
     def _existing_meme_ids(self, conn, ids: List[int]) -> List[int]:
         """过滤出实际存在的表情 id（外键开启时对缺失 id 写子表会整批失败）"""
         placeholders = ",".join("?" for _ in ids)
@@ -2175,6 +2212,15 @@ class MemeDB:
             uncategorized_only=True,
             exclude_collection_ids=exclude_collection_ids,
         )
+
+    def add_favorite(self, meme_id: int) -> None:
+        """幂等收藏（远端清单收藏并集合入用）"""
+        with self._lock:
+            conn = self._get_conn()
+            conn.execute(
+                "INSERT OR IGNORE INTO favorites (meme_id) VALUES (?)", (meme_id,)
+            )
+            conn.commit()
 
     # --- 收藏集 ---
 

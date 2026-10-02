@@ -24,6 +24,8 @@ const state = reactive({
   loading: false,
   showStartupAnimation: true,
   startupBgColor: '#000000',
+  hoverZoom: true,
+  guideOk: true,
 })
 
 let searchGen = 0
@@ -83,6 +85,8 @@ export function useMemes() {
       warmLaterPages(0, [])
       state.showStartupAnimation = data.show_startup_animation !== false
       state.startupBgColor = data.startup_bg_color || '#000000'
+      state.hoverZoom = data.hover_zoom !== false
+      state.guideOk = data.guide_ok !== false
     }
   }
 
@@ -225,7 +229,7 @@ export function useMemes() {
   }
   function setMemes(newMemes: Meme[]) { state.memes = newMemes }
 
-  function selectAllVisible() { state.selectedIds = new Set(state.memes.map(m => m.id)) }
+  function selectAllVisible() { state.selectedIds = new Set(state.memes.filter(m => !m.cloud).map(m => m.id)) }
 
   function _collectionExists(items: any[], id: number): boolean {
     for (const c of items) {
@@ -239,6 +243,7 @@ export function useMemes() {
   function canReorder(): boolean {
     const q = state.searchQuery.trim()
     if (!state.activeGenres.some(genre => genre !== 'chat_record') || state.chatTotal > 0) return false
+    if (state.memes.some(meme => meme.cloud)) return false
     if (q || state.activeTags.size > 0) return false
     if (state.activeCategory !== null) return false
     // 全部/未分组/正 ID 分组可排序；收藏夹/最近使用/随机（-2/-3/-5）不可排

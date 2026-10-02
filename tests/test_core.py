@@ -164,6 +164,26 @@ class TestConfig(unittest.TestCase):
         reset = Config(self.config_path)
         self.assertIs(reset.get("hotkey_show_at_mouse"), False)
 
+    def test_manifest_include_tags_default_on(self):
+        cfg = Config(self.config_path)
+        self.assertIs(cfg.get("manifest_include_tags"), True)
+        self.assertIs(Config.DEFAULTS.get("manifest_include_tags"), True)
+
+        cfg.set("manifest_include_tags", False)
+        cfg.save()
+        self.assertIs(Config(self.config_path).get("manifest_include_tags"), False)
+
+    def test_manifest_include_favorites_default_on(self):
+        cfg = Config(self.config_path)
+        self.assertIs(cfg.get("manifest_include_favorites"), True)
+        self.assertIs(Config.DEFAULTS.get("manifest_include_favorites"), True)
+
+        cfg.set("manifest_include_favorites", False)
+        cfg.save()
+        self.assertIs(
+            Config(self.config_path).get("manifest_include_favorites"), False
+        )
+
     def test_removed_auto_paste_setting_is_not_retained(self):
         self.config_path.write_text('{"auto_paste_meme": true}', encoding="utf-8")
 
@@ -3888,6 +3908,11 @@ class TestManifest(unittest.TestCase):
             "category_id": 9,
         }
         db.get_category_path_names.return_value = ["角色", "爱丽丝"]
+        db.get_tags_map.return_value = {"new.png": ["可爱"]}
+        db.get_tag_records_map.return_value = {
+            "new.png": [{"name": "可爱", "category": "风格"}]
+        }
+        db.search.return_value = [{"filename": "new.png"}]
         collections = [{"name": "收藏", "filenames": ["new.png"]}]
         categories = [{"name": "角色", "children": [{"name": "爱丽丝"}]}]
 
@@ -3917,6 +3942,9 @@ class TestManifest(unittest.TestCase):
         self.assertEqual(entry["category_path"], ["角色", "爱丽丝"])
         self.assertEqual(entry["storage_path"], "角色/爱丽丝/new.png")
         self.assertEqual(entry["future_field"], "保留")
+        self.assertEqual(entry["tags"], ["可爱"])
+        self.assertEqual(entry["tag_records"], [{"name": "可爱", "category": "风格"}])
+        self.assertEqual(result["favorite"], ["new.png"])
         self.assertEqual(result["memes"][1], original["memes"][1])
         self.assertEqual(result["collections"], collections)
         self.assertEqual(result["categories"], categories)
@@ -6486,6 +6514,83 @@ class TestDatabase(unittest.TestCase):
         self.db.delete_meme(mid2)
         self.assertEqual(self.db.get_all_tags(), ["other"])
 
+    def test_get_tags_map(self):
+        self.db.add_meme("a.png", tags=["y", "x"])
+        self.db.add_meme("b.png")
+        m = self.db.get_tags_map()
+        self.assertEqual(m, {"a.png": ["x", "y"]})
+
+    def test_apply_remote_tags_union(self):
+        from src.sync import _apply_remote_tags
+
+        mid = self.db.add_meme("a.png", tags=["local"])
+        self.db.add_meme("b.png")
+        remote = {
+            "memes": [
+                {"filename": "a.png", "tags": ["remote"]},
+                {"filename": "b.png", "tags": ["btag"]},
+                {"filename": "missing.png", "tags": ["ghost"]},
+                {"filename": "../evil.png", "tags": ["evil"]},
+            ]
+        }
+        with mock.patch("src.sync.get_db", return_value=self.db):
+            _apply_remote_tags(remote)
+        # 并集：本地标签保留、远端标签并入
+        self.assertEqual(set(self.db.get_meme_tags(mid)), {"local", "remote"})
+        self.assertEqual(set(self.db.get_meme_tags(2)), {"btag"})
+        self.assertEqual(self.db.get_all_tags(), ["btag", "local", "remote"])
+
+    def test_apply_remote_tags_falls_back_to_tag_map(self):
+        from src.sync import _apply_remote_tags
+
+        mid = self.db.add_meme("a.png")
+        remote = {
+            "memes": [{"filename": "a.png"}],
+            "tag_map": {"a.png": ["oldstyle"]},
+        }
+        with mock.patch("src.sync.get_db", return_value=self.db):
+            _apply_remote_tags(remote)
+        self.assertEqual(self.db.get_meme_tags(mid), ["oldstyle"])
+
+    def test_apply_remote_tags_missing_keys_skips(self):
+        from src.sync import _apply_remote_tags
+
+        mid = self.db.add_meme("a.png", tags=["local"])
+        with mock.patch("src.sync.get_db", return_value=self.db):
+            _apply_remote_tags({"memes": [{"filename": "a.png"}]})
+            _apply_remote_tags({"memes": [{"filename": "a.png", "tags": []}]})
+            _apply_remote_tags({"memes": [{"filename": "a.png", "tags": ["", 42]}]})
+        # 条目无 tags 且无 tag_map、空列表、非字符串项均不改动本地标签
+        self.assertEqual(self.db.get_meme_tags(mid), ["local"])
+        self.assertEqual(self.db.get_all_tags(), ["local"])
+
+    def test_apply_remote_favorites_union(self):
+        from src.sync import _apply_remote_favorites
+
+        mid_a = self.db.add_meme("a.png")
+        mid_c = self.db.add_meme("c.png")
+        self.db.toggle_favorite(mid_c)  # 本地已收藏、远端列表没有 → 保留
+        remote = {"favorite": ["a.png", "missing.png", "../evil.png"]}
+        with mock.patch("src.sync.get_db", return_value=self.db):
+            _apply_remote_favorites(remote)
+            _apply_remote_favorites(remote)  # 幂等：重复合并不产生副作用
+        self.assertTrue(self.db.is_favorite(mid_a))
+        self.assertTrue(self.db.is_favorite(mid_c))
+
+    def test_apply_remote_favorites_missing_key_noop(self):
+        from src.sync import _apply_remote_favorites
+
+        mid = self.db.add_meme("a.png")
+        mid_b = self.db.add_meme("b.png")
+        self.db.toggle_favorite(mid)
+        with mock.patch("src.sync.get_db", return_value=self.db):
+            _apply_remote_favorites({})
+            _apply_remote_favorites({"favorite": "a.png"})
+            _apply_remote_favorites({"favorite": [42]})
+        # 键缺失/非 list/仅非法项均不改动本地收藏
+        self.assertTrue(self.db.is_favorite(mid))
+        self.assertFalse(self.db.is_favorite(mid_b))
+
     def test_favorites(self):
         mid = self.db.add_meme("test.png")
         self.assertFalse(self.db.is_favorite(mid))
@@ -6630,6 +6735,58 @@ class TestHotkeyWatchdog(unittest.TestCase):
         hk._hook_last_seen = 0.0
         self.assertTrue(hk._hook_health_check(now=130.0 + KEYBOARD_PROBE_TIMEOUT))
         self.assertIsNone(hk._probe_pending_at)
+
+    def test_probe_blocker_swallows_pending_probe_and_refreshes(self):
+        """pending 窗口内的 F15 探针被阻塞钩子吞掉并刷新心跳，防止泄漏到前台（issue #95）。"""
+        import types
+
+        hk = self._fresh_hotkey()
+        blocker = hk._make_probe_blocker()
+
+        # 无 pending：F15（真实宏键盘按键）正常放行
+        hk._probe_pending_at = None
+        self.assertTrue(blocker(types.SimpleNamespace(name="f15", scan_code=-126)))
+
+        # pending 窗口内：注入探针（scan_code=-126）被吞并刷新 _hook_last_seen 完成确认
+        hk._probe_pending_at = 100.0
+        hk._hook_last_seen = 0.0
+        self.assertFalse(blocker(types.SimpleNamespace(name="f15", scan_code=-126)))
+        self.assertGreaterEqual(hk._hook_last_seen, 100.0)
+
+        # pending 窗口内：真实按键事件放行
+        self.assertTrue(blocker(types.SimpleNamespace(name="a", scan_code=30)))
+        self.assertTrue(blocker(types.SimpleNamespace(name="ctrl", scan_code=29)))
+
+    def test_probe_blocker_passes_on_malformed_event(self):
+        """事件属性访问异常时阻塞钩子回退放行，绝不拦截正常按键。"""
+        hk = self._fresh_hotkey()
+        blocker = hk._make_probe_blocker()
+        hk._probe_pending_at = 100.0
+
+        class BrokenEvent(object):
+            def __getattr__(self, name):
+                raise RuntimeError("boom")
+
+        self.assertTrue(blocker(BrokenEvent()))
+
+    @mock.patch.dict("sys.modules", {"keyboard": None}, clear=False)
+    @mock.patch("sys.platform", "win32")
+    def test_try_keyboard_registers_and_unregisters_probe_blocker(self):
+        """_try_keyboard 注册探针阻塞钩子，unregister 时移除。"""
+        from src.hotkey import GlobalHotkey
+
+        fake_mod = self._fake_keyboard_module()
+        hk = GlobalHotkey()
+        try:
+            with mock.patch.dict("sys.modules", {"keyboard": fake_mod}):
+                ok = hk._try_keyboard("Ctrl+Alt+N", lambda: None)
+                self.assertTrue(ok)
+                self.assertIsNotNone(hk._probe_blocker)
+
+                hk.unregister()
+                self.assertIsNone(hk._probe_blocker)
+        finally:
+            hk.unregister()
 
     def test_restart_keyboard_listener_reinstalls_hook(self):
         """钩子失效重启：结束旧线程→重装钩子→重挂热键；成功后清 pending。"""

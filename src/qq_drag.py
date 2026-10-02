@@ -10,7 +10,6 @@ from collections import defaultdict
 
 from .onebot import OneBotError, call_action, call_webui_plugin_api
 
-
 CURRENT_PEER_PLUGIN_ID = "napcat-plugin-ohmymeme-current-peer"
 
 
@@ -84,7 +83,9 @@ def _choose_target(element_candidates, groups, friends):
                 readable.append(compact[:40])
             if len(readable) >= 6:
                 break
-        detail = f"；读取到：{' / '.join(readable)}" if readable else "；未读取到标题文本"
+        detail = (
+            f"；读取到：{' / '.join(readable)}" if readable else "；未读取到标题文本"
+        )
         return None, f"无法从 QQ 当前聊天标题识别好友或群{detail}"
     best_score = max(scored.values())
     best = [target for target, score in scored.items() if score == best_score]
@@ -131,9 +132,7 @@ def _plugin_target(webui_url, webui_token, error_out=None, window_handle=None):
             name = str(item.get("name") or "").strip()
             if not name or len(name) > 200:
                 continue
-            candidates.append(
-                {"name": name, "score": int(item.get("score") or 0)}
-            )
+            candidates.append({"name": name, "score": int(item.get("score") or 0)})
         if candidates:
             return {
                 "element_candidates": candidates,
@@ -272,10 +271,7 @@ def _qq_header_candidates(window_handle, progress=None):
                 pass
             finally:
                 progress["completed"] += 1
-    return [
-        {"name": name, "score": score}
-        for name, score in candidates.items()
-    ]
+    return [{"name": name, "score": score} for name, score in candidates.items()]
 
 
 def _qq_header_candidates_with_timeout(window_handle, timeout=8):
