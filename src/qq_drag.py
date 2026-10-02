@@ -319,7 +319,7 @@ def resolve_qq_target(
 ):
     """验证 QQ 窗口，优先读取 WebUI 插件目标，再回退标题匹配。"""
     if str(process_name or "").casefold() != "qq":
-        raise OneBotError("请把聊天记录拖到 QQ 聊天窗口")
+        raise OneBotError("请拖到 QQ 聊天窗口")
     plugin_error = {}
     plugin_target = _plugin_target(
         plugin_http_url,

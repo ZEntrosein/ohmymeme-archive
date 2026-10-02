@@ -79,11 +79,26 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(cfg.get("napcat_webui_url"), "http://127.0.0.1:6099")
         self.assertEqual(cfg.get("napcat_command"), "/omm")
         self.assertEqual(cfg.get("napcat_send_mode"), "original_native")
+        self.assertEqual(cfg.get("napcat_image_send_mode"), "sticker")
 
     def test_set_get(self):
         cfg = Config(self.config_path)
         cfg.set("hotkey", "Ctrl+Shift+X")
         self.assertEqual(cfg.get("hotkey"), "Ctrl+Shift+X")
+
+    def test_legacy_gif_send_mode_migrates_to_all_images(self):
+        from src import __version__
+
+        self.config_path.write_text(
+            json.dumps(
+                {"version": __version__, "napcat_gif_send_mode": "image"}
+            ),
+            encoding="utf-8",
+        )
+
+        cfg = Config(self.config_path)
+
+        self.assertEqual(cfg.get("napcat_image_send_mode"), "image")
 
     def test_s3_path_persists_through_bulk_update(self):
         cfg = Config(self.config_path)
@@ -212,6 +227,135 @@ class TestConfig(unittest.TestCase):
 
 
 class TestOneBot(unittest.TestCase):
+    def test_send_meme_image_marks_image_as_sticker(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            image = Path(tmp) / "meme.gif"
+            image.write_bytes(b"GIF89a")
+            with mock.patch(
+                "src.onebot.call_action", return_value={"message_id": 42}
+            ) as action:
+                result = onebot.send_meme_image(
+                    "http://127.0.0.1:3000",
+                    "token",
+                    image,
+                    "group",
+                    "123",
+                    as_sticker=True,
+                )
+
+        self.assertEqual(result["message_id"], 42)
+        self.assertEqual(action.call_args.args[2], "send_group_msg")
+        self.assertEqual(
+            action.call_args.args[3],
+            {
+                "group_id": "123",
+                "message": [
+                    {
+                        "type": "image",
+                        "data": {
+                            "file": str(image.absolute()),
+                            "sub_type": 1,
+                            "summary": "[表情]",
+                        },
+                    }
+                ],
+            },
+        )
+
+    def test_send_meme_image_can_keep_normal_image_form(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            image = Path(tmp) / "meme.gif"
+            image.write_bytes(b"GIF89a")
+            with mock.patch(
+                "src.onebot.call_action", return_value={"message_id": 43}
+            ) as action:
+                onebot.send_meme_image(
+                    "http://127.0.0.1:3000",
+                    "token",
+                    image,
+                    "private",
+                    "456",
+                )
+
+        self.assertEqual(action.call_args.args[2], "send_private_msg")
+        self.assertEqual(
+            action.call_args.args[3]["message"][0]["data"],
+            {"file": str(image.absolute())},
+        )
+
+    def test_rebuilt_chat_record_preserves_animated_sticker_image_shape(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            image = Path(tmp) / "animated.gif"
+            image.write_bytes(b"GIF89a")
+            segments, degraded = onebot._prepare_sendable_segments(
+                [
+                    {
+                        "type": "image",
+                        "data": {
+                            "local_path": str(image),
+                            "sub_type": 1,
+                            "summary": "[动画表情]",
+                        },
+                    }
+                ]
+            )
+
+        self.assertEqual(degraded, 0)
+        self.assertEqual(
+            segments,
+            [
+                {
+                    "type": "image",
+                    "data": {
+                        "file": str(image),
+                        "sub_type": 1,
+                        "summary": "[动画表情]",
+                    },
+                }
+            ],
+        )
+
+    def test_rebuilt_chat_record_restores_market_face_instead_of_plain_image(self):
+        resolver = mock.Mock(side_effect=AssertionError("商城表情不应按图片下载"))
+        segments, degraded = onebot._prepare_sendable_segments(
+            [
+                {
+                    "type": "image",
+                    "data": {
+                        "file": "market-face.gif",
+                        "emoji_package_id": 12,
+                        "emoji_id": "abcdef",
+                        "key": "market-key",
+                        "summary": "[商城表情]",
+                    },
+                }
+            ],
+            degrade_media=True,
+            media_resolver=resolver,
+        )
+
+        resolver.assert_not_called()
+        self.assertEqual(degraded, 0)
+        self.assertEqual(
+            segments,
+            [
+                {
+                    "type": "mface",
+                    "data": {
+                        "emoji_package_id": 12,
+                        "emoji_id": "abcdef",
+                        "key": "market-key",
+                        "summary": "[商城表情]",
+                    },
+                }
+            ],
+        )
+
+    def test_token_normalization_trims_paste_whitespace_but_rejects_internal_newlines(self):
+        self.assertEqual(onebot.normalize_token("  token-value\r\n"), "token-value")
+        with self.assertRaises(onebot.OneBotError):
+            onebot.normalize_token("first-line\nsecond-line")
+
     def test_only_accepts_loopback_service_urls(self):
         self.assertEqual(
             onebot.normalize_http_url("http://127.0.0.1:3000/"),
@@ -389,12 +533,126 @@ class TestOneBot(unittest.TestCase):
                 "test",
                 "forward-message",
                 params={"source_real_seq": 123, "label": "空 格"},
+                max_response_bytes=1024,
             )
 
         self.assertEqual(
             opener.call_args.args[0].full_url,
             "http://127.0.0.1:6099/api/Plugin/ext/test/forward-message?"
             "source_real_seq=123&label=%E7%A9%BA+%E6%A0%BC",
+        )
+        response.read.assert_called_once_with(1025)
+
+    def test_consumes_and_validates_chat_record_drag_ticket(self):
+        ticket_id = "12345678-1234-4123-8123-123456789abc"
+        source = {
+            "message_id": 42,
+            "message_type": "group",
+            "group_id": 778899,
+            "self_id": 112233,
+            "real_seq": 9876,
+            "message": [{"type": "forward", "data": {"id": "resource"}}],
+        }
+        with mock.patch(
+            "src.onebot.call_webui_plugin_api",
+            return_value={"ok": True, "source_message": source},
+        ) as bridge:
+            result = onebot.consume_chat_record_drag_ticket(
+                "http://127.0.0.1:6099", "secret", ticket_id
+            )
+
+        self.assertIs(result, source)
+        bridge.assert_called_once_with(
+            "http://127.0.0.1:6099",
+            "secret",
+            "napcat-plugin-ohmymeme-current-peer",
+            "consume-chat-record-ticket",
+            timeout=onebot._CHAT_RECORD_PLUGIN_TIMEOUT,
+            params={"ticket_id": ticket_id},
+            max_response_bytes=onebot._MAX_CHAT_RECORD_PLUGIN_RESPONSE_BYTES,
+        )
+
+    def test_dragged_chat_record_reuses_standard_archive_pipeline(self):
+        source = {
+            "message_id": 42,
+            "message_type": "group",
+            "group_id": 778899,
+            "self_id": 112233,
+            "real_seq": 9876,
+            "message": [{"type": "forward", "data": {"id": "resource"}}],
+        }
+        with (
+            mock.patch(
+                "src.onebot.consume_chat_record_drag_ticket", return_value=source
+            ) as consume,
+            mock.patch(
+                "src.onebot.archive_chat_record", return_value={"ok": True, "id": 3}
+            ) as archive,
+        ):
+            result = onebot.archive_dragged_chat_record(
+                "http://127.0.0.1:3000",
+                "onebot-secret",
+                "http://127.0.0.1:6099",
+                "webui-secret",
+                "12345678-1234-4123-8123-123456789abc",
+                db="database",
+            )
+
+        self.assertEqual(result, {"ok": True, "id": 3})
+        consume.assert_called_once_with(
+            "http://127.0.0.1:6099",
+            "webui-secret",
+            "12345678-1234-4123-8123-123456789abc",
+        )
+        archive.assert_called_once_with(
+            "http://127.0.0.1:3000",
+            "onebot-secret",
+            42,
+            trigger_event=source,
+            db="database",
+            webui_url="http://127.0.0.1:6099",
+            webui_token="webui-secret",
+            source_message=source,
+        )
+
+    def test_webui_imports_chat_record_ticket_and_marks_response(self):
+        from src.webui import WebUI
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Config(Path(tmp) / "config.json")
+            cfg.set("napcat_http_url", "http://127.0.0.1:3000")
+            cfg.set("napcat_token", "onebot-secret")
+            cfg.set("napcat_webui_url", "http://127.0.0.1:6099")
+            cfg.set("napcat_webui_token", "webui-secret")
+            webui = WebUI.__new__(WebUI)
+            webui._cfg = cfg
+            descriptor = json.dumps(
+                {
+                    "type": "ohmymeme.qq-chat-record-drag",
+                    "schema_version": 1,
+                    "ticket_id": "12345678-1234-4123-8123-123456789abc",
+                }
+            ).encode("utf-8")
+            with (
+                mock.patch("src.webui.get_db", return_value="database"),
+                mock.patch(
+                    "src.onebot.archive_dragged_chat_record",
+                    return_value={"ok": True, "id": 7, "created": True},
+                ) as archive,
+            ):
+                result = webui._import_chat_record_ticket(descriptor)
+
+        self.assertEqual(
+            result,
+            {"ok": True, "id": 7, "created": True, "chat_record": True},
+        )
+        archive.assert_called_once_with(
+            "http://127.0.0.1:3000",
+            "onebot-secret",
+            "http://127.0.0.1:6099",
+            "webui-secret",
+            "12345678-1234-4123-8123-123456789abc",
+            db="database",
         )
 
     def test_rejects_token_header_injection(self):
@@ -494,6 +752,22 @@ class TestOneBot(unittest.TestCase):
             {"get_msg", "get_group_msg_history", "get_forward_msg"},
         )
         self.assertFalse(any(item[0].startswith("send_") for item in actions))
+
+    def test_json_card_preview_uses_prompt_instead_of_segment_type(self):
+        card = {
+            "app": "com.tencent.qqshare",
+            "prompt": "发现超好看的装扮",
+            "meta": {"detail": {"title": "备用标题"}},
+        }
+        segment = {
+            "type": "json",
+            "data": {"data": json.dumps(json.dumps(card, ensure_ascii=False))},
+        }
+
+        self.assertEqual(
+            onebot._segment_preview([segment]),
+            "发现超好看的装扮",
+        )
 
     def test_forward_diagnosis_stops_on_duplicate_record(self):
         def fake_action(http_url, token, action, params=None, timeout=5):
@@ -720,6 +994,289 @@ class TestOneBot(unittest.TestCase):
         self.assertTrue(result["native_rebuild"])
         self.assertTrue(result["native_replay"])
 
+    def test_archive_rebuild_reads_inline_root_native_payload_from_package(self):
+        package = {
+            "title": "内联根记录",
+            "omm_native_payload_b64": "aW5saW5lLW5hdGl2ZQ==",
+            "native_card": {"app": "com.tencent.multimsg"},
+            "source": {
+                "self_id": 123,
+                "message_id": 99,
+                "message_type": "group",
+                "group_id": 987,
+                "real_seq": 9988,
+                "message": [{
+                    "type": "forward",
+                    "data": {"content": [{
+                        "sender": {"user_id": 456, "nickname": "Alice"},
+                        "message": [{"type": "text", "data": {"text": "你好"}}],
+                    }]},
+                }],
+            },
+            "forward_records": {},
+        }
+        db = mock.MagicMock()
+        db.get_chat_record.return_value = package
+        captured = {}
+
+        def fake_plugin(http_url, token, plugin_id, route, timeout=5, params=None):
+            payload_path = Path(params["payload_path"])
+            captured.update(json.loads(payload_path.read_text(encoding="utf-8")))
+            payload_path.unlink()
+            return {"ok": True, "strategy": "qqnt_native_replay"}
+
+        with mock.patch(
+            "src.onebot.call_webui_plugin_api", side_effect=fake_plugin
+        ):
+            result = onebot.send_chat_record(
+                "http://127.0.0.1:3000",
+                "token",
+                7,
+                {"self_id": 123, "message_type": "group", "group_id": 789},
+                db=db,
+                send_mode="archive_rebuild",
+                webui_url="http://127.0.0.1:6099",
+                webui_token="webui-token",
+            )
+
+        self.assertEqual(captured["native_payload_b64"], "aW5saW5lLW5hdGl2ZQ==")
+        self.assertEqual(captured["native_card"]["app"], "com.tencent.multimsg")
+        self.assertTrue(result["native_replay"])
+
+    def test_archive_rebuild_filters_root_nodes_inside_native_payload(self):
+        package = {
+            "title": "带屏蔽规则的记录",
+            "source": {
+                "self_id": 123,
+                "message_id": 99,
+                "message_type": "group",
+                "group_id": 987,
+                "message": [{"type": "forward", "data": {"id": "root"}}],
+            },
+            "send_filter": {"blocked_node_paths": ["n1"]},
+            "forward_records": {
+                "root": {
+                    "omm_native_payload_b64": "bmF0aXZl",
+                    "messages": [
+                        {
+                            "sender": {"user_id": 456, "nickname": "Alice"},
+                            "message": [{"type": "text", "data": {"text": "保留"}}],
+                        },
+                        {
+                            "sender": {"user_id": 789, "nickname": "Ad"},
+                            "message": [{"type": "text", "data": {"text": "广告"}}],
+                        },
+                    ],
+                }
+            },
+        }
+        db = mock.MagicMock()
+        db.get_chat_record.return_value = package
+        captured = {}
+
+        def fake_plugin(http_url, token, plugin_id, route, timeout=5, params=None):
+            payload_path = Path(params["payload_path"])
+            captured.update(json.loads(payload_path.read_text(encoding="utf-8")))
+            payload_path.unlink()
+            return {
+                "ok": True,
+                "message_id": "filtered-card-id",
+                "strategy": "qqnt_native_filtered_replay",
+            }
+
+        with mock.patch(
+            "src.onebot.call_webui_plugin_api", side_effect=fake_plugin
+        ):
+            result = onebot.send_chat_record(
+                "http://127.0.0.1:3000",
+                "token",
+                7,
+                {"self_id": 123, "message_type": "group", "group_id": 789},
+                db=db,
+                send_mode="archive_rebuild",
+                webui_url="http://127.0.0.1:6099",
+                webui_token="webui-token",
+            )
+
+        self.assertEqual(captured["native_payload_b64"], "bmF0aXZl")
+        self.assertEqual(captured["blocked_node_paths"], ["n1"])
+        self.assertEqual(len(captured["messages"]), 1)
+        self.assertEqual(captured["messages"][0]["data"]["nickname"], "Alice")
+        self.assertEqual(
+            captured["messages"][0]["data"]["content"][0]["data"]["text"],
+            "保留",
+        )
+        self.assertTrue(result["native_replay"])
+        self.assertTrue(result["native_filtered_replay"])
+
+    def test_archive_rebuild_uses_node_rebuild_for_nested_filters(self):
+        package = {
+            "title": "带内层屏蔽规则的记录",
+            "source": {
+                "self_id": 123,
+                "message_id": 99,
+                "message_type": "group",
+                "group_id": 987,
+                "message": [{"type": "forward", "data": {"id": "root"}}],
+            },
+            "send_filter": {"blocked_node_paths": ["n0/s0/n1"]},
+            "forward_records": {
+                "root": {
+                    "omm_native_payload_b64": "bmF0aXZl",
+                    "messages": [{
+                        "sender": {"user_id": 456, "nickname": "Alice"},
+                        "message": [{
+                            "type": "forward",
+                            "data": {"content": [
+                                {
+                                    "sender": {"user_id": 789, "nickname": "Bob"},
+                                    "message": [{"type": "text", "data": {"text": "保留"}}],
+                                },
+                                {
+                                    "sender": {"user_id": 999, "nickname": "Ad"},
+                                    "message": [{"type": "text", "data": {"text": "广告"}}],
+                                },
+                            ]},
+                        }],
+                    }],
+                },
+            },
+        }
+        db = mock.MagicMock()
+        db.get_chat_record.return_value = package
+        captured = {}
+
+        def fake_plugin(http_url, token, plugin_id, route, timeout=5, params=None):
+            payload_path = Path(params["payload_path"])
+            captured.update(json.loads(payload_path.read_text(encoding="utf-8")))
+            payload_path.unlink()
+            return {"ok": True, "strategy": "qqnt_native_rebuild"}
+
+        with mock.patch(
+            "src.onebot.call_webui_plugin_api", side_effect=fake_plugin
+        ):
+            result = onebot.send_chat_record(
+                "http://127.0.0.1:3000",
+                "token",
+                7,
+                {"self_id": 123, "message_type": "group", "group_id": 789},
+                db=db,
+                send_mode="archive_rebuild",
+                webui_url="http://127.0.0.1:6099",
+                webui_token="webui-token",
+            )
+
+        self.assertNotIn("native_payload_b64", captured)
+        children = captured["messages"][0]["data"]["content"]
+        self.assertEqual(len(children), 1)
+        self.assertEqual(children[0]["data"]["nickname"], "Bob")
+        self.assertFalse(result["native_replay"])
+        self.assertFalse(result["native_filtered_replay"])
+
+    def test_send_chat_record_uses_self_native_relay_without_saved_payload(self):
+        package = {
+            "title": "桌面兼容记录",
+            "source": {
+                "self_id": 123,
+                "message_id": 99,
+                "message": [{"type": "forward", "data": {"id": "root"}}],
+            },
+            "send_filter": {"blocked_node_paths": ["n1"]},
+            "forward_records": {
+                "root": {
+                    "omm_native_payload_b64": "dW51c2Vk",
+                    "messages": [
+                        {
+                            "sender": {"user_id": 456, "nickname": "Alice"},
+                            "message": [{"type": "text", "data": {"text": "你好"}}],
+                        },
+                        {
+                            "sender": {"user_id": 789, "nickname": "Ad"},
+                            "message": [{"type": "text", "data": {"text": "广告"}}],
+                        },
+                    ],
+                }
+            },
+        }
+        db = mock.MagicMock()
+        db.get_chat_record.return_value = package
+        captured = {}
+
+        def fake_plugin(http_url, token, plugin_id, route, timeout=5, params=None):
+            payload_path = Path(params["payload_path"])
+            captured.update(json.loads(payload_path.read_text(encoding="utf-8")))
+            payload_path.unlink()
+            return {
+                "ok": True,
+                "message_id": "self-card-id",
+                "strategy": "qqnt_self_native_relay",
+            }
+
+        with mock.patch(
+            "src.onebot.call_webui_plugin_api", side_effect=fake_plugin
+        ) as plugin:
+            result = onebot.send_chat_record(
+                "http://127.0.0.1:3000",
+                "token",
+                7,
+                {
+                    "self_id": 123,
+                    "message_type": "group",
+                    "group_id": 789,
+                },
+                db=db,
+                send_mode="self_native_relay",
+                webui_url="http://127.0.0.1:6099",
+                webui_token="webui-token",
+            )
+
+        self.assertEqual(plugin.call_args.args[3], "send-self-native-forward")
+        self.assertNotIn("self_native_relay", captured)
+        self.assertNotIn("native_payload_b64", captured)
+        self.assertEqual(captured["destination_type"], "group")
+        self.assertEqual(captured["destination_peer_id"], "789")
+        self.assertEqual(len(captured["messages"]), 1)
+        self.assertEqual(captured["messages"][0]["data"]["nickname"], "Alice")
+        self.assertEqual(result["source"], "self_native_relay")
+        self.assertTrue(result["native_rebuild"])
+        self.assertTrue(result["self_native_relay"])
+        self.assertFalse(result["native_replay"])
+
+    def test_self_native_relay_requires_webui_credentials(self):
+        package = {
+            "source": {
+                "self_id": 123,
+                "message_id": 99,
+                "message": [{"type": "forward", "data": {"id": "root"}}],
+            },
+            "forward_records": {
+                "root": {
+                    "messages": [
+                        {
+                            "sender": {"user_id": 456, "nickname": "Alice"},
+                            "message": [{"type": "text", "data": {"text": "你好"}}],
+                        }
+                    ]
+                }
+            },
+        }
+        db = mock.MagicMock()
+        db.get_chat_record.return_value = package
+
+        with self.assertRaisesRegex(onebot.OneBotError, "WebUI"):
+            onebot.send_chat_record(
+                "http://127.0.0.1:3000",
+                "token",
+                7,
+                {
+                    "self_id": 123,
+                    "message_type": "group",
+                    "group_id": 789,
+                },
+                db=db,
+                send_mode="self_native_relay",
+            )
+
     def test_forward_nodes_preserves_nested_forward_tree(self):
         package = {
             "source": {"message": [{"type": "forward", "data": {"id": "root"}}]},
@@ -769,6 +1326,98 @@ class TestOneBot(unittest.TestCase):
             "内层内容",
         )
 
+    def test_forward_nodes_omit_selected_root_and_nested_messages(self):
+        package = {
+            "source": {
+                "message": [{
+                    "type": "forward",
+                    "data": {
+                        "content": [
+                            {
+                                "sender": {"nickname": "Alice"},
+                                "message": [{"type": "text", "data": {"text": "保留"}}],
+                            },
+                            {
+                                "sender": {"nickname": "Ad"},
+                                "message": [{"type": "text", "data": {"text": "广告"}}],
+                            },
+                            {
+                                "sender": {"nickname": "Forwarder"},
+                                "message": [{
+                                    "type": "forward",
+                                    "data": {
+                                        "content": [
+                                            {
+                                                "sender": {"nickname": "Bob"},
+                                                "message": [{"type": "text", "data": {"text": "内层保留"}}],
+                                            },
+                                            {
+                                                "sender": {"nickname": "Nested Ad"},
+                                                "message": [{"type": "text", "data": {"text": "内层广告"}}],
+                                            },
+                                        ]
+                                    },
+                                }],
+                            },
+                        ]
+                    },
+                }],
+            },
+            "forward_records": {},
+            "send_filter": {
+                "blocked_node_paths": ["n1", "n2/s0/n1"],
+            },
+        }
+
+        view = onebot.chat_record_view(package)
+        self.assertEqual(
+            [item["path"] for item in view],
+            ["n0", "n1", "n2", "n2/s0/n0", "n2/s0/n1"],
+        )
+        nodes, degraded = onebot._forward_nodes(package, 123)
+
+        texts = []
+
+        def collect(value):
+            if isinstance(value, dict):
+                if value.get("type") == "text":
+                    texts.append(value.get("data", {}).get("text"))
+                for child in value.values():
+                    collect(child)
+            elif isinstance(value, list):
+                for child in value:
+                    collect(child)
+
+        collect(nodes)
+        self.assertEqual(degraded, 0)
+        self.assertIn("保留", texts)
+        self.assertIn("内层保留", texts)
+        self.assertNotIn("广告", texts)
+        self.assertNotIn("内层广告", texts)
+
+    def test_blocking_parent_removes_its_nested_subtree(self):
+        package = {
+            "source": {
+                "message": [{
+                    "type": "forward",
+                    "data": {"content": [{
+                        "sender": {"nickname": "Alice"},
+                        "message": [{
+                            "type": "forward",
+                            "data": {"content": [{
+                                "sender": {"nickname": "Bob"},
+                                "message": [{"type": "text", "data": {"text": "子内容"}}],
+                            }]},
+                        }],
+                    }]},
+                }],
+            },
+            "send_filter": {"blocked_node_paths": ["n0"]},
+        }
+
+        with self.assertRaisesRegex(onebot.OneBotError, "没有可重新发送"):
+            onebot._forward_nodes(package, 123)
+
     def test_forward_nodes_flattens_only_beyond_napcat_nested_limit(self):
         def nested_node(name, depth):
             if depth == 0:
@@ -816,6 +1465,7 @@ class TestOneBot(unittest.TestCase):
         package = {
             "title": "原生记录",
             "source": {"self_id": 123, "message_id": 99},
+            "send_filter": {"blocked_node_paths": ["n0"]},
             "summary": {"node_count": 2},
         }
         db = mock.MagicMock()
@@ -884,6 +1534,7 @@ class TestOneBot(unittest.TestCase):
             {
                 "source_type": "group",
                 "source_peer_id": 555,
+                "source_self_id": "123",
                 "source_real_seq": 7788,
                 "source_time": 1710000000,
                 "source_sender_id": 111222,
@@ -892,10 +1543,62 @@ class TestOneBot(unittest.TestCase):
             },
         )
 
+    def test_cross_account_native_forward_skips_short_id_and_flips_private_peer(self):
+        package = {
+            "title": "B 账号导入的私聊记录",
+            "source": {
+                "self_id": 20000,
+                "message_id": -987,
+                "message_type": "private",
+                "target_id": 10000,
+                "real_seq": 7788,
+                "time": 1710000000,
+                "sender": {"user_id": 20000},
+            },
+            "summary": {"node_count": 2},
+        }
+        db = mock.MagicMock()
+        db.get_chat_record.return_value = package
+        event = {"self_id": 10000, "message_type": "group", "group_id": 999}
+
+        with mock.patch("src.onebot.call_action") as action:
+            with mock.patch(
+                "src.onebot.call_webui_plugin_api",
+                return_value={"ok": True, "recovered": True},
+            ) as plugin:
+                result = onebot.send_chat_record(
+                    "http://127.0.0.1:3000",
+                    "onebot-token",
+                    7,
+                    event,
+                    db=db,
+                    webui_url="http://127.0.0.1:6099",
+                    webui_token="webui-token",
+                )
+
+        action.assert_not_called()
+        self.assertTrue(result["reindexed"])
+        self.assertEqual(
+            plugin.call_args.kwargs["params"],
+            {
+                "source_type": "private",
+                "source_peer_id": 10000,
+                "source_self_id": "20000",
+                "source_real_seq": 7788,
+                "source_time": 1710000000,
+                "source_sender_id": 20000,
+                "destination_type": "group",
+                "destination_peer_id": 999,
+            },
+        )
+
     def test_send_chat_record_can_force_original_rebuild(self):
         archived = {
             "title": "旧归档",
+            "omm_native_payload_b64": "cHJlc2VydmVkLW5hdGl2ZQ==",
+            "native_card": {"app": "com.tencent.multimsg"},
             "source": {"self_id": 123, "message_id": 99},
+            "send_filter": {"blocked_node_paths": ["n1"]},
         }
         refreshed = {
             "title": "刷新后的记录",
@@ -910,7 +1613,11 @@ class TestOneBot(unittest.TestCase):
                         {
                             "sender": {"user_id": 456, "nickname": "Alice"},
                             "message": [{"type": "text", "data": {"text": "刷新内容"}}],
-                        }
+                        },
+                        {
+                            "sender": {"user_id": 789, "nickname": "Ad"},
+                            "message": [{"type": "text", "data": {"text": "刷新广告"}}],
+                        },
                     ]
                 }
             },
@@ -934,8 +1641,240 @@ class TestOneBot(unittest.TestCase):
                 )
 
         rebuild.assert_called_once()
+        self.assertEqual(
+            refreshed["send_filter"]["blocked_node_paths"], ["n1"]
+        )
+        self.assertEqual(
+            refreshed["omm_native_payload_b64"], "cHJlc2VydmVkLW5hdGl2ZQ=="
+        )
+        self.assertEqual(refreshed["native_card"]["app"], "com.tencent.multimsg")
+        db.save_chat_record.assert_called_once_with(refreshed, record_id=7)
         self.assertEqual(result["source"], "original_rebuild")
         self.assertEqual(action.call_args.args[2], "send_group_forward_msg")
+        sent_nodes = action.call_args.args[3]["messages"]
+        self.assertEqual(len(sent_nodes), 1)
+        self.assertEqual(sent_nodes[0]["data"]["nickname"], "Alice")
+
+    def test_original_rebuild_recovers_source_by_persistent_identity_after_restart(self):
+        archived = {
+            "title": "旧归档",
+            "source": {
+                "self_id": 123,
+                "message_id": -99,
+                "message_type": "group",
+                "group_id": 456,
+                "real_seq": 7788,
+                "time": 1710000000,
+                "user_id": 111,
+            },
+        }
+        recovered_source = {
+            "message_id": "native-outer",
+            "message": [{"type": "forward", "data": {"id": "root"}}],
+        }
+        refreshed = {
+            "title": "刷新后",
+            "source": recovered_source,
+            "forward_records": {
+                "root": {
+                    "messages": [{
+                        "sender": {"nickname": "Alice"},
+                        "message": [{"type": "text", "data": {"text": "内容"}}],
+                    }]
+                }
+            },
+        }
+        db = mock.MagicMock()
+        db.get_chat_record.return_value = archived
+        build_calls = []
+
+        def fake_build(*args, **kwargs):
+            build_calls.append((args, kwargs))
+            if kwargs.get("source_message") is None:
+                raise onebot.OneBotError("OneBot 调用失败：消息不存在")
+            self.assertEqual(kwargs["source_message"]["message_id"], "native-outer")
+            self.assertEqual(kwargs["source_message"]["real_seq"], 7788)
+            return refreshed
+
+        with (
+            mock.patch("src.onebot.build_chat_record_package", side_effect=fake_build),
+            mock.patch(
+                "src.onebot.call_webui_plugin_api",
+                return_value={
+                    "ok": True,
+                    "message": recovered_source,
+                    "native_payload_b64": "bmF0aXZl",
+                },
+            ) as plugin,
+            mock.patch(
+                "src.onebot._send_qqnt_native_rebuilt_forward",
+                return_value={"ok": True, "strategy": "qqnt_native_rebuild"},
+            ),
+        ):
+            result = onebot.send_chat_record(
+                "http://127.0.0.1:3000",
+                "token",
+                7,
+                {"self_id": 123, "message_type": "group", "group_id": 789},
+                db=db,
+                send_mode="original_rebuild",
+                webui_url="http://127.0.0.1:6099",
+                webui_token="webui-token",
+            )
+
+        self.assertEqual(result["source"], "original_rebuild")
+        self.assertEqual(len(build_calls), 1)
+        self.assertEqual(plugin.call_args.args[3], "recover-message")
+        self.assertEqual(plugin.call_args.kwargs["params"]["source_real_seq"], 7788)
+        self.assertEqual(plugin.call_args.kwargs["params"]["source_self_id"], "123")
+        db.save_chat_record.assert_called_once_with(refreshed, record_id=7)
+
+    def test_native_send_records_destination_and_reuses_it_after_source_is_gone(self):
+        with tempfile.TemporaryDirectory() as folder:
+            db = MemeDB(Path(folder) / "memes.db")
+            try:
+                original = {
+                    "self_id": "123", "message_id": -99, "message_type": "group",
+                    "group_id": "456", "real_seq": "100", "time": "1710000000",
+                    "sender": {"user_id": "321"},
+                }
+                saved = db.save_chat_record({
+                    "title": "记录", "source": original, "summary": {"node_count": 2},
+                })
+                replica = {
+                    "self_id": "123", "message_id": "9876543210",
+                    "message_type": "group", "group_id": "789", "real_seq": "200",
+                    "time": "1710000001", "sender": {"user_id": "123"},
+                }
+                event = {"self_id": "123", "message_type": "group", "group_id": "789"}
+                with mock.patch("src.onebot.call_webui_plugin_api", return_value={
+                    "ok": True, "source_location": replica,
+                }) as plugin:
+                    result = onebot.send_chat_record(
+                        "http://127.0.0.1:3000", "", saved["id"], event, db=db,
+                        webui_url="http://127.0.0.1:6099", webui_token="token",
+                    )
+                self.assertTrue(result["backup_recorded"])
+                self.assertEqual(len(onebot.chat_record_sources(db.get_chat_record(saved["id"]))), 2)
+                with mock.patch("src.onebot.call_webui_plugin_api", return_value={"ok": True}) as plugin:
+                    onebot.send_chat_record(
+                        "http://127.0.0.1:3000", "", saved["id"], event, db=db,
+                        webui_url="http://127.0.0.1:6099", webui_token="token",
+                    )
+                self.assertEqual(plugin.call_args.kwargs["params"]["source_real_seq"], "200")
+                self.assertEqual(db.count_chat_records(), 1)
+            finally:
+                db.close()
+
+    def test_native_locations_are_equal_and_lookup_failure_tries_next(self):
+        original = {"self_id": 123, "message_id": -99, "message_type": "group",
+                    "group_id": 456, "real_seq": 100}
+        backup = {"self_id": 123, "message_id": 999, "message_type": "group",
+                  "group_id": 789, "real_seq": 200, "last_success_at": 1}
+        db = mock.MagicMock()
+        db.get_chat_record.return_value = {"source": original, "source_locations": [backup]}
+        with mock.patch("src.onebot.call_webui_plugin_api", side_effect=[
+            {"ok": False, "retry_safe": True, "error": "已清除"}, {"ok": True},
+        ]) as plugin:
+            onebot.send_chat_record(
+                "http://127.0.0.1:3000", "", 7,
+                {"self_id": 123, "message_type": "group", "group_id": 900}, db=db,
+                webui_url="http://127.0.0.1:6099", webui_token="token",
+            )
+        self.assertEqual([call.kwargs["params"]["source_real_seq"]
+                          for call in plugin.call_args_list], [200, 100])
+
+    def test_native_send_does_not_retry_after_dispatch_or_transport_timeout(self):
+        db = mock.MagicMock()
+        source = {"self_id": 123, "message_id": 99, "message_type": "group",
+                  "group_id": 456, "real_seq": 100}
+        db.get_chat_record.return_value = {"source": source, "source_locations": [
+            {**source, "group_id": 789, "real_seq": 200},
+        ]}
+        for response in (
+            {"ok": False, "retry_safe": False, "error": "发送状态不确定"},
+            onebot.OneBotError("连接超时"),
+        ):
+            with mock.patch("src.onebot.call_webui_plugin_api") as plugin:
+                if isinstance(response, Exception):
+                    plugin.side_effect = response
+                else:
+                    plugin.return_value = response
+                with self.assertRaises(onebot.OneBotError):
+                    onebot.send_chat_record(
+                        "http://127.0.0.1:3000", "", 7,
+                        {"self_id": 123, "message_type": "group", "group_id": 900}, db=db,
+                        webui_url="http://127.0.0.1:6099", webui_token="token",
+                    )
+                self.assertEqual(plugin.call_count, 1)
+
+    def test_filtered_replay_does_not_become_an_equivalent_original(self):
+        db = mock.MagicMock()
+        db.get_chat_record.return_value = {
+            "source": {"self_id": 123, "message_id": 99},
+            "send_filter": {"blocked_node_paths": ["n1"]},
+        }
+        location = {"self_id": 123, "message_id": 999, "message_type": "group",
+                    "group_id": 789, "real_seq": 200}
+        with (
+            mock.patch("src.onebot._forward_nodes", return_value=([{}], 0)),
+            mock.patch("src.onebot._send_qqnt_native_rebuilt_forward", return_value={
+                "ok": True, "strategy": "qqnt_native_filtered_replay", "source_location": location,
+            }),
+        ):
+            result = onebot.send_chat_record(
+                "http://127.0.0.1:3000", "", 7,
+                {"self_id": 123, "message_type": "group", "group_id": 789}, db=db,
+                send_mode="archive_rebuild", webui_url="http://127.0.0.1:6099",
+                webui_token="token",
+            )
+        self.assertFalse(result["backup_recorded"])
+        db.add_chat_record_source.assert_not_called()
+
+    def test_backup_database_failure_does_not_change_successful_send(self):
+        db = mock.MagicMock()
+        source = {"self_id": 123, "message_id": 99, "message_type": "group",
+                  "group_id": 456, "real_seq": 100}
+        db.get_chat_record.return_value = {"source": source}
+        db.add_chat_record_source.side_effect = sqlite3.OperationalError("disk full")
+        with mock.patch("src.onebot.call_webui_plugin_api", return_value={
+            "ok": True, "source_location": {**source, "real_seq": 200},
+        }) as plugin:
+            result = onebot.send_chat_record(
+                "http://127.0.0.1:3000", "", 7,
+                {"self_id": 123, "message_type": "group", "group_id": 789}, db=db,
+                webui_url="http://127.0.0.1:6099", webui_token="token",
+            )
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["backup_recorded"])
+        self.assertEqual(plugin.call_count, 1)
+
+    def test_original_rebuild_tries_backup_and_updates_existing_record(self):
+        source = {"self_id": 123, "message_id": 99, "message_type": "group",
+                  "group_id": 456, "real_seq": 100}
+        backup = {**source, "message_id": 999, "group_id": 789, "real_seq": 200}
+        db = mock.MagicMock()
+        db.get_chat_record.return_value = {"source": source, "source_locations": [backup],
+                                          "summary": {"node_count": 2}}
+        refreshed = {"title": "刷新", "source": {**backup, "message_id": 1000},
+                     "summary": {"node_count": 2}}
+        with (
+            mock.patch("src.onebot._recover_original_message_by_identity", side_effect=[
+                onebot.OneBotError("副本已清除"), source,
+            ]) as recover,
+            mock.patch("src.onebot.build_chat_record_package", return_value=refreshed),
+            mock.patch("src.onebot._forward_nodes", return_value=([{}], 0)),
+            mock.patch("src.onebot._send_qqnt_native_rebuilt_forward", return_value={"ok": True}),
+        ):
+            onebot.send_chat_record(
+                "http://127.0.0.1:3000", "", 7,
+                {"self_id": 123, "message_type": "group", "group_id": 789}, db=db,
+                send_mode="original_rebuild", webui_url="http://127.0.0.1:6099",
+                webui_token="token",
+            )
+        self.assertEqual([call.args[2]["real_seq"] for call in recover.call_args_list], [200, 100])
+        db.save_chat_record.assert_called_once_with(refreshed, record_id=7)
+        self.assertEqual({item["real_seq"] for item in refreshed["source_locations"]}, {100, 200})
 
     def test_send_chat_record_rejects_unknown_mode(self):
         db = mock.MagicMock()
@@ -1232,6 +2171,71 @@ class TestOneBot(unittest.TestCase):
             ]["data"]
             self.assertEqual(reused, 1)
             self.assertEqual(new_data["local_path"], str(local_path))
+
+    def test_new_quoted_media_does_not_shift_or_overwrite_existing_media(self):
+        from copy import deepcopy
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first = root / "first.jpg"
+            second = root / "second.jpg"
+            quoted = root / "quoted.jpg"
+            first.write_bytes(b"\xff\xd8\xfffirst")
+            second.write_bytes(b"\xff\xd8\xffsecond")
+            quoted.write_bytes(b"\xff\xd8\xffquoted")
+            package = {
+                "source": {
+                    "self_id": 123,
+                    "message_id": 99,
+                    "message": [{"type": "forward", "data": {"id": "root"}}],
+                },
+                "forward_records": {
+                    "root": {
+                        "messages": [
+                            {
+                                "message": [
+                                    {"type": "reply", "data": {"id": "quote"}},
+                                    {"type": "image", "data": {"path": str(first)}},
+                                    {"type": "image", "data": {"path": str(second)}},
+                                ]
+                            }
+                        ]
+                    }
+                },
+            }
+            media_root = root / "media"
+            self.assertEqual(
+                onebot._localize_archive_media("", "", package, media_root), 2
+            )
+            original_paths = [
+                Path(data["local_path"])
+                for _, data in onebot._archive_media_entries(package)
+            ]
+            refreshed = deepcopy(package)
+            segments = refreshed["forward_records"]["root"]["messages"][0]["message"]
+            for segment in segments[1:]:
+                segment["data"].pop("local_path")
+                segment["data"].pop("path")
+            segments[0]["data"]["omm_quoted_message"] = {
+                "message": [{"type": "image", "data": {"path": str(quoted)}}]
+            }
+            self.assertEqual(onebot._reuse_archived_media_paths(package, refreshed), 2)
+            self.assertNotIn(
+                "local_path",
+                segments[0]["data"]["omm_quoted_message"]["message"][0]["data"],
+            )
+            self.assertEqual(
+                onebot._localize_archive_media("", "", refreshed, media_root), 3
+            )
+            entries = onebot._archive_media_entries(refreshed)
+            self.assertEqual(
+                [Path(data["local_path"]).read_bytes() for _, data in entries],
+                [quoted.read_bytes(), first.read_bytes(), second.read_bytes()],
+            )
+            self.assertEqual(
+                [path.read_bytes() for path in original_paths],
+                [first.read_bytes(), second.read_bytes()],
+            )
 
     def test_archive_video_and_voice_are_persisted_with_images(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1828,6 +2832,7 @@ class TestOneBot(unittest.TestCase):
                 "res_id": "root",
                 "source_type": "group",
                 "source_peer_id": 20000,
+                "source_self_id": "10000",
                 "source_real_seq": 77,
                 "source_time": 1710000001,
                 "source_sender_id": 30000,
@@ -1849,6 +2854,253 @@ class TestOneBot(unittest.TestCase):
             image["omm_fallback_urls"],
             ["https://fallback/x", "https://signed/x"],
         )
+
+    def test_build_inline_root_captures_native_payload_from_outer_message(self):
+        source = {
+            "message_id": 99,
+            "self_id": 10000,
+            "message_type": "group",
+            "group_id": 20000,
+            "real_seq": 77,
+            "time": 1710000001,
+            "sender": {"user_id": 30000},
+            "message": [{
+                "type": "forward",
+                "data": {"content": [{
+                    "sender": {"user_id": 30000, "nickname": "Alice"},
+                    "message": [{"type": "text", "data": {"text": "内联内容"}}],
+                }]},
+            }],
+        }
+        native_card = {
+            "app": "com.tencent.multimsg",
+            "meta": {"detail": {"resid": "old-resource"}},
+        }
+
+        with (
+            mock.patch("src.onebot.call_action", return_value=source),
+            mock.patch(
+                "src.onebot.call_webui_plugin_api",
+                return_value={
+                    "ok": True,
+                    "message": source,
+                    "native_payload_b64": "aW5saW5lLXByb3Rv",
+                    "native_card": native_card,
+                },
+            ) as plugin,
+        ):
+            package = onebot.build_chat_record_package(
+                "http://127.0.0.1:3000",
+                "token",
+                "99",
+                webui_url="http://127.0.0.1:6099",
+                webui_token="webui-token",
+            )
+
+        self.assertEqual(plugin.call_args.args[3], "recover-message")
+        self.assertEqual(package["omm_native_payload_b64"], "aW5saW5lLXByb3Rv")
+        self.assertEqual(package["native_card"], native_card)
+        self.assertNotIn("_omm_native_payload_b64", package["source"])
+        self.assertEqual(package["summary"]["node_count"], 1)
+
+    def test_build_inline_root_merges_quoted_media_from_recovered_message(self):
+        plain_source = {
+            "message_id": 99,
+            "self_id": 10000,
+            "message_type": "group",
+            "group_id": 20000,
+            "real_seq": 77,
+            "time": 1710000001,
+            "sender": {"user_id": 30000},
+            "message": [{
+                "type": "forward",
+                "data": {"content": [{
+                    "sender": {"nickname": "Bob"},
+                    "message": [
+                        {"type": "reply", "data": {"id": "quoted-1"}},
+                        {"type": "text", "data": {"text": "看这里"}},
+                    ],
+                }]},
+            }],
+        }
+        recovered_source = {
+            **plain_source,
+            "message": [{
+                "type": "forward",
+                "data": {"content": [{
+                    "sender": {"nickname": "Bob"},
+                    "message": [
+                        {
+                            "type": "reply",
+                            "data": {
+                                "id": "quoted-1",
+                                "omm_quoted_message": {
+                                    "sender": {"nickname": "Alice"},
+                                    "message": [{
+                                        "type": "video",
+                                        "data": {
+                                            "file": "quoted.mp4",
+                                            "path": "C:/cache/quoted.mp4",
+                                        },
+                                    }],
+                                },
+                            },
+                        },
+                        {"type": "text", "data": {"text": "看这里"}},
+                    ],
+                }]},
+            }],
+        }
+
+        with (
+            mock.patch("src.onebot.call_action", return_value=plain_source),
+            mock.patch(
+                "src.onebot.call_webui_plugin_api",
+                return_value={
+                    "ok": True,
+                    "message": recovered_source,
+                    "native_payload_b64": "aW5saW5lLXByb3Rv",
+                },
+            ),
+        ):
+            package = onebot.build_chat_record_package(
+                "http://127.0.0.1:3000",
+                "token",
+                "99",
+                webui_url="http://127.0.0.1:6099",
+                webui_token="webui-token",
+            )
+
+        node = package["source"]["message"][0]["data"]["content"][0]
+        quote = node["message"][0]["data"]["omm_quoted_message"]
+        self.assertEqual(quote["sender"]["nickname"], "Alice")
+        self.assertEqual(quote["message"][0]["type"], "video")
+        self.assertEqual(package["summary"]["media_count"], 1)
+        self.assertEqual(
+            onebot._archive_media_entries(package)[0][0],
+            "video",
+        )
+
+    def test_command_import_recovers_missing_real_seq_by_message_id(self):
+        plain_source = {
+            "message_id": "7690600602430115722",
+            "self_id": 10000,
+            "message_type": "private",
+            "target_id": 20000,
+            "message": [{"type": "forward", "data": {"id": "root"}}],
+        }
+        recovered_source = {
+            **plain_source,
+            "real_seq": "7788",
+            "message": [{
+                "type": "forward",
+                "data": {"content": [{
+                    "sender": {"nickname": "Bob"},
+                    "message": [{
+                        "type": "reply",
+                        "data": {
+                            "id": "quoted-1",
+                            "omm_quoted_message": {
+                                "sender": {"nickname": "Alice"},
+                                "message": [{
+                                    "type": "image",
+                                    "data": {
+                                        "file": "quoted.jpg",
+                                        "path": "C:/cache/quoted.jpg",
+                                    },
+                                }],
+                            },
+                        },
+                    }],
+                }]},
+            }],
+        }
+
+        with (
+            mock.patch("src.onebot.call_action", return_value=plain_source),
+            mock.patch(
+                "src.onebot.call_webui_plugin_api",
+                return_value={
+                    "ok": True,
+                    "message": recovered_source,
+                    "native_payload_b64": "bmF0aXZl",
+                },
+            ) as plugin,
+        ):
+            package = onebot.build_chat_record_package(
+                "http://127.0.0.1:3000",
+                "token",
+                plain_source["message_id"],
+                trigger_event={
+                    "self_id": 10000,
+                    "message_type": "private",
+                    "target_id": 20000,
+                },
+                webui_url="http://127.0.0.1:6099",
+                webui_token="webui-token",
+            )
+
+        self.assertEqual(plugin.call_args.args[3], "recover-message-by-id")
+        self.assertEqual(
+            plugin.call_args.kwargs["params"],
+            {
+                "message_id": plain_source["message_id"],
+                "source_type": "private",
+                "source_peer_id": 20000,
+                "source_self_id": "10000",
+            },
+        )
+        self.assertEqual(package["source"]["real_seq"], "7788")
+        self.assertEqual(package["summary"]["media_count"], 1)
+        self.assertEqual(
+            onebot._archive_media_entries(package)[0][0],
+            "image",
+        )
+
+    def test_command_import_recovers_by_id_when_get_msg_mapping_expired(self):
+        recovered_source = {
+            "message_id": "7690600602430115722",
+            "self_id": 10000,
+            "message_type": "group",
+            "group_id": 20000,
+            "real_seq": "7788",
+            "message": [{
+                "type": "forward",
+                "data": {"content": [{
+                    "message": [{"type": "text", "data": {"text": "仍可恢复"}}],
+                }]},
+            }],
+        }
+        with (
+            mock.patch(
+                "src.onebot.call_action",
+                side_effect=onebot.OneBotError("OneBot 调用失败：消息不存在"),
+            ),
+            mock.patch(
+                "src.onebot.call_webui_plugin_api",
+                return_value={
+                    "ok": True,
+                    "message": recovered_source,
+                    "native_payload_b64": "bmF0aXZl",
+                },
+            ) as plugin,
+        ):
+            package = onebot.build_chat_record_package(
+                "http://127.0.0.1:3000",
+                "token",
+                recovered_source["message_id"],
+                trigger_event={
+                    "self_id": 10000,
+                    "message_type": "group",
+                    "group_id": 20000,
+                },
+                webui_url="http://127.0.0.1:6099",
+                webui_token="webui-token",
+            )
+
+        self.assertEqual(plugin.call_args.args[3], "recover-message-by-id")
+        self.assertEqual(package["source"]["real_seq"], "7788")
+        self.assertEqual(package["summary"]["node_count"], 1)
 
     def test_build_chat_record_package_hydrates_complete_media_with_plugin(self):
         def fake_action(http_url, token, action, params=None, timeout=5):
@@ -2030,7 +3282,63 @@ class TestOneBot(unittest.TestCase):
         self.assertEqual(view[1]["media"][0]["index"], 3)
         self.assertEqual(view[1]["media"][0]["url"], "/api/chat-record-media/7/3")
 
-    def test_chat_record_media_path_only_serves_saved_images_under_media_root(self):
+    def test_reply_quoted_media_is_archived_previewed_and_rebuilt(self):
+        quoted_image = {
+            "file": "quoted.jpg",
+            "local_path": "chat-record-media/r/00001.jpg",
+        }
+        package = {
+            "source": {"message": [{"type": "forward", "data": {"id": "root"}}]},
+            "forward_records": {
+                "root": {
+                    "messages": [
+                        {
+                            "sender": {"nickname": "Bob"},
+                            "message": [
+                                {
+                                    "type": "reply",
+                                    "data": {
+                                        "id": "source-message",
+                                        "omm_quoted_message": {
+                                            "sender": {"nickname": "Alice"},
+                                            "time": 1710000000,
+                                            "message": [
+                                                {
+                                                    "type": "image",
+                                                    "data": quoted_image,
+                                                }
+                                            ],
+                                        },
+                                    },
+                                },
+                                {"type": "text", "data": {"text": "看这里"}},
+                            ],
+                        }
+                    ]
+                }
+            },
+        }
+
+        entries = onebot._archive_media_entries(package)
+        view = onebot.chat_record_view(
+            package,
+            media_url_factory=lambda index, _kind: f"/media/{index}",
+        )
+        rebuilt, degraded = onebot._prepare_sendable_segments(
+            package["forward_records"]["root"]["messages"][0]["message"],
+            degrade_media=True,
+        )
+
+        self.assertEqual(entries, [("image", quoted_image)])
+        self.assertEqual(view[0]["quotes"][0]["sender"], "Alice")
+        self.assertEqual(view[0]["quotes"][0]["media"][0]["index"], 1)
+        self.assertTrue(view[0]["quotes"][0]["media"][0]["quoted"])
+        self.assertEqual(degraded, 1)
+        self.assertEqual(rebuilt[0]["data"]["text"], "[引用内容] ")
+        self.assertIn("资源已失效", rebuilt[1]["data"]["text"])
+        self.assertEqual(rebuilt[-1]["data"]["text"], "看这里")
+
+    def test_chat_record_media_path_serves_saved_images_and_videos_under_root(self):
         from types import SimpleNamespace
 
         from src.webui import WebUI
@@ -2042,6 +3350,8 @@ class TestOneBot(unittest.TestCase):
             media.mkdir(parents=True)
             image = media / "00001.gif"
             image.write_bytes(b"GIF89a")
+            video = media / "00002.mp4"
+            video.write_bytes(b"video")
             package = {
                 "source": {
                     "self_id": 123,
@@ -2058,13 +3368,19 @@ class TestOneBot(unittest.TestCase):
                                         "data": {
                                             "local_path": "chat-record-media/record/00001.gif"
                                         },
-                                    }
+                                    },
+                                    {
+                                        "type": "video",
+                                        "data": {
+                                            "local_path": "chat-record-media/record/00002.mp4"
+                                        },
+                                    },
                                 ]
                             }
                         ]
                     }
                 },
-                "summary": {"node_count": 1, "record_count": 1, "media_count": 1},
+                "summary": {"node_count": 1, "record_count": 1, "media_count": 2},
             }
             db = MemeDB(root / "memes.db")
             try:
@@ -2080,7 +3396,7 @@ class TestOneBot(unittest.TestCase):
                     result = ui._get_chat_record_media_path(saved["id"], 1)
                     video_result = ui._get_chat_record_media_path(saved["id"], 2)
                 self.assertTrue(os.path.samefile(result, image))
-                self.assertEqual(video_result, "")
+                self.assertTrue(os.path.samefile(video_result, video))
             finally:
                 db.close()
 
@@ -2272,6 +3588,13 @@ class TestLibraryEvents(unittest.TestCase):
         self.assertTrue(notify_changed("structure"))
         self.assertEqual(receiver.kinds, ["content", "structure"])
 
+    def test_notification_without_registered_window_is_ignored(self):
+        from src.library_events import notify_changed, set_change_callback
+
+        set_change_callback(None)
+
+        self.assertFalse(notify_changed("content"))
+
     def test_chat_archive_notifies_library_after_database_commit(self):
         from src import library_events
 
@@ -2304,37 +3627,90 @@ class TestBulkRead(unittest.TestCase):
     def test_guarded_read_pauses_after_one_batch(self):
         from src import bulk_read
 
-        old_count = bulk_read._GATE._count
-        try:
-            bulk_read._GATE._count = 0
-            with mock.patch.object(bulk_read, "enabled", return_value=True):
-                with mock.patch.object(bulk_read.time, "sleep") as pause:
-                    for _ in range(bulk_read.BULK_READ_BATCH_SIZE):
-                        with bulk_read.guarded_read():
-                            pass
-                    pause.assert_called_once_with(bulk_read.BULK_READ_PAUSE_SECONDS)
-            self.assertEqual(bulk_read._GATE._count, 0)
-        finally:
-            bulk_read._GATE._count = old_count
+        gate = bulk_read._BulkReadGate()
+        started = bulk_read.time.monotonic()
+        with (
+            mock.patch.object(bulk_read, "_GATE", gate),
+            mock.patch.object(bulk_read, "enabled", return_value=True),
+        ):
+            for _ in range(bulk_read.BULK_READ_BATCH_SIZE):
+                with bulk_read.guarded_read():
+                    pass
+        self.assertEqual(gate._count, 0)
+        self.assertGreaterEqual(
+            gate._cooldown_until,
+            started + bulk_read.BULK_READ_PAUSE_SECONDS,
+        )
 
     def test_guarded_read_uses_configurable_batch_and_pause(self):
         from src import bulk_read
 
-        old_count = bulk_read._GATE._count
-        try:
-            bulk_read._GATE._count = 0
-            with (
-                mock.patch.object(bulk_read, "enabled", return_value=True),
-                mock.patch.object(bulk_read, "limits", return_value=(3, 0.25)),
-                mock.patch.object(bulk_read.time, "sleep") as pause,
-            ):
-                for _ in range(3):
-                    with bulk_read.guarded_read():
-                        pass
-                pause.assert_called_once_with(0.25)
-            self.assertEqual(bulk_read._GATE._count, 0)
-        finally:
-            bulk_read._GATE._count = old_count
+        gate = bulk_read._BulkReadGate()
+        started = bulk_read.time.monotonic()
+        with (
+            mock.patch.object(bulk_read, "_GATE", gate),
+            mock.patch.object(bulk_read, "enabled", return_value=True),
+            mock.patch.object(bulk_read, "limits", return_value=(3, 0.25)),
+        ):
+            for _ in range(3):
+                with bulk_read.guarded_read():
+                    pass
+        self.assertEqual(gate._count, 0)
+        self.assertGreaterEqual(gate._cooldown_until, started + 0.25)
+
+    def test_critical_read_bypasses_existing_cooldown(self):
+        from src import bulk_read
+
+        gate = bulk_read._BulkReadGate()
+        gate._cooldown_until = bulk_read.time.monotonic() + 30
+        with mock.patch.object(bulk_read, "limits", return_value=(1000, 0)):
+            started = bulk_read.time.monotonic()
+            with gate.operation("critical"):
+                pass
+        self.assertLess(bulk_read.time.monotonic() - started, 0.2)
+
+    def test_waiting_critical_read_runs_before_queued_background_read(self):
+        from src import bulk_read
+
+        gate = bulk_read._BulkReadGate()
+        active_entered = threading.Event()
+        release_active = threading.Event()
+        order = []
+
+        def run_active():
+            with gate.operation("background"):
+                order.append("active")
+                active_entered.set()
+                release_active.wait(2)
+
+        def run_waiter(name, priority):
+            with gate.operation(priority):
+                order.append(name)
+
+        with mock.patch.object(bulk_read, "limits", return_value=(1000, 0)):
+            active = threading.Thread(target=run_active)
+            background = threading.Thread(
+                target=run_waiter, args=("background", "background")
+            )
+            critical = threading.Thread(
+                target=run_waiter, args=("critical", "critical")
+            )
+            active.start()
+            self.assertTrue(active_entered.wait(1))
+            background.start()
+            critical.start()
+            deadline = bulk_read.time.monotonic() + 1
+            while bulk_read.time.monotonic() < deadline:
+                with gate._condition:
+                    if gate._waiting[0] and gate._waiting[2]:
+                        break
+                bulk_read.time.sleep(0.005)
+            release_active.set()
+            active.join(1)
+            critical.join(1)
+            background.join(1)
+
+        self.assertEqual(order, ["active", "critical", "background"])
 
     def test_limit_values_are_clamped(self):
         from src import bulk_read
@@ -2363,7 +3739,6 @@ class TestBulkRead(unittest.TestCase):
         self.assertTrue(normalized["bulk_read_prefetch_pages"])
         self.assertEqual(normalized["theme"], "dark")
 
-
 class TestManifest(unittest.TestCase):
     def setUp(self):
         self.tmp_dir = Path(tempfile.mkdtemp())
@@ -2371,6 +3746,39 @@ class TestManifest(unittest.TestCase):
 
     def tearDown(self):
         shutil.rmtree(self.tmp_dir, ignore_errors=True)
+
+    def test_collection_tree_preserves_explicit_empty_paths(self):
+        from src import manifest
+
+        db = mock.MagicMock()
+        db.get_collections.return_value = [
+            (1, "角色", None, 0),
+            (2, "爱丽丝", 1, 0),
+            (3, "问候", 2, 0),
+        ]
+        db.search.return_value = []
+
+        result = manifest._build_collection_tree(db)
+
+        self.assertEqual(
+            result,
+            [
+                {
+                    "name": "角色",
+                    "filenames": [],
+                    "children": [
+                        {
+                            "name": "爱丽丝",
+                            "filenames": [],
+                            "children": [
+                                {"name": "问候", "filenames": []}
+                            ],
+                        }
+                    ],
+                }
+            ],
+        )
+        db.delete_collection.assert_not_called()
 
     def test_update_meme_name_rewrites_only_local_manifest_metadata(self):
         from src import manifest
@@ -2419,10 +3827,113 @@ class TestManifest(unittest.TestCase):
         self.index_path.write_text(
             json.dumps({"version": 4, "memes": []}), encoding="utf-8"
         )
-        with mock.patch.object(
-            manifest, "_index_path", return_value=self.index_path
-        ):
+        with mock.patch.object(manifest, "_index_path", return_value=self.index_path):
             self.assertFalse(manifest.update_meme_name("missing.png", "新标题"))
+
+    def test_incremental_updates_do_not_wait_for_full_rebuild_lock(self):
+        from src import manifest
+
+        lock_acquired = threading.Event()
+        release_lock = threading.Event()
+
+        def hold_manifest_lock():
+            with manifest._MANIFEST_LOCK:
+                lock_acquired.set()
+                release_lock.wait(2)
+
+        holder = threading.Thread(target=hold_manifest_lock)
+        holder.start()
+        self.assertTrue(lock_acquired.wait(1))
+        try:
+            started = time.monotonic()
+            self.assertFalse(manifest.update_meme_name("busy.png", "新标题"))
+            self.assertFalse(manifest.update_meme_structure(7, "busy.png"))
+            self.assertLess(time.monotonic() - started, 0.2)
+        finally:
+            release_lock.set()
+            holder.join(1)
+        self.assertFalse(holder.is_alive())
+
+    def test_update_meme_structure_refreshes_metadata_without_reading_originals(self):
+        from src import manifest
+
+        original = {
+            "version": 4,
+            "memes": [
+                {
+                    "filename": "old.png",
+                    "name": "旧标题",
+                    "sha256": "old-hash",
+                    "file_size": 100,
+                    "mtime": "456",
+                    "category_path": [],
+                    "storage_path": "old.png",
+                    "future_field": "保留",
+                },
+                {"filename": "untouched.png", "name": "保持不变"},
+            ],
+            "collections": [],
+            "categories": [],
+        }
+        self.index_path.write_text(
+            json.dumps(original, ensure_ascii=False), encoding="utf-8"
+        )
+        db = mock.MagicMock()
+        db.get_by_id.return_value = {
+            "id": 7,
+            "filename": "new.png",
+            "original_name": "新标题",
+            "file_hash": "new-hash",
+            "file_size": 321,
+            "category_id": 9,
+        }
+        db.get_category_path_names.return_value = ["角色", "爱丽丝"]
+        collections = [{"name": "收藏", "filenames": ["new.png"]}]
+        categories = [{"name": "角色", "children": [{"name": "爱丽丝"}]}]
+
+        with (
+            mock.patch.object(manifest, "_index_path", return_value=self.index_path),
+            mock.patch.object(manifest, "get_db", return_value=db),
+            mock.patch.object(
+                manifest, "_build_collection_tree", return_value=collections
+            ),
+            mock.patch.object(
+                manifest, "_build_category_tree", return_value=categories
+            ),
+            mock.patch.object(
+                manifest, "guarded_read", side_effect=AssertionError("不应访问原件")
+            ),
+        ):
+            updated = manifest.update_meme_structure(7, "old.png")
+
+        self.assertTrue(updated)
+        result = json.loads(self.index_path.read_text(encoding="utf-8"))
+        entry = result["memes"][0]
+        self.assertEqual(entry["filename"], "new.png")
+        self.assertEqual(entry["name"], "新标题")
+        self.assertEqual(entry["sha256"], "new-hash")
+        self.assertEqual(entry["file_size"], 321)
+        self.assertEqual(entry["mtime"], "456")
+        self.assertEqual(entry["category_path"], ["角色", "爱丽丝"])
+        self.assertEqual(entry["storage_path"], "角色/爱丽丝/new.png")
+        self.assertEqual(entry["future_field"], "保留")
+        self.assertEqual(result["memes"][1], original["memes"][1])
+        self.assertEqual(result["collections"], collections)
+        self.assertEqual(result["categories"], categories)
+
+    def test_update_meme_structure_requests_fallback_when_entry_is_missing(self):
+        from src import manifest
+
+        self.index_path.write_text(
+            json.dumps({"version": 4, "memes": []}), encoding="utf-8"
+        )
+        db = mock.MagicMock()
+        db.get_by_id.return_value = {"id": 7, "filename": "new.png"}
+        with (
+            mock.patch.object(manifest, "_index_path", return_value=self.index_path),
+            mock.patch.object(manifest, "get_db", return_value=db),
+        ):
+            self.assertFalse(manifest.update_meme_structure(7, "old.png"))
 
 
 class TestQQDragTarget(unittest.TestCase):
@@ -2514,9 +4025,7 @@ class TestQQDragTarget(unittest.TestCase):
             },
         ):
             error = {}
-            target = qq_drag._plugin_target(
-                "http://127.0.0.1:6099", "secret", error
-            )
+            target = qq_drag._plugin_target("http://127.0.0.1:6099", "secret", error)
 
         self.assertIsNone(target)
         self.assertIn("未经", error["error"])
@@ -2570,9 +4079,7 @@ class TestQQDragTarget(unittest.TestCase):
             time.sleep(0.1)
             return []
 
-        with mock.patch.object(
-            qq_drag, "_qq_header_candidates", side_effect=slow_read
-        ):
+        with mock.patch.object(qq_drag, "_qq_header_candidates", side_effect=slow_read):
             with self.assertRaisesRegex(RuntimeError, "超时"):
                 qq_drag._qq_header_candidates_with_timeout(123, timeout=0.01)
 
@@ -2652,6 +4159,300 @@ class TestDatabase(unittest.TestCase):
 
         shutil.rmtree(self.tmp_dir, ignore_errors=True)
 
+    def test_chat_record_locations_survive_refresh_and_stale_detail_edits(self):
+        source = {"self_id": 123, "message_id": 99, "message_type": "group",
+                  "group_id": 456, "real_seq": 100}
+        saved = self.db.save_chat_record({
+            "title": "原记录", "source": source, "summary": {"node_count": 2},
+        })
+        record_id = saved["id"]
+        self.db.update_chat_record_details(record_id, [], name="自定义名称")
+        stale = self.db.get_chat_record(record_id)
+        folder = stale["_omm_media_folder"]
+        backup = {**source, "message_id": 999, "group_id": 789, "real_seq": 200}
+        self.assertTrue(self.db.add_chat_record_source(record_id, backup))
+        self.assertTrue(self.db.add_chat_record_source(record_id, {**backup, "message_id": 998}))
+        self.db.update_chat_record_details(record_id, [], package=stale)
+        refreshed = {"title": "重新读取", "source": backup, "summary": {"node_count": 2}}
+        self.assertEqual(self.db.save_chat_record(refreshed, record_id=record_id),
+                         {"id": record_id, "created": False})
+        entry = self.db.get_chat_record_entry(record_id)
+        self.assertEqual(entry["name"], "自定义名称")
+        self.assertEqual(entry["media_folder"], folder)
+        locations = onebot.chat_record_sources(entry["package"])
+        self.assertEqual({item["real_seq"] for item in locations}, {100, 200})
+        self.assertEqual(len(locations), 2)
+        self.assertEqual(self.db.count_chat_records(), 1)
+        from src.webui import JsApi
+
+        api = JsApi.__new__(JsApi)
+        api._db = self.db
+        self.assertEqual(len(api.get_chat_record_details(record_id)["source_locations"]), 2)
+
+    def _save_test_chat(self, message_id: int):
+        return self.db.save_chat_record(
+            {
+                "schema_version": 1,
+                "title": f"测试记录 {message_id}",
+                "source": {
+                    "self_id": 1,
+                    "message_id": message_id,
+                    "message_type": "private",
+                    "user_id": 2,
+                },
+                "forward_records": {},
+                "summary": {"node_count": 1, "record_count": 1},
+            }
+        )
+
+    def test_category_delete_modes_promote_or_remove_subtree(self):
+        parent = self.db.create_category("父类别")
+        node = self.db.create_category("待删除", parent)
+        child = self.db.create_category("保留子级", node)
+        direct_meme = self.db.add_meme("category-direct.png")
+        child_meme = self.db.add_meme("category-child.png")
+        direct_chat = self._save_test_chat(101)
+        child_chat = self._save_test_chat(102)
+        self.db.set_meme_category(direct_meme, node)
+        self.db.set_meme_category(child_meme, child)
+        self.db.set_chat_category(direct_chat["id"], node)
+        self.db.set_chat_category(child_chat["id"], child)
+
+        promoted = self.db.delete_category(node, mode="promote")
+
+        self.assertEqual(promoted["parent_id"], parent)
+        self.assertEqual(promoted["deleted_ids"], [node])
+        self.assertIsNone(self.db.get_category(node))
+        self.assertEqual(self.db.get_category(child)["parent_id"], parent)
+        self.assertEqual(self.db.get_meme_category(direct_meme)["id"], parent)
+        self.assertEqual(self.db.get_meme_category(child_meme)["id"], child)
+        self.assertEqual(self.db.get_chat_category(direct_chat["id"])["id"], parent)
+        self.assertEqual(self.db.get_chat_category(child_chat["id"])["id"], child)
+
+        cascade_node = self.db.create_category("删除子树", parent)
+        cascade_child = self.db.create_category("一并删除", cascade_node)
+        cascade_meme = self.db.add_meme("category-cascade.png")
+        cascade_chat = self._save_test_chat(103)
+        self.db.set_meme_category(cascade_meme, cascade_child)
+        self.db.set_chat_category(cascade_chat["id"], cascade_node)
+
+        cascaded = self.db.delete_category(cascade_node, mode="cascade")
+
+        self.assertEqual(set(cascaded["deleted_ids"]), {cascade_node, cascade_child})
+        self.assertIsNone(self.db.get_category(cascade_node))
+        self.assertIsNone(self.db.get_category(cascade_child))
+        self.assertEqual(self.db.get_meme_category(cascade_meme)["id"], parent)
+        self.assertEqual(self.db.get_chat_category(cascade_chat["id"])["id"], parent)
+
+    def test_collection_delete_modes_promote_or_remove_subtree(self):
+        parent = self.db.create_collection("父分组")
+        node = self.db.create_collection("待删除", parent)
+        child = self.db.create_collection("保留子级", node)
+        direct_meme = self.db.add_meme("collection-direct.png")
+        child_meme = self.db.add_meme("collection-child.png")
+        direct_chat = self._save_test_chat(201)
+        child_chat = self._save_test_chat(202)
+        self.db.add_to_collection(direct_meme, node)
+        self.db.add_to_collection(child_meme, child)
+        self.db.add_to_chat_collection(direct_chat["id"], node)
+        self.db.add_to_chat_collection(child_chat["id"], child)
+
+        promoted = self.db.delete_collection(node, mode="promote")
+
+        self.assertEqual(promoted["parent_id"], parent)
+        self.assertEqual(promoted["deleted_ids"], [node])
+        self.assertEqual(
+            next(item for item in self.db.get_collections() if item[0] == child)[2],
+            parent,
+        )
+        self.assertEqual(
+            [item["id"] for item in self.db.get_meme_collections(direct_meme)],
+            [parent],
+        )
+        self.assertEqual(
+            [item["id"] for item in self.db.get_meme_collections(child_meme)],
+            [child],
+        )
+        self.assertEqual(
+            [item["id"] for item in self.db.get_chat_collections(direct_chat["id"])],
+            [parent],
+        )
+        self.assertEqual(
+            [item["id"] for item in self.db.get_chat_collections(child_chat["id"])],
+            [child],
+        )
+
+        cascade_node = self.db.create_collection("删除子树", parent)
+        cascade_child = self.db.create_collection("一并删除", cascade_node)
+        cascade_meme = self.db.add_meme("collection-cascade.png")
+        cascade_chat = self._save_test_chat(203)
+        self.db.add_to_collection(cascade_meme, cascade_child)
+        self.db.add_to_chat_collection(cascade_chat["id"], cascade_node)
+
+        cascaded = self.db.delete_collection(cascade_node, mode="cascade")
+
+        self.assertEqual(set(cascaded["deleted_ids"]), {cascade_node, cascade_child})
+        remaining_ids = {item[0] for item in self.db.get_collections()}
+        self.assertNotIn(cascade_node, remaining_ids)
+        self.assertNotIn(cascade_child, remaining_ids)
+        self.assertEqual(
+            [item["id"] for item in self.db.get_meme_collections(cascade_meme)],
+            [parent],
+        )
+        self.assertEqual(
+            [item["id"] for item in self.db.get_chat_collections(cascade_chat["id"])],
+            [parent],
+        )
+
+    def test_category_delete_api_moves_files_for_each_mode(self):
+        from src.webui import JsApi, WebUI
+
+        cache = self.tmp_dir / "category-delete-cache"
+        cfg = Config(self.tmp_dir / "category-delete-config.json")
+        cfg.set("cache_dir", str(cache))
+        webui = WebUI.__new__(WebUI)
+        webui._cfg = cfg
+        webui._file_cache = {}
+        api = JsApi.__new__(JsApi)
+        api._db = self.db
+        api._cfg = cfg
+        api._webui = webui
+
+        parent = self.db.create_category("父类别")
+        promote_node = self.db.create_category("提升节点", parent)
+        promote_child = self.db.create_category("保留子级", promote_node)
+        empty_grandchild = self.db.create_category("空孙级", promote_child)
+        direct = cache / "父类别" / "提升节点" / "direct.png"
+        nested = cache / "父类别" / "提升节点" / "保留子级" / "nested.png"
+        direct.parent.mkdir(parents=True)
+        nested.parent.mkdir(parents=True)
+        (cache / "父类别" / "提升节点" / "保留子级" / "空孙级").mkdir()
+        direct.write_bytes(b"direct")
+        nested.write_bytes(b"nested")
+        direct_id = self.db.add_meme("direct.png")
+        nested_id = self.db.add_meme("nested.png")
+        self.db.set_meme_category(direct_id, promote_node)
+        self.db.set_meme_category(nested_id, promote_child)
+
+        with mock.patch("src.webui.request_manifest_rebuild") as rebuild:
+            promoted = api.delete_category(promote_node, "promote")
+
+        self.assertTrue(promoted["ok"])
+        self.assertTrue((cache / "父类别" / "direct.png").is_file())
+        self.assertTrue((cache / "父类别" / "保留子级" / "nested.png").is_file())
+        self.assertTrue((cache / "父类别" / "保留子级" / "空孙级").is_dir())
+        self.assertEqual(self.db.get_category(promote_child)["parent_id"], parent)
+        self.assertEqual(
+            self.db.get_category(empty_grandchild)["parent_id"], promote_child
+        )
+        rebuild.assert_called_once_with()
+
+        cascade_node = self.db.create_category("删除节点", parent)
+        cascade_child = self.db.create_category("删除子级", cascade_node)
+        cascade_direct = cache / "父类别" / "删除节点" / "cascade-direct.png"
+        cascade_nested = (
+            cache / "父类别" / "删除节点" / "删除子级" / "cascade-nested.png"
+        )
+        cascade_direct.parent.mkdir(parents=True)
+        cascade_nested.parent.mkdir(parents=True)
+        cascade_direct.write_bytes(b"direct")
+        cascade_nested.write_bytes(b"nested")
+        cascade_direct_id = self.db.add_meme("cascade-direct.png")
+        cascade_nested_id = self.db.add_meme("cascade-nested.png")
+        self.db.set_meme_category(cascade_direct_id, cascade_node)
+        self.db.set_meme_category(cascade_nested_id, cascade_child)
+
+        with mock.patch("src.webui.request_manifest_rebuild") as rebuild:
+            cascaded = api.delete_category(cascade_node, "cascade")
+
+        self.assertTrue(cascaded["ok"])
+        self.assertTrue((cache / "父类别" / "cascade-direct.png").is_file())
+        self.assertTrue((cache / "父类别" / "cascade-nested.png").is_file())
+        self.assertFalse((cache / "父类别" / "删除节点").exists())
+        self.assertIsNone(self.db.get_category(cascade_child))
+        rebuild.assert_called_once_with()
+
+    def test_root_subtree_deletion_keeps_content_but_clears_assignment(self):
+        category = self.db.create_category("根类别")
+        subcategory = self.db.create_category("子类别", category)
+        category_meme = self.db.add_meme("root-category.png")
+        self.db.set_meme_category(category_meme, subcategory)
+
+        collection = self.db.create_collection("根分组")
+        subcollection = self.db.create_collection("子分组", collection)
+        collection_meme = self.db.add_meme("root-collection.png")
+        self.db.add_to_collection(collection_meme, subcollection)
+
+        self.db.delete_category(category, mode="cascade")
+        self.db.delete_collection(collection, mode="cascade")
+
+        self.assertIsNone(self.db.get_by_id(category_meme)["category_id"])
+        self.assertEqual(self.db.get_meme_collections(collection_meme), [])
+        self.assertIsNotNone(self.db.get_by_id(category_meme))
+        self.assertIsNotNone(self.db.get_by_id(collection_meme))
+
+    def test_hierarchy_delete_mode_defaults_to_ask_and_can_be_saved(self):
+        from src.webui import JsApi, WebUI
+
+        cfg = Config(self.tmp_dir / "delete-mode-config.json")
+        api = JsApi.__new__(JsApi)
+        api._cfg = cfg
+
+        self.assertEqual(api.get_hierarchy_delete_mode(), "ask")
+        self.assertTrue(api.set_hierarchy_delete_mode("cascade")["ok"])
+        self.assertEqual(api.get_hierarchy_delete_mode(), "cascade")
+        self.assertFalse(api.set_hierarchy_delete_mode("invalid")["ok"])
+        self.assertEqual(api.get_hierarchy_delete_mode(), "cascade")
+
+    def test_recent_usage_automatic_setting_and_explicit_marking(self):
+        from src.webui import JsApi
+
+        meme_id = self.db.add_meme("recent-setting.png")
+        cfg = Config(self.tmp_dir / "recent-setting-config.json")
+        api = JsApi.__new__(JsApi)
+        api._db = self.db
+        api._cfg = cfg
+
+        self.assertTrue(api._record_recent_meme(meme_id))
+        self.assertEqual(
+            [row["id"] for row in self.db.get_recent()],
+            [meme_id],
+        )
+        self.db.clear_recent()
+        cfg.set("record_recent_use", False)
+        self.assertFalse(api._record_recent_meme(meme_id))
+        self.assertEqual(self.db.get_recent(), [])
+        # 重复导入后的显式定位是用户要求的动作，不受自动记录开关影响。
+        self.assertEqual(
+            api.record_meme_uses([meme_id, meme_id, "invalid"]),
+            {"ok": True, "ids": [meme_id]},
+        )
+        self.assertEqual([row["id"] for row in self.db.get_recent()], [meme_id])
+
+    def test_recent_usage_frontend_refresh_contract(self):
+        root = Path(__file__).resolve().parent.parent
+        app = (root / "src" / "vue-src" / "App.vue").read_text(
+            encoding="utf-8"
+        )
+        composable = (
+            root / "src" / "vue-src" / "composables" / "useMemes.ts"
+        ).read_text(encoding="utf-8")
+        backend = (root / "src" / "webui.py").read_text(encoding="utf-8")
+
+        recent_block = composable.split(
+            "async function refreshRecentUsage", 1
+        )[1].split("async function reorderMemes", 1)[0]
+        self.assertIn("await refreshCollections()", recent_block)
+        self.assertIn("state.activeCollection === -3", recent_block)
+        self.assertIn("await search()", recent_block)
+        self.assertIn("if (result?.ok) await refreshRecentUsage()", app)
+        self.assertIn("void refreshRecentUsage()", app)
+        self.assertIn("window.refreshRecent =", app)
+        self.assertIn("window.refreshRecent&&window.refreshRecent()", backend)
+        self.assertIn("async function revealExistingImports", app)
+        self.assertIn("state.activeCollection = -3", app)
+        self.assertIn("record_meme_uses", app)
+
     def test_chat_record_save_is_complete_and_idempotent(self):
         package = {
             "schema_version": 1,
@@ -2707,6 +4508,97 @@ class TestDatabase(unittest.TestCase):
         self.db.delete_all()
         self.assertEqual(self.db.count_chat_records(), 0)
 
+    def test_chat_record_name_and_media_folder_are_editable_and_persistent(self):
+        from src.webui import JsApi, WebUI
+
+        package = {
+            "schema_version": 1,
+            "title": "原始聊天摘要",
+            "source": {
+                "self_id": 123,
+                "message_id": 654,
+                "message_type": "private",
+                "user_id": 456,
+            },
+            "forward_records": {
+                "root": {
+                    "messages": [
+                        {
+                            "message": [
+                                {
+                                    "type": "image",
+                                    "data": {},
+                                }
+                            ]
+                        }
+                    ]
+                }
+            },
+            "summary": {"node_count": 1, "record_count": 1},
+        }
+        saved = self.db.save_chat_record(package)
+        entry = self.db.get_chat_record_entry(saved["id"])
+        old_folder = entry["media_folder"]
+        cache = self.tmp_dir / "chat-name-cache"
+        media = cache / "chat-record-media" / old_folder / "00001.gif"
+        media.parent.mkdir(parents=True)
+        media.write_bytes(b"GIF89a-test")
+        stored = self.db.get_chat_record(saved["id"])
+        stored["forward_records"]["root"]["messages"][0]["message"][0][
+            "data"
+        ]["local_path"] = f"chat-record-media/{old_folder}/00001.gif"
+        self.db.save_chat_record(stored)
+
+        cfg = Config(self.tmp_dir / "chat-name-config.json")
+        cfg.set("cache_dir", str(cache))
+        api = JsApi.__new__(JsApi)
+        api._db = self.db
+        api._cfg = cfg
+        result = api.update_chat_record_details(
+            saved["id"],
+            {
+                "name": "人工命名的聊天记录",
+                "media_folder": "项目讨论记录",
+                "tags": [],
+            },
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["name"], "人工命名的聊天记录")
+        self.assertEqual(result["media_folder"], "项目讨论记录")
+        self.assertFalse(media.parent.exists())
+        renamed = cache / "chat-record-media" / "项目讨论记录" / "00001.gif"
+        self.assertTrue(renamed.is_file())
+        changed = self.db.get_chat_record_entry(saved["id"])
+        self.assertEqual(changed["name"], "人工命名的聊天记录")
+        self.assertEqual(changed["media_folder"], "项目讨论记录")
+        changed_data = changed["package"]["forward_records"]["root"][
+            "messages"
+        ][0]["message"][0]["data"]
+        self.assertEqual(
+            changed_data["local_path"],
+            "chat-record-media/项目讨论记录/00001.gif",
+        )
+        webui = WebUI.__new__(WebUI)
+        webui._cfg = cfg
+        with mock.patch("src.webui.get_db", return_value=self.db):
+            preview_path = webui._get_chat_record_media_path(saved["id"], 1)
+        self.assertTrue(os.path.samefile(preview_path, renamed))
+        self.assertEqual(
+            self.db.list_chat_records(keyword="人工命名")[0]["id"], saved["id"]
+        )
+        self.assertEqual(
+            self.db.list_chat_records(keyword="项目讨论记录")[0]["id"], saved["id"]
+        )
+
+        refreshed = self.db.get_chat_record(saved["id"])
+        refreshed["title"] = "重新读取的来源摘要"
+        self.db.save_chat_record(refreshed)
+        persisted = self.db.get_chat_record_entry(saved["id"])
+        self.assertEqual(persisted["title"], "重新读取的来源摘要")
+        self.assertEqual(persisted["name"], "人工命名的聊天记录")
+        self.assertEqual(persisted["media_folder"], "项目讨论记录")
+
     def test_genre_filters_and_unified_library_keep_system_genres_separate(self):
         from types import SimpleNamespace
 
@@ -2729,9 +4621,7 @@ class TestDatabase(unittest.TestCase):
                     "messages": [
                         {
                             "sender": {"nickname": "Alice"},
-                            "message": [
-                                {"type": "text", "data": {"text": "确认方案"}}
-                            ],
+                            "message": [{"type": "text", "data": {"text": "确认方案"}}],
                         }
                     ]
                 }
@@ -2749,7 +4639,8 @@ class TestDatabase(unittest.TestCase):
             [row["id"] for row in self.db.search(genre="image")], [image_id]
         )
         self.assertEqual(
-            [row["id"] for row in self.db.search(genre="gif")], [gif_id]
+            [row["id"] for row in self.db.search(genre="gif")],
+            [gif_id],
         )
         self.assertEqual(self.db.count(genre="image"), 1)
         self.assertEqual(self.db.count_chat_records("项目"), 1)
@@ -2769,6 +4660,233 @@ class TestDatabase(unittest.TestCase):
         self.assertEqual(details["genre_label"], "聊天记录")
         self.assertEqual(details["messages"][0]["preview"], "确认方案")
         self.assertEqual(details["send_command"], "/omm send 1")
+
+    def test_library_genre_multiselect_unions_and_paginates_all_combinations(self):
+        from itertools import combinations
+        from types import SimpleNamespace
+
+        from src.webui import JsApi
+
+        image = self.db.add_meme("multiselect.png", tags=["共同"])
+        gif = self.db.add_meme("multiselect.gif", mime_type="image/gif", tags=["共同"])
+        chats = [self._save_test_chat(9201), self._save_test_chat(9202)]
+        group = self.db.create_collection("多选范围")
+        child = self.db.create_collection("子分组", group)
+        category = self.db.create_category("多选类别")
+        for meme_id in (image, gif):
+            self.db.add_to_collection(meme_id, child)
+            self.db.set_meme_category(meme_id, category)
+        for chat in chats:
+            self.db.add_to_chat_collection(chat["id"], child)
+            self.db.set_chat_category(chat["id"], category)
+            self.db.update_chat_record_details(chat["id"], ["共同"])
+        hidden = self.db.ensure_hidden_collection()
+        hidden_meme = self.db.add_meme("excluded.gif", mime_type="image/gif")
+        self.db.add_to_collection(hidden_meme, hidden)
+        hidden_chat = self._save_test_chat(9203)
+        self.db.add_to_chat_collection(hidden_chat["id"], hidden)
+        self.db.add_meme("carrier.gif", stego_of_hash="source")
+        api = JsApi.__new__(JsApi)
+        api._db = self.db
+        api._cfg = Config(self.tmp_dir / "multiselect-config.json")
+        api._webui = SimpleNamespace()
+
+        for size in range(4):
+            for selected in combinations(("image", "gif", "chat_record"), size):
+                genres = list(selected)
+                with self.subTest(genres=genres):
+                    expected_memes = set()
+                    if "image" in genres:
+                        expected_memes.add(image)
+                    if "gif" in genres:
+                        expected_memes.add(gif)
+                    expected_chats = (
+                        {chat["id"] for chat in chats}
+                        if "chat_record" in genres
+                        else set()
+                    )
+                    result = api.search_library(genre=genres)
+                    total = len(expected_memes) + len(expected_chats)
+                    self.assertEqual(result["total"], total)
+                    self.assertEqual(result["chat_total"], len(expected_chats))
+                    self.assertEqual(
+                        {row["id"] for row in result["memes"]}, expected_memes
+                    )
+                    self.assertEqual(
+                        {row["id"] for row in result["chat_records"]}, expected_chats
+                    )
+                    self.assertEqual(api.count_library(genre=genres), total)
+                    ordered = [
+                        ("chat", row["id"]) for row in result["chat_records"]
+                    ] + [("meme", row["id"]) for row in result["memes"]]
+                    paged = []
+                    for offset in range(0, total + 2, 2):
+                        page = api.search_library(genre=genres, offset=offset, limit=2)
+                        self.assertEqual(page["total"], total)
+                        paged.extend(
+                            ("chat", row["id"]) for row in page["chat_records"]
+                        )
+                        paged.extend(("meme", row["id"]) for row in page["memes"])
+                    self.assertEqual(paged, ordered)
+                    scoped = api.search_library(
+                        genre=genres,
+                        tags=["共同"],
+                        collection_id=group,
+                        category_id=category,
+                    )
+                    self.assertEqual(scoped["total"], total)
+                    legacy = api.search_library(genre="all" if size == 3 else genres)
+                    self.assertEqual(legacy["total"], total)
+
+        self.db.toggle_favorite(gif)
+        self.db.record_use(gif)
+        for special in (-2, -3, -5):
+            result = api.search_library(
+                collection_id=special, genre=["gif", "chat_record"]
+            )
+            self.assertEqual([row["id"] for row in result["memes"]], [gif])
+            self.assertEqual(result["chat_records"], [])
+            self.assertEqual(
+                api.search_library(collection_id=special, genre=[])["total"], 0
+            )
+        self.assertEqual(
+            api.search_library(genre=["image", "chat_record"], keyword="multiselect")[
+                "total"
+            ],
+            1,
+        )
+
+    def test_multiselect_page_cache_warmup_matches_later_library_pages(self):
+        from types import SimpleNamespace
+
+        from src.webui import JsApi
+
+        for index in range(5):
+            self.db.add_meme(f"prefetch-image-{index}.png")
+            self.db.add_meme(f"prefetch-gif-{index}.gif", mime_type="image/gif")
+        for index in range(3):
+            self._save_test_chat(9300 + index)
+        warmed = []
+        api = JsApi.__new__(JsApi)
+        api._db = self.db
+        api._cfg = Config(self.tmp_dir / "multiselect-prefetch-config.json")
+        api._cfg.set("bulk_read_protection", True)
+        api._cfg.set("bulk_read_prefetch_pages", True)
+        api._webui = SimpleNamespace(
+            _get_thumbnail_path=lambda meme_id, filename, read_priority: warmed.append(
+                meme_id
+            )
+        )
+
+        class ImmediateThread:
+            def __init__(self, target, args, **_kwargs):
+                self.target = target
+                self.args = args
+
+            def start(self):
+                self.target(*self.args)
+
+        with (
+            mock.patch("src.webui.threading.Thread", ImmediateThread),
+            mock.patch("src.webui.time.sleep"),
+        ):
+            for genres in (
+                ["image", "chat_record"],
+                ["gif", "chat_record"],
+                ["image", "gif"],
+                ["image", "gif", "chat_record"],
+                ["chat_record"],
+                [],
+            ):
+                with self.subTest(genres=genres):
+                    warmed.clear()
+                    total = api.count_library(genre=genres)
+                    expected = []
+                    for offset in range(2, total, 2):
+                        expected.extend(
+                            row["id"]
+                            for row in api.search_library(
+                                genre=genres, offset=offset, limit=2
+                            )["memes"]
+                        )
+                    result = api.start_page_cache_warmup(
+                        page_size=2, total=total, genre=genres
+                    )
+                    self.assertEqual(warmed, expected)
+                    self.assertEqual(result["started"], bool(expected))
+
+    def test_chat_record_details_persist_selective_send_filters(self):
+        from src.webui import JsApi
+
+        package = {
+            "schema_version": 1,
+            "title": "可筛选记录",
+            "source": {
+                "self_id": 123,
+                "message_id": 456,
+                "message_type": "group",
+                "group_id": 789,
+                "message": [{"type": "forward", "data": {"id": "root"}}],
+            },
+            "forward_records": {
+                "root": {
+                    "messages": [
+                        {
+                            "sender": {"nickname": "Alice"},
+                            "message": [{"type": "text", "data": {"text": "保留"}}],
+                        },
+                        {
+                            "sender": {"nickname": "Ad"},
+                            "message": [{"type": "text", "data": {"text": "广告"}}],
+                        },
+                    ]
+                }
+            },
+            "summary": {
+                "node_count": 2,
+                "record_count": 1,
+                "max_depth": 1,
+                "media_count": 0,
+            },
+        }
+        saved = self.db.save_chat_record(package)
+        api = JsApi.__new__(JsApi)
+        api._db = self.db
+        api._cfg = Config(self.tmp_dir / "chat-filter-config.json")
+
+        before = api.get_chat_record_details(saved["id"])
+        self.assertEqual(
+            [message["path"] for message in before["messages"]], ["n0", "n1"]
+        )
+        result = api.update_chat_record_details(
+            saved["id"],
+            {
+                "tags": [],
+                "blocked_message_paths": ["n1"],
+            },
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["blocked_message_paths"], ["n1"])
+        self.assertEqual(result["blocked_message_count"], 1)
+        stored = self.db.get_chat_record(saved["id"])
+        self.assertEqual(
+            stored["send_filter"]["blocked_node_paths"], ["n1"]
+        )
+        after = api.get_chat_record_details(saved["id"])
+        self.assertEqual(after["blocked_message_paths"], ["n1"])
+
+        invalid = api.update_chat_record_details(
+            saved["id"],
+            {"tags": [], "blocked_message_paths": ["../../other"]},
+        )
+        self.assertFalse(invalid["ok"])
+        self.assertEqual(
+            self.db.get_chat_record(saved["id"])["send_filter"][
+                "blocked_node_paths"
+            ],
+            ["n1"],
+        )
 
     def test_page_cache_warmup_processes_only_later_filtered_pages(self):
         from types import SimpleNamespace
@@ -2791,8 +4909,8 @@ class TestDatabase(unittest.TestCase):
         api._db = self.db
         api._cfg = cfg
         api._webui = SimpleNamespace(
-            _get_thumbnail_path=lambda meme_id, filename: warmed.append(
-                (meme_id, filename)
+            _get_thumbnail_path=lambda meme_id, filename, read_priority: warmed.append(
+                (meme_id, filename, read_priority)
             )
         )
 
@@ -2805,7 +4923,7 @@ class TestDatabase(unittest.TestCase):
                 self.target(*self.args)
 
         all_rows = api._search_meme_rows("目标", [], group_id, 0, 99)
-        expected = [(row["id"], row["filename"]) for row in all_rows[2:]]
+        expected = [(row["id"], row["filename"], "background") for row in all_rows[2:]]
         with (
             mock.patch("src.webui.threading.Thread", ImmediateThread),
             mock.patch("src.webui.time.sleep"),
@@ -2816,6 +4934,327 @@ class TestDatabase(unittest.TestCase):
 
         self.assertTrue(result["started"])
         self.assertEqual(warmed, expected)
+
+    def test_webp_list_search_never_probes_virtual_drive_original(self):
+        from types import SimpleNamespace
+
+        from src.webui import JsApi
+
+        meme_id = self.db.add_meme(
+            "static.webp",
+            mime_type="image/webp",
+            original_name="本地副本缺失",
+        )
+        cfg = Config(self.tmp_dir / "webp-search-config.json")
+        api = JsApi.__new__(JsApi)
+        api._db = self.db
+        api._cfg = cfg
+        api._webui = SimpleNamespace(
+            _find_meme_file_for_row=mock.Mock(
+                side_effect=AssertionError("列表查询不应读取网盘原件")
+            )
+        )
+
+        rows = api.search_memes(limit=10)
+
+        self.assertEqual([row["id"] for row in rows], [meme_id])
+        self.assertFalse(rows[0]["is_animated"])
+        api._webui._find_meme_file_for_row.assert_not_called()
+
+    def test_meme_list_includes_sidebar_membership_metadata_in_one_batch(self):
+        from types import SimpleNamespace
+
+        from src.webui import JsApi
+
+        first_id = self.db.add_meme("first.png", mime_type="image/png")
+        second_id = self.db.add_meme("second.png", mime_type="image/png")
+        category_id = self.db.create_category("角色")
+        first_collection = self.db.create_collection("常用")
+        second_collection = self.db.create_collection("爱丽丝", first_collection)
+        self.db.set_meme_category(first_id, category_id)
+        self.db.add_memes_to_collection([first_id], first_collection)
+        self.db.add_memes_to_collection([first_id], second_collection)
+        self.db.record_use(first_id)
+
+        membership = self.db.get_meme_collection_ids_map(
+            [first_id, second_id, first_id]
+        )
+        self.assertEqual(
+            membership,
+            {
+                first_id: [first_collection, second_collection],
+                second_id: [],
+            },
+        )
+
+        api = JsApi.__new__(JsApi)
+        api._db = self.db
+        api._cfg = Config(self.tmp_dir / "sidebar-hover-config.json")
+        api._webui = SimpleNamespace()
+        rows = {row["id"]: row for row in api.search_memes(limit=10)}
+
+        self.assertEqual(rows[first_id]["category_id"], category_id)
+        self.assertTrue(rows[first_id]["recently_used"])
+        self.assertEqual(
+            rows[first_id]["collection_ids"],
+            [first_collection, second_collection],
+        )
+        self.assertIsNone(rows[second_id]["category_id"])
+        self.assertEqual(rows[second_id]["collection_ids"], [])
+        self.assertFalse(rows[second_id]["recently_used"])
+
+    def test_sidebar_virtual_roots_put_ungrouped_first_and_uncategorized_after_all(
+        self,
+    ):
+        from src.webui import JsApi
+
+        self.db.add_meme("sidebar-all.png", mime_type="image/png")
+        self._save_test_chat(9081)
+        self.db.create_category("角色")
+        api = JsApi.__new__(JsApi)
+        api._db = self.db
+        api._cfg = Config(self.tmp_dir / "category-all-config.json")
+
+        categories = api.get_categories()
+        collections = api.get_collections()
+
+        self.assertEqual(
+            [(item["id"], item["name"]) for item in categories[:2]],
+            [(-1, "全部"), (-4, "未分类")],
+        )
+        self.assertEqual(categories[0]["count"], 2)
+        self.assertEqual(categories[1]["count"], 2)
+        self.assertEqual(collections[0]["id"], -4)
+        self.assertEqual(collections[0]["name"], "未分组")
+        self.assertTrue(any(item["name"] == "角色" for item in categories))
+
+        api._cfg.set("show_uncategorized", False)
+        self.assertEqual(
+            [(item["id"], item["name"]) for item in api.get_categories()[:2]],
+            [(-1, "全部"), (-4, "未分类")],
+        )
+        self.assertEqual(api.get_collections()[0]["id"], -4)
+        self.assertEqual(api.get_collections()[0]["count"], 2)
+        self.assertEqual(
+            api.get_init_data()["collections"], api.get_collections()
+        )
+        self.assertEqual(api.search_library(collection_id=-4)["total"], 2)
+
+    def test_random_page_samples_one_page_and_only_rerolls_explicitly(self):
+        from types import SimpleNamespace
+
+        from src.webui import MEME_PAGE, JsApi
+
+        ids = [
+            self.db.add_meme(f"random-{index}.png", mime_type="image/png")
+            for index in range(MEME_PAGE + 12)
+        ]
+        hidden_root = self.db.ensure_hidden_collection()
+        hidden_child = self.db.create_collection("随机排除", hidden_root)
+        self.db.add_memes_to_collection(ids[-2:], hidden_child)
+        self.db.add_meme("random-carrier.gif", stego_of_hash="source-hash")
+        self._save_test_chat(9083)
+        api = JsApi.__new__(JsApi)
+        api._db = self.db
+        api._cfg = Config(self.tmp_dir / "random-page-config.json")
+        api._webui = SimpleNamespace()
+
+        with mock.patch.object(self.db, "search", wraps=self.db.search) as query:
+            self.assertEqual(api.get_init_data()["collections"], api.get_collections())
+            self.assertFalse(
+                any(call.kwargs.get("random_order") for call in query.call_args_list)
+            )
+            first = api.search_library(collection_id=-5)
+            first_ids = [row["id"] for row in first["memes"]]
+            self.assertEqual(first["total"], MEME_PAGE)
+            self.assertEqual(len(set(first_ids)), MEME_PAGE)
+            self.assertTrue(set(first_ids).issubset(set(ids[:-2])))
+            self.assertEqual(first["chat_records"], [])
+            self.assertEqual(first["chat_total"], 0)
+
+            api.search_library()
+            api.search_library(collection_id=-4)
+            api.get_collections()
+            self.db.toggle_favorite(first_ids[0])
+            returned = api.search_library(collection_id=-5)
+            self.assertEqual([row["id"] for row in returned["memes"]], first_ids)
+            self.assertTrue(returned["memes"][0]["favorited"])
+            self.assertEqual(
+                sum(
+                    bool(call.kwargs.get("random_order"))
+                    for call in query.call_args_list
+                ),
+                1,
+            )
+            api.search_library(collection_id=-5, refresh_random=True)
+            self.assertEqual(
+                sum(
+                    bool(call.kwargs.get("random_order"))
+                    for call in query.call_args_list
+                ),
+                2,
+            )
+
+        sampled = api.search_library(collection_id=-5)["memes"]
+        self.db.delete_meme(sampled[0]["id"])
+        self.db.add_to_collection(sampled[1]["id"], hidden_child)
+        remaining = api.search_library(collection_id=-5)
+        self.assertEqual(remaining["total"], MEME_PAGE - 2)
+        self.assertEqual(
+            [row["id"] for row in remaining["memes"]],
+            [row["id"] for row in sampled[2:]],
+        )
+        self.assertEqual(
+            api.search_library(collection_id=-5, refresh_random=True)["total"],
+            MEME_PAGE,
+        )
+
+    def test_random_page_handles_empty_small_filtered_and_hidden_libraries(self):
+        from types import SimpleNamespace
+
+        from src.webui import JsApi
+
+        api = JsApi.__new__(JsApi)
+        api._db = self.db
+        api._cfg = Config(self.tmp_dir / "random-small-config.json")
+        api._webui = SimpleNamespace()
+        self.assertEqual(api.search_library(collection_id=-5)["total"], 0)
+        image = self.db.add_meme("small.png", mime_type="image/png")
+        gif = self.db.add_meme("small.gif", mime_type="image/gif")
+        self.db.set_meme_tags(gif, ["动画"])
+        hidden = self.db.add_meme("private.png", mime_type="image/png")
+        self.db.add_to_collection(hidden, self.db.ensure_hidden_collection())
+        self.assertEqual(api.search_library(collection_id=-5)["total"], 0)
+
+        result = api.search_library(collection_id=-5, refresh_random=True)
+        ids = [row["id"] for row in result["memes"]]
+        self.assertEqual(set(ids), {image, gif})
+        self.assertEqual(result["total"], 2)
+        self.assertEqual(
+            api.search_library(collection_id=-5, offset=1, limit=1)["memes"][0]["id"],
+            ids[1],
+        )
+        self.assertEqual(api.search_library(collection_id=-5, offset=2)["memes"], [])
+        for filters in ({"genre": "gif"}, {"tags": ["动画"]}, {"keyword": "small.gif"}):
+            filtered = api.search_library(collection_id=-5, **filters)
+            self.assertEqual(filtered["total"], 1)
+            self.assertEqual([row["id"] for row in filtered["memes"]], [gif])
+        self.assertEqual(
+            api.search_library(collection_id=-5, genre="chat_record")["total"], 0
+        )
+        self.assertEqual(
+            [row["id"] for row in api.search_library(collection_id=-5)["memes"]], ids
+        )
+
+        api._cfg.set("hidden_collection_enabled", False)
+        result = api.search_library(collection_id=-5, refresh_random=True)
+        self.assertEqual({row["id"] for row in result["memes"]}, {image, gif, hidden})
+        api._cfg.set("hidden_collection_enabled", True)
+        self.assertEqual(api.search_library(collection_id=-5)["total"], 2)
+        self.assertEqual(
+            next(row for row in api.get_collections() if row["id"] == -5)["count"], 2
+        )
+        self.assertFalse(api.delete_collection(-5)["ok"])
+        self.assertFalse(api.rename_collection(-5, "别的名字"))
+
+    def test_hidden_collection_root_is_stable_and_protected(self):
+        existing = self.db.create_collection("隐藏")
+        hidden_id = self.db.ensure_hidden_collection()
+
+        self.assertEqual(hidden_id, existing)
+        self.assertEqual(self.db.ensure_hidden_collection(), hidden_id)
+        self.assertTrue(self.db.is_hidden_collection_root(hidden_id))
+        with self.assertRaisesRegex(ValueError, "不能重命名"):
+            self.db.rename_collection(hidden_id, "别的名字")
+        with self.assertRaisesRegex(ValueError, "不能删除"):
+            self.db.delete_collection(hidden_id)
+
+        child_id = self.db.create_collection("可删除子分组", hidden_id)
+        result = self.db.delete_collection(child_id)
+        self.assertIn(child_id, result["deleted_ids"])
+        self.assertTrue(self.db.is_hidden_collection_root(hidden_id))
+
+    def test_hidden_collection_filters_all_views_until_effect_is_disabled(self):
+        from types import SimpleNamespace
+
+        from src.webui import JsApi
+
+        visible_id = self.db.add_meme(
+            "visible.png", mime_type="image/png", original_name="共同关键词"
+        )
+        hidden_id = self.db.add_meme(
+            "hidden.png", mime_type="image/png", original_name="共同关键词"
+        )
+        dual_id = self.db.add_meme(
+            "dual.png", mime_type="image/png", original_name="共同关键词"
+        )
+        hidden_root = self.db.ensure_hidden_collection()
+        hidden_child = self.db.create_collection("私密", hidden_root)
+        normal_group = self.db.create_collection("普通")
+        self.db.add_memes_to_collection([hidden_id, dual_id], hidden_child)
+        self.db.add_memes_to_collection([visible_id, dual_id], normal_group)
+        self.db.toggle_favorite(hidden_id)
+        self.db.record_use(hidden_id)
+        hidden_chat = self._save_test_chat(9082)
+        self.db.add_to_chat_collection(hidden_chat["id"], hidden_child)
+
+        cfg = Config(self.tmp_dir / "hidden-collection-config.json")
+        api = JsApi.__new__(JsApi)
+        api._db = self.db
+        api._cfg = cfg
+        api._webui = SimpleNamespace()
+
+        self.assertEqual(
+            [row["id"] for row in api.search_memes(keyword="共同关键词")],
+            [visible_id],
+        )
+        self.assertEqual(
+            [row["id"] for row in api.search_memes(collection_id=normal_group)],
+            [visible_id],
+        )
+        self.assertEqual(api.search_memes(collection_id=-2), [])
+        self.assertEqual(api.search_memes(collection_id=-3), [])
+        self.assertEqual(
+            {row["id"] for row in api.search_memes(collection_id=hidden_root)},
+            {hidden_id, dual_id},
+        )
+        self.assertEqual(
+            {row["id"] for row in api.search_memes(collection_id=hidden_child)},
+            {hidden_id, dual_id},
+        )
+        self.assertEqual(api.search_library()["chat_records"], [])
+        self.assertEqual(
+            [row["id"] for row in api.search_library(
+                collection_id=hidden_root
+            )["chat_records"]],
+            [hidden_chat["id"]],
+        )
+        collections = api.get_collections()
+        hidden_node = next(item for item in collections if item["id"] == hidden_root)
+        normal_node = next(item for item in collections if item["id"] == normal_group)
+        self.assertTrue(hidden_node["system_hidden"])
+        self.assertEqual(hidden_node["count"], 3)
+        self.assertEqual(normal_node["count"], 1)
+        self.assertEqual(api.get_categories()[0]["count"], 1)
+
+        cfg.set("hidden_collection_enabled", False)
+        self.assertEqual(
+            {row["id"] for row in api.search_memes(keyword="共同关键词")},
+            {visible_id, hidden_id, dual_id},
+        )
+        self.assertEqual(
+            {row["id"] for row in api.search_memes(collection_id=normal_group)},
+            {visible_id, dual_id},
+        )
+        self.assertEqual(
+            [row["id"] for row in api.search_library()["chat_records"]],
+            [hidden_chat["id"]],
+        )
+        normal_node = next(
+            item for item in api.get_collections() if item["id"] == normal_group
+        )
+        self.assertEqual(normal_node["count"], 2)
+        self.assertEqual(api.get_categories()[0]["count"], 4)
 
     def test_page_cache_warmup_disabled_cancels_previous_generation(self):
         from types import SimpleNamespace
@@ -2991,7 +5430,12 @@ class TestDatabase(unittest.TestCase):
         api = JsApi.__new__(JsApi)
         api._db = self.db
 
-        with mock.patch("src.webui.build_manifest") as build:
+        with (
+            mock.patch(
+                "src.webui.update_manifest_meme_structure", return_value=True
+            ) as incremental,
+            mock.patch("src.webui.build_manifest") as build,
+        ):
             result = api.update_meme_details(
                 mid,
                 {
@@ -3011,7 +5455,112 @@ class TestDatabase(unittest.TestCase):
         self.assertEqual(
             [row["id"] for row in self.db.search(collection_id=new_group)], [mid]
         )
-        build.assert_called_once()
+        incremental.assert_called_once_with(mid, "group-edit.png")
+        build.assert_not_called()
+
+    def test_drag_assignment_adds_meme_and_chat_record_to_collection(self):
+        from src.webui import JsApi
+
+        meme_id = self.db.add_meme("drag-group.png", tags=["保留标签"])
+        saved = self.db.save_chat_record(
+            {
+                "schema_version": 1,
+                "title": "拖拽聊天记录",
+                "source": {
+                    "self_id": 1,
+                    "message_id": 2,
+                    "message_type": "private",
+                    "user_id": 3,
+                },
+                "forward_records": {},
+                "summary": {"node_count": 1, "record_count": 1},
+            }
+        )
+        collection_id = self.db.create_collection("拖放分组")
+        api = JsApi.__new__(JsApi)
+        api._db = self.db
+
+        with (
+            mock.patch(
+                "src.webui.update_manifest_meme_structure", return_value=True
+            ) as incremental,
+            mock.patch("src.webui.request_manifest_rebuild") as rebuild,
+        ):
+            meme_result = api.assign_library_item(
+                "meme", meme_id, "collection", collection_id
+            )
+            chat_result = api.assign_library_item(
+                "chat_record", saved["id"], "collection", collection_id
+            )
+
+        self.assertTrue(meme_result["ok"])
+        self.assertTrue(chat_result["ok"])
+        self.assertEqual(
+            [item["id"] for item in self.db.get_meme_collections(meme_id)],
+            [collection_id],
+        )
+        self.assertEqual(
+            [item["id"] for item in self.db.get_chat_collections(saved["id"])],
+            [collection_id],
+        )
+        self.assertEqual(self.db.get_meme_tags(meme_id), ["保留标签"])
+        incremental.assert_called_once_with(meme_id, "drag-group.png")
+        rebuild.assert_called_once_with()
+
+    def test_drag_assignment_moves_meme_file_and_switches_categories(self):
+        from types import SimpleNamespace
+
+        from src.webui import JsApi
+
+        old_path = self.tmp_dir / "drag-category.png"
+        new_path = self.tmp_dir / "角色" / "drag-category.png"
+        meme_id = self.db.add_meme("drag-category.png", tags=["保留标签"])
+        saved = self.db.save_chat_record(
+            {
+                "schema_version": 1,
+                "title": "类别聊天记录",
+                "source": {
+                    "self_id": 1,
+                    "message_id": 4,
+                    "message_type": "private",
+                    "user_id": 5,
+                },
+                "forward_records": {},
+                "summary": {"node_count": 1, "record_count": 1},
+            }
+        )
+        category_id = self.db.create_category("角色")
+        mover = mock.Mock(return_value=(old_path, new_path))
+        api = JsApi.__new__(JsApi)
+        api._db = self.db
+        api._webui = SimpleNamespace(
+            _move_meme_file=mover,
+            _file_cache={"drag-category.png": str(old_path)},
+        )
+
+        with (
+            mock.patch(
+                "src.webui.update_manifest_meme_structure", return_value=True
+            ),
+            mock.patch("src.webui.request_manifest_rebuild") as rebuild,
+        ):
+            meme_result = api.assign_library_item(
+                "meme", meme_id, "category", category_id
+            )
+            chat_result = api.assign_library_item(
+                "chat_record", saved["id"], "category", category_id
+            )
+
+        self.assertTrue(meme_result["ok"])
+        self.assertTrue(chat_result["ok"])
+        self.assertEqual(self.db.get_by_id(meme_id)["category_id"], category_id)
+        self.assertEqual(
+            self.db.get_chat_record_entry(saved["id"])["category_id"], category_id
+        )
+        self.assertEqual(self.db.get_meme_tags(meme_id), ["保留标签"])
+        mover.assert_called_once()
+        self.assertEqual(api._webui._file_cache["drag-category.png"], str(new_path))
+        rebuild.assert_called_once_with()
 
     def test_create_collection_api_does_not_assign_meme_until_details_save(self):
         from src.webui import JsApi
@@ -3020,7 +5569,10 @@ class TestDatabase(unittest.TestCase):
         api = JsApi.__new__(JsApi)
         api._db = self.db
 
-        with mock.patch("src.webui.build_manifest") as build:
+        with (
+            mock.patch("src.webui.build_manifest") as build,
+            mock.patch("src.webui.request_manifest_rebuild") as rebuild,
+        ):
             parent = api.create_collection("角色")
             child = api.create_collection("爱丽丝", parent["id"])
 
@@ -3028,23 +5580,62 @@ class TestDatabase(unittest.TestCase):
         self.assertTrue(child["ok"])
         self.assertEqual(child["collection"]["path"], "角色 / 爱丽丝")
         self.assertEqual(self.db.get_meme_collections(meme_id), [])
-        # 空分组不能触发 manifest 重建，否则清单构建会把它立即清理掉。
+        # 创建节点本身不需要为整库同步清单而阻塞界面。
         build.assert_not_called()
+        self.assertEqual(rebuild.call_count, 2)
 
-    def test_create_collection_api_rejects_third_level(self):
+    def test_create_collection_api_creates_and_reuses_deep_paths(self):
         from src.webui import JsApi
 
         api = JsApi.__new__(JsApi)
         api._db = self.db
-        with mock.patch("src.webui.build_manifest"):
-            parent = api.create_collection("顶层")
-            child = api.create_collection("小分组", parent["id"])
-            result = api.create_collection("第三层", child["id"])
+        with mock.patch("src.webui.request_manifest_rebuild") as rebuild:
+            result = api.create_collection("角色 / 爱丽丝 / 问候")
+            repeated = api.create_collection("角色/爱丽丝/问候")
+            relative = api.create_collection("早安/挥手", result["id"])
 
-        self.assertFalse(result["ok"])
-        self.assertIn("最大支持", result["error"])
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["created"])
+        self.assertEqual(result["collection"]["path"], "角色 / 爱丽丝 / 问候")
+        self.assertEqual(repeated["id"], result["id"])
+        self.assertFalse(repeated["created"])
+        self.assertEqual(
+            relative["collection"]["path"],
+            "角色 / 爱丽丝 / 问候 / 早安 / 挥手",
+        )
+        self.assertEqual(len(self.db.get_collections()), 5)
+        self.assertEqual(rebuild.call_count, 2)
 
-    def test_create_category_api_does_not_assign_meme_and_survives_manifest_error(
+    def test_create_category_api_creates_root_and_relative_paths(self):
+        from src.webui import JsApi
+
+        cache = self.tmp_dir / "category-path-cache"
+        cfg = Config(self.tmp_dir / "category-path-config.json")
+        cfg.set("cache_dir", str(cache))
+        api = JsApi.__new__(JsApi)
+        api._db = self.db
+        api._cfg = cfg
+
+        with mock.patch("src.webui.request_manifest_rebuild") as rebuild:
+            root_path = api.create_category("来源 / QQ / 群聊")
+            relative = api.create_category("公告/活动", root_path["id"])
+            repeated = api.create_category("来源/QQ/群聊")
+            casefolded = api.create_category("来源/qq/群聊")
+
+        self.assertTrue(root_path["ok"])
+        self.assertTrue(root_path["created"])
+        self.assertEqual(root_path["path"], "来源 / QQ / 群聊")
+        self.assertEqual(
+            relative["path"], "来源 / QQ / 群聊 / 公告 / 活动"
+        )
+        self.assertEqual(repeated["id"], root_path["id"])
+        self.assertFalse(repeated["created"])
+        self.assertEqual(casefolded["id"], root_path["id"])
+        self.assertFalse(casefolded["created"])
+        self.assertTrue((cache / "来源" / "QQ" / "群聊" / "公告" / "活动").is_dir())
+        self.assertEqual(rebuild.call_count, 2)
+
+    def test_create_category_api_does_not_assign_meme_and_schedules_manifest(
         self,
     ):
         from src.webui import JsApi
@@ -3057,9 +5648,7 @@ class TestDatabase(unittest.TestCase):
         api._db = self.db
         api._cfg = cfg
 
-        with mock.patch(
-            "src.webui.build_manifest", side_effect=OSError("manifest unavailable")
-        ):
+        with mock.patch("src.webui.request_manifest_rebuild") as rebuild:
             parent = api.create_category("角色")
             child = api.create_category("爱丽丝", parent["id"])
 
@@ -3069,6 +5658,21 @@ class TestDatabase(unittest.TestCase):
         self.assertTrue((cache / "角色" / "爱丽丝").is_dir())
         child_record = self.db.get_category(child["id"])
         self.assertEqual(child_record["parent_id"], parent["id"])
+        self.assertEqual(rebuild.call_count, 2)
+
+    def test_hierarchy_creation_rejects_empty_or_dot_segments(self):
+        from src.webui import JsApi
+
+        cfg = Config(self.tmp_dir / "invalid-path-config.json")
+        cfg.set("cache_dir", str(self.tmp_dir / "invalid-path-cache"))
+        api = JsApi.__new__(JsApi)
+        api._db = self.db
+        api._cfg = cfg
+
+        self.assertFalse(api.create_collection("角色//问候")["ok"])
+        self.assertFalse(api.create_category("角色/../问候")["ok"])
+        self.assertEqual(self.db.get_collections(), [])
+        self.assertEqual(self.db.get_categories(), [])
 
     def test_update_meme_details_renames_title_and_physical_file(self):
         from types import SimpleNamespace
@@ -3087,7 +5691,12 @@ class TestDatabase(unittest.TestCase):
         api._cfg = cfg
         api._webui = SimpleNamespace(_file_cache={"old-name.png": str(old_path)})
 
-        with mock.patch("src.webui.build_manifest") as build:
+        with (
+            mock.patch(
+                "src.webui.update_manifest_meme_structure", return_value=True
+            ) as incremental,
+            mock.patch("src.webui.build_manifest") as build,
+        ):
             result = api.update_meme_details(
                 mid,
                 {
@@ -3111,7 +5720,39 @@ class TestDatabase(unittest.TestCase):
                 api._webui._file_cache["new-name.png"], cache / "new-name.png"
             )
         )
-        build.assert_called_once()
+        incremental.assert_called_once_with(mid, "old-name.png")
+        build.assert_not_called()
+
+    def test_update_meme_details_structure_schedules_rebuild_when_manifest_is_missing(
+        self,
+    ):
+        from src.webui import JsApi
+
+        mid = self.db.add_meme("structure-fallback.png")
+        group = self.db.create_collection("新分组")
+        api = JsApi.__new__(JsApi)
+        api._db = self.db
+
+        with (
+            mock.patch(
+                "src.webui.update_manifest_meme_structure", return_value=False
+            ) as incremental,
+            mock.patch("src.webui.request_manifest_rebuild") as rebuild,
+            mock.patch("src.webui.build_manifest") as build,
+        ):
+            result = api.update_meme_details(
+                mid,
+                {
+                    "filename": "structure-fallback.png",
+                    "tags": [],
+                    "collection_ids": [group],
+                },
+            )
+
+        self.assertTrue(result["ok"])
+        incremental.assert_called_once_with(mid, "structure-fallback.png")
+        rebuild.assert_called_once_with()
+        build.assert_not_called()
 
     def test_update_meme_details_title_only_updates_manifest_incrementally(self):
         from src.webui import JsApi
@@ -3136,7 +5777,9 @@ class TestDatabase(unittest.TestCase):
         incremental.assert_called_once_with("title-only.png", "新标题")
         build.assert_not_called()
 
-    def test_update_meme_details_title_only_rebuilds_when_manifest_is_missing(self):
+    def test_update_meme_details_title_only_schedules_rebuild_when_manifest_is_missing(
+        self,
+    ):
         from src.webui import JsApi
 
         mid = self.db.add_meme("missing-manifest.png", original_name="旧标题")
@@ -3145,6 +5788,7 @@ class TestDatabase(unittest.TestCase):
 
         with (
             mock.patch("src.webui.update_manifest_meme_name", return_value=False),
+            mock.patch("src.webui.request_manifest_rebuild") as rebuild,
             mock.patch("src.webui.build_manifest") as build,
         ):
             result = api.update_meme_details(
@@ -3153,7 +5797,8 @@ class TestDatabase(unittest.TestCase):
             )
 
         self.assertTrue(result["ok"])
-        build.assert_called_once_with()
+        rebuild.assert_called_once_with()
+        build.assert_not_called()
 
     def test_legacy_rename_meme_uses_incremental_manifest_update(self):
         from src.webui import JsApi
@@ -3197,6 +5842,7 @@ class TestDatabase(unittest.TestCase):
 
         with (
             mock.patch("src.webui.get_db", return_value=self.db),
+            mock.patch("src.webui.update_manifest_meme_structure", return_value=True),
             mock.patch("src.webui.build_manifest"),
             mock.patch.object(
                 Path,
@@ -3238,6 +5884,7 @@ class TestDatabase(unittest.TestCase):
 
         with (
             mock.patch("src.webui.get_db", return_value=self.db),
+            mock.patch("src.webui.update_manifest_meme_structure", return_value=True),
             mock.patch("src.webui.build_manifest"),
         ):
             result = api.update_meme_details(
@@ -3275,6 +5922,7 @@ class TestDatabase(unittest.TestCase):
 
         with (
             mock.patch("src.webui.get_db", return_value=self.db),
+            mock.patch("src.webui.update_manifest_meme_structure", return_value=True),
             mock.patch("src.webui.build_manifest"),
         ):
             result = api.update_meme_details(
@@ -4501,9 +7149,7 @@ class TestBackup(unittest.TestCase):
             "summary": {"node_count": 1, "record_count": 1},
         }
         saved = self.db.save_chat_record(package)
-        result = backup.create_backup(
-            self.backup_dir, self.tmp, self.cache, self.db
-        )
+        result = backup.create_backup(self.backup_dir, self.tmp, self.cache, self.db)
 
         db2 = MemeDB(self.tmp / "memes2.db")
         try:

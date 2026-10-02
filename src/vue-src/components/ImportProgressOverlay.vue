@@ -4,6 +4,7 @@ import { api } from '../utils/api'
 
 const emit = defineEmits<{
   imported: []
+  duplicates: [ids: number[]]
 }>()
 
 const visible = ref(false)
@@ -46,7 +47,12 @@ async function poll() {
     if (s.rejected) finalMsg.value += '，跳过 ' + s.rejected + ' 个超限文件'
     if (s.skipped_dup) finalMsg.value += '，' + s.skipped_dup + ' 个已存在（重复）'
     showToast('导入完成')
-    emit('imported')
+    if (Array.isArray(s.duplicate_ids) && s.duplicate_ids.length) {
+      visible.value = false
+      emit('duplicates', s.duplicate_ids)
+    } else {
+      emit('imported')
+    }
   } else if (s.status === 'cancelled') {
     finalMsg.value = '导入已取消'
     showToast('导入已取消')

@@ -438,6 +438,83 @@ def test_chat_record_drag_sends_directly_to_resolved_qq_group(monkeypatch):
     ui.schedule_hide.assert_called_once()
 
 
+def test_static_image_drag_to_qq_sends_napcat_sticker(monkeypatch):
+    import src.native_drag as native_drag
+    import src.qq_drag as qq_drag
+    import src.webui as webui_module
+    from src.webui import JsApi
+
+    ui = type("DragWebUI", (), {})()
+    ui.schedule_hide = mock.Mock()
+    api = JsApi.__new__(JsApi)
+    api._webui = ui
+    api._cfg = _FakeConfig(False)
+    api._cfg.saved.update(
+        {
+            "napcat_http_url": "http://127.0.0.1:3000",
+            "napcat_token": "token",
+            "napcat_image_send_mode": "sticker",
+        }
+    )
+    api._cfg.get = lambda key, default=None: api._cfg.saved.get(key, default)
+    used = []
+    api._db = type(
+        "ImageDB",
+        (),
+        {
+            "get_by_id": lambda self, meme_id: {
+                "id": meme_id,
+                "filename": "a.png",
+            },
+            "record_use": lambda self, meme_id: used.append(meme_id),
+        },
+    )()
+    monkeypatch.setattr(api, "_daily_meme_path", lambda row: row["filename"])
+    native_meme_drag = mock.Mock(
+        side_effect=lambda path, intercept_qq=False: {
+            "ok": True,
+            "qq_target": {
+                "window_handle": 123,
+                "process_name": "QQ",
+                "x": 1,
+                "y": 2,
+            },
+            "intercept_qq": intercept_qq,
+        },
+    )
+    monkeypatch.setattr(native_drag, "start_meme_drag", native_meme_drag)
+    monkeypatch.setattr(
+        qq_drag,
+        "resolve_qq_target",
+        lambda *args: {
+            "message_type": "group",
+            "peer_id": "456",
+            "label": "测试群",
+            "source": "napcat_plugin",
+        },
+    )
+    sent = mock.Mock(return_value={"ok": True})
+    monkeypatch.setattr(webui_module.onebot, "send_meme_image", sent)
+
+    result = api.start_meme_drag(7)
+
+    assert result["ok"]
+    assert result["recent_recorded"]
+    assert result["sent_as_sticker"]
+    assert result["target_label"] == "测试群"
+    native_meme_drag.assert_called_once_with("a.png", intercept_qq=True)
+    sent.assert_called_once_with(
+        "http://127.0.0.1:3000",
+        "token",
+        "a.png",
+        "group",
+        "456",
+        as_sticker=True,
+    )
+    assert used == [7]
+    ui.schedule_hide.assert_called_once()
+
+
 def test_successful_copy_requests_hide_only_for_hotkey_session(monkeypatch):
     import src.webui as webui_module
     from src.webui import JsApi
@@ -570,9 +647,11 @@ def test_webui_html_exists():
     assert 'src="/settings.js"' in settings_html
     assert 'href="/settings.css"' in settings_html
     assert 'id="s-hotkey-show-at-mouse"' in settings_html
+    assert 'id="s-napcat-image-send-mode"' in settings_html
     settings_js = (HTML_DIR / "settings.js").read_text(encoding="utf-8")
     assert settings_js.count("s.hotkey_show_at_mouse === true") == 2
     assert "hotkey_show_at_mouse," in settings_js
+    assert "napcat_image_send_mode" in settings_js
 
 
 def test_sorting_visual_feedback_static_contract():
@@ -994,19 +1073,211 @@ def test_virtual_drive_compat_settings_contract():
     assert "pendingStorageDir, move, compat" in settings_js
 
 
+def test_genre_multiselect_and_random_sidebar_interactions():
+    import shutil
+
+    import pytest
+
+    root = Path(__file__).resolve().parent.parent
+    node = shutil.which("node")
+    if not node or not (root / "node_modules" / "esbuild").is_dir():
+        pytest.skip("随机页前端交互测试需要 Node 和已安装的前端依赖")
+    script = r"""
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const vm = require('node:vm');
+const Module = require('node:module');
+const esbuild = require('esbuild');
+const calls = [];
+global.pywebview = { api: {
+  search_library: async (...args) => {
+    calls.push(args);
+    return { memes: [], chat_records: [], chat_total: 0, total: 0 };
+  },
+  start_page_cache_warmup: async () => ({}),
+} };
+const filename = path.resolve('src/vue-src/composables/useMemes.ts');
+const compiled = esbuild.buildSync({
+  entryPoints: [filename], bundle: true, platform: 'node', format: 'cjs',
+  external: ['vue'], write: false,
+}).outputFiles[0].text;
+const moduleInstance = new Module(filename, module);
+moduleInstance.filename = filename;
+moduleInstance.paths = Module._nodeModulePaths(path.dirname(filename));
+moduleInstance._compile(compiled, filename);
+const { state, setActiveCollection, setActiveCategory, toggleGenre, search, canReorder } =
+  moduleInstance.exports.useMemes();
+const app = fs.readFileSync('src/vue-src/App.vue', 'utf8');
+const handler = app.match(/function onSidebarSelect\(id: number\) \{[\s\S]*?\n\}/)[0];
+const javascript = esbuild.transformSync(handler, { loader: 'ts' }).code;
+const context = { sidebarTab: { value: 'collections' }, state,
+  setActiveCollection, setActiveCategory };
+vm.createContext(context);
+vm.runInContext(javascript, context);
+const settle = () => new Promise(resolve => setImmediate(resolve));
+(async () => {
+  assert.deepEqual([...state.activeGenres], ['image', 'gif', 'chat_record']);
+  state.activeCollection = 42;
+  state.searchQuery = 'kept search';
+  state.activeTags.add('kept tag');
+  state.page = 4;
+  toggleGenre('gif');
+  await settle();
+  assert.deepEqual([...state.activeGenres], ['image', 'chat_record']);
+  assert.deepEqual(calls.at(-1)[6], ['image', 'chat_record']);
+  assert.equal(state.page, 1);
+  assert.equal(state.activeCollection, 42);
+  assert.equal(state.searchQuery, 'kept search');
+  assert.ok(state.activeTags.has('kept tag'));
+  toggleGenre('image');
+  await settle();
+  assert.deepEqual([...state.activeGenres], ['chat_record']);
+  assert.equal(state.activeCollection, 42);
+  assert.equal(canReorder(), false);
+  toggleGenre('chat_record');
+  await settle();
+  assert.deepEqual(calls.at(-1)[6], []);
+  assert.equal(canReorder(), false);
+  state.activeCollection = null;
+  state.activeCategory = 21;
+  toggleGenre('gif');
+  await settle();
+  assert.deepEqual(calls.at(-1)[6], ['gif']);
+  assert.equal(state.activeCategory, 21);
+  toggleGenre('image');
+  await settle();
+  assert.deepEqual(calls.at(-1)[6], ['image', 'gif']);
+  toggleGenre('chat_record');
+  await settle();
+  assert.deepEqual(calls.at(-1)[6], ['image', 'gif', 'chat_record']);
+  state.searchQuery = 'old search';
+  state.activeTags.add('old tag');
+  state.activeGenres = ['chat_record'];
+  context.onSidebarSelect(-5);
+  await settle();
+  assert.equal(state.activeCollection, -5);
+  assert.equal(state.searchQuery, '');
+  assert.equal(state.activeTags.size, 0);
+  assert.deepEqual([...state.activeGenres], ['image', 'gif', 'chat_record']);
+  assert.equal(canReorder(), false);
+  assert.equal(calls.at(-1)[7], false);
+
+  context.onSidebarSelect(-5);
+  await settle();
+  assert.equal(state.activeCollection, -5);
+  assert.equal(calls.at(-1)[7], true);
+
+  context.onSidebarSelect(-4);
+  await settle();
+  context.onSidebarSelect(-5);
+  await settle();
+  assert.equal(calls.at(-1)[7], false);
+  setActiveCategory(null);
+  await settle();
+  context.onSidebarSelect(-5);
+  await settle();
+  assert.equal(calls.at(-1)[7], false);
+  setActiveCollection(-5);
+  await settle();
+  assert.equal(state.activeCollection, -5);
+  assert.equal(calls.at(-1)[7], false);
+  await search(false);
+  assert.equal(calls.at(-1)[7], false);
+  toggleGenre('gif');
+  await settle();
+  assert.equal(state.activeCollection, -5);
+  assert.equal(calls.at(-1)[7], false);
+  assert.equal(calls.filter(args => args[7] === true).length, 1);
+})().catch(error => { console.error(error); process.exitCode = 1; });
+"""
+    result = subprocess.run(
+        [node, "-e", script], cwd=root, capture_output=True, text=True, timeout=30
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_later_page_cache_warmup_follows_current_query_contract():
     root = Path(__file__).resolve().parent.parent
-    source = (
-        root / "src" / "vue-src" / "composables" / "useMemes.ts"
-    ).read_text(encoding="utf-8")
+    source = (root / "src" / "vue-src" / "composables" / "useMemes.ts").read_text(
+        encoding="utf-8"
+    )
+    backend = (root / "src" / "webui.py").read_text(encoding="utf-8")
 
     assert "'start_page_cache_warmup'" in source
     assert "state.searchQuery" in source
     assert "state.activeCollection" in source
     assert "state.activeCategory" in source
-    assert "state.activeGenre" in source
-    assert "'cancel_page_cache_warmup'" in source
+    assert "state.activeGenres" in source
+    assert "'cancel_page_cache_warmup'" not in source
+    assert "self.cancel_page_cache_warmup()" in backend
     assert "warmLaterPages(offset, selectedTags)" in source
+
+
+def test_drag_import_uses_local_refresh_without_diagnostic_fallbacks():
+    root = Path(__file__).resolve().parent.parent
+    app_source = (root / "src" / "vue-src" / "App.vue").read_text(encoding="utf-8")
+    meme_source = (root / "src" / "vue-src" / "composables" / "useMemes.ts").read_text(
+        encoding="utf-8"
+    )
+    backend = (root / "src" / "webui.py").read_text(encoding="utf-8")
+
+    assert "function presentImportedMeme" not in meme_source
+    assert "pendingImportedMemes" not in meme_source
+    finish_block = app_source.split("async function finishMemeImport", 1)[1].split(
+        "async function onDrop", 1
+    )[0]
+    assert "await refreshLibraryView('structure')" in finish_block
+    assert "window.location.reload" not in finish_block
+    assert "schedule_main_page_reload" not in backend
+    assert "get_meme_card" not in backend
+    assert '"/api/import-presented/"' not in backend
+    assert "get_library_revision" not in backend
+
+
+def test_delete_waits_for_structure_refresh_and_backend_publishes_change():
+    root = Path(__file__).resolve().parent.parent
+    app_source = (root / "src" / "vue-src" / "App.vue").read_text(encoding="utf-8")
+    backend = (root / "src" / "webui.py").read_text(encoding="utf-8")
+
+    single_delete = app_source.split("case 'delete':", 1)[1].split(
+        "case 'rename-collection':", 1
+    )[0]
+    batch_delete = app_source.split("async function batchDelete", 1)[1].split(
+        "function batchAddToCollection", 1
+    )[0]
+    assert "await refreshLibraryView('structure')" in single_delete
+    assert "await refreshLibraryView('structure')" in batch_delete
+    assert "remove_memes_from_manifest" in backend
+    assert 'notify_changed("structure")' in backend
+
+
+def test_cache_rescan_runs_as_single_background_job():
+    from src.webui import WebUI
+
+    ui = WebUI.__new__(WebUI)
+    ui._cache_scan_lock = threading.Lock()
+    ui._cache_scan_thread = None
+    started = threading.Event()
+    release = threading.Event()
+
+    def scan_cache():
+        started.set()
+        release.wait(2)
+        return 0
+
+    ui.scan_cache = scan_cache
+    self_notify = mock.patch("src.library_events.notify_changed")
+    with self_notify as notify_changed:
+        assert ui.start_cache_scan()
+        assert started.wait(1)
+        first_thread = ui._cache_scan_thread
+        assert ui.start_cache_scan()
+        assert ui._cache_scan_thread is first_thread
+        release.set()
+        first_thread.join(2)
+        assert ui._cache_scan_thread is None
+        notify_changed.assert_not_called()
 
 
 def test_meme_details_close_discards_unsaved_changes():
@@ -1033,9 +1304,7 @@ def test_meme_details_can_create_and_select_collections_and_categories():
     source = (root / "src" / "vue-src" / "components" / "MemeDetails.vue").read_text(
         encoding="utf-8"
     )
-    app_source = (root / "src" / "vue-src" / "App.vue").read_text(
-        encoding="utf-8"
-    )
+    app_source = (root / "src" / "vue-src" / "App.vue").read_text(encoding="utf-8")
 
     assert "'create_collection'" in source
     assert "'create_category'" in source

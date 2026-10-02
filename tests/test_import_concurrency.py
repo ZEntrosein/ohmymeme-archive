@@ -35,6 +35,8 @@ def env(monkeypatch, tmp_path):
     cfg = _IsoCfg(cache_dir)
     monkeypatch.setattr(webui, "get_db", lambda: db)
     monkeypatch.setattr(webui, "get_config", lambda: cfg)
+    monkeypatch.setattr(webui, "add_memes_to_manifest", lambda _ids: True)
+    monkeypatch.setattr(webui, "request_manifest_rebuild", lambda: True)
     # _do_import 成功路径会调 build_manifest；manifest 单独导入 config/database，
     # 需在 manifest 命名空间也 patch，否则会读写真实 data_dir
     import src.manifest as _manifest

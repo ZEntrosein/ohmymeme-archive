@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted, computed } from 'vue'
-import { tagKey, useMemes } from './composables/useMemes'
+import { ALL_GENRES, tagKey, useMemes } from './composables/useMemes'
 import { useDragSort } from './composables/useDragSort'
 import { useContextMenu, type MenuItem } from './composables/useContextMenu'
 import { useCollectionBuilder, flattenCollections, type CollectionOption } from './composables/useCollectionBuilder'
@@ -9,8 +9,10 @@ import CollectionBuilder from './components/CollectionBuilder.vue'
 import CollectionTreeNode from './components/CollectionTreeNode.vue'
 import ChatRecordDetails from './components/ChatRecordDetails.vue'
 import ConfirmDialog from './components/ConfirmDialog.vue'
+import HierarchyDeleteDialog from './components/HierarchyDeleteDialog.vue'
 import ImportMenu from './components/ImportMenu.vue'
 import ImportProgressOverlay from './components/ImportProgressOverlay.vue'
+import LargeMemeImportDialog from './components/LargeMemeImportDialog.vue'
 import MemeDetails from './components/MemeDetails.vue'
 import NotionImportDialog from './components/NotionImportDialog.vue'
 import InputDialog from './components/InputDialog.vue'
@@ -22,7 +24,7 @@ import UpdateDialog from './components/UpdateDialog.vue'
 import type { ChatRecordSummary, Genre, Meme, TagRecord } from './types'
 import { api } from './utils/api'
 
-const { state, setMemes, search, goToPage, setSearch, setGenre, toggleTag, setActiveCollection, setActiveCategory, refreshTags, refreshCollections, refreshCategories, copyMeme, reorderMemes, canReorder, startNativeDrag, selectAllVisible, clearSelection, loadInitData } = useMemes()
+const { state, setMemes, search, goToPage, setSearch, toggleGenre, toggleTag, setActiveCollection, setActiveCategory, refreshTags, refreshCollections, refreshCategories, refreshRecentUsage, copyMeme, reorderMemes, canReorder, startNativeDrag, selectAllVisible, clearSelection, loadInitData } = useMemes()
 const ctx = useContextMenu()
 const cb = useCollectionBuilder()
 const tagEditor = ref<InstanceType<typeof TagEditor> | null>(null)
@@ -31,11 +33,68 @@ const chatRecordDetails = ref<InstanceType<typeof ChatRecordDetails> | null>(nul
 const updateDialog = ref<InstanceType<typeof UpdateDialog> | null>(null)
 const inputDialog = ref<InstanceType<typeof InputDialog> | null>(null)
 const confirmDialog = ref<InstanceType<typeof ConfirmDialog> | null>(null)
+const hierarchyDeleteDialog = ref<InstanceType<typeof HierarchyDeleteDialog> | null>(null)
+const largeMemeImportDialog = ref<InstanceType<typeof LargeMemeImportDialog> | null>(null)
 const similarImportDialog = ref<InstanceType<typeof SimilarImportDialog> | null>(null)
 
 // 统一确认对话框（替代原生 confirm，风格与重构主题一致）
 async function confirmAsk(title: string, message: string): Promise<boolean> {
   return !!(await confirmDialog.value?.open(title, message))
+}
+
+type HierarchyDeleteMode = 'promote' | 'cascade'
+
+async function chooseHierarchyDeleteMode(
+  kind: 'collection' | 'category',
+  name: string,
+): Promise<{ mode: HierarchyDeleteMode; remember: boolean } | null> {
+  const configured = await api('get_hierarchy_delete_mode')
+  if (configured === 'promote' || configured === 'cascade') {
+    return { mode: configured, remember: false }
+  }
+  return await hierarchyDeleteDialog.value?.open(kind, name) ?? null
+}
+
+async function deleteHierarchyNode(
+  kind: 'collection' | 'category',
+  id: number,
+  name: string,
+) {
+  const choice = await chooseHierarchyDeleteMode(kind, name)
+  if (!choice) return
+  const result = await api(
+    kind === 'category' ? 'delete_category' : 'delete_collection',
+    id,
+    choice.mode,
+  )
+  if (!result?.ok) {
+    showToast(result?.error || `${kind === 'category' ? '类别' : '分组'}删除失败`)
+    return
+  }
+  if (choice.remember) {
+    const saved = await api('set_hierarchy_delete_mode', choice.mode)
+    if (!saved?.ok) showToast('已删除，但“始终如此”设置保存失败')
+  }
+  const deletedIds = new Set<number>(
+    (Array.isArray(result.deleted_ids) ? result.deleted_ids : [id]).map(Number),
+  )
+  if (kind === 'category') {
+    if (state.activeCategory != null && deletedIds.has(state.activeCategory)) {
+      state.activeCategory = result.parent_id == null
+        ? (findCollectionNode(state.categories, -4) ? -4 : null)
+        : Number(result.parent_id)
+    }
+    await refreshCategories()
+  } else {
+    if (state.activeCollection != null && deletedIds.has(state.activeCollection)) {
+      state.activeCollection = result.parent_id == null
+        ? (findCollectionNode(state.collections, -4) ? -4 : null)
+        : Number(result.parent_id)
+    }
+    await refreshCollections()
+  }
+  await search()
+  showToast(`${kind === 'category' ? '类别' : '分组'}已删除`)
 }
 
 // 检查更新并弹窗：首次 force 发起后台检查；pending 时以非 force 轮询取结果
@@ -85,6 +144,16 @@ let dragGeneration = 0
 let dragState: { sx: number; sy: number; px: number; py: number; raf: number | null } | null = null
 let updateInterval: ReturnType<typeof setInterval> | null = null
 
+async function refreshLibraryView(kind: 'content' | 'structure' = 'content'): Promise<boolean> {
+  const refreshed = await search()
+  if (kind === 'structure') {
+    await refreshTags()
+    await refreshCollections()
+    await refreshCategories()
+  }
+  return refreshed
+}
+
 // 启动动画：仅页面首次加载（启动）时播放一次，快捷键呼出不重载页面故不重复播放
 const startupAnim = ref(true)
 const startupVideoReady = ref(false)
@@ -98,25 +167,79 @@ onMounted(() => {
   // 兜底：视频加载失败或未触发 ended 时最多 6s 后移除遮罩，避免卡死界面
   startupAnimTimer = setTimeout(dismissStartupAnim, 6000)
   // 后端 evaluate_js 刷新入口（设置保存/同步后由 webui.py 调用）
-  window.refreshMemes = () => { search() }
+  window.refreshMemes = () => { void refreshLibraryView('content') }
   window.refreshTags = refreshTags
   window.refreshCollections = refreshCollections
   window.refreshCategories = refreshCategories
+  window.refreshRecent = () => { void refreshRecentUsage() }
   // NapCat/LAN 等后台线程只重新查询当前筛选并回到第一页；仅结构变化才更新侧栏。
-  window.refreshLibrary = (kind = 'content') => {
-    void search()
-    if (kind === 'structure') {
-      void refreshCollections()
-      void refreshCategories()
-    }
-  }
+  window.refreshLibrary = (kind = 'content') => { void refreshLibraryView(kind) }
 })
 // 网格列数由 CSS repeat(auto-fill, minmax(112px, 1fr)) 随容器宽度自适应
 
 // 当前分组（正 ID）下的子分组列表，用于网格顶部显示文件夹卡片
 const sidebarTab = ref<'collections' | 'categories'>('collections')
 const sidebarItems = computed(() => sidebarTab.value === 'categories' ? state.categories : state.collections)
-const activeSidebarId = computed(() => sidebarTab.value === 'categories' ? state.activeCategory : state.activeCollection)
+const activeSidebarId = computed(() => (
+  sidebarTab.value === 'categories'
+    ? (state.activeCategory ?? -1)
+    : state.activeCollection
+))
+const hoveredSidebarNode = ref<{
+  kind: 'collection' | 'category'
+  id: number
+} | null>(null)
+
+function subtreeIds(items: any[], targetId: number): Set<number> {
+  const collect = (node: any, result: Set<number>) => {
+    result.add(Number(node.id))
+    for (const child of node.children || []) collect(child, result)
+  }
+  const find = (nodes: any[]): Set<number> | null => {
+    for (const node of nodes) {
+      if (Number(node.id) === targetId) {
+        const result = new Set<number>()
+        collect(node, result)
+        return result
+      }
+      const nested = find(node.children || [])
+      if (nested) return nested
+    }
+    return null
+  }
+  return find(items) || new Set([targetId])
+}
+
+const hoveredSidebarIds = computed(() => {
+  const hovered = hoveredSidebarNode.value
+  if (!hovered || hovered.id <= 0) return new Set<number>()
+  const items = hovered.kind === 'category' ? state.categories : state.collections
+  return subtreeIds(items, hovered.id)
+})
+
+function onSidebarNodeHover(id: number | null) {
+  hoveredSidebarNode.value = id == null
+    ? null
+    : {
+        kind: sidebarTab.value === 'categories' ? 'category' : 'collection',
+        id,
+      }
+}
+
+function isMemeInHoveredSidebarNode(meme: Meme): boolean {
+  const hovered = hoveredSidebarNode.value
+  if (!hovered) return false
+  if (hovered.kind === 'category') {
+    if (hovered.id === -1) return true
+    if (hovered.id === -4) return meme.category_id == null
+    return hoveredSidebarIds.value.has(Number(meme.category_id))
+  }
+  if (hovered.id === -2) return meme.favorited === true
+  if (hovered.id === -3) return meme.recently_used === true
+  if (hovered.id === -4) return !meme.collection_ids?.length
+  if (hovered.id <= 0) return false
+  return (meme.collection_ids || []).some(id => hoveredSidebarIds.value.has(Number(id)))
+}
 
 const folderCards = computed(() => {
   if (!activeSidebarId.value || activeSidebarId.value < 0) return []
@@ -136,6 +259,7 @@ const folderCards = computed(() => {
 // 面包屑：当前分组从「全部」到自身的祖先链
 const breadcrumb = computed(() => {
   if (!activeSidebarId.value) return []
+  if (sidebarTab.value === 'categories' && activeSidebarId.value === -1) return []
   const walk = (items: any[], target: number, trail: any[]): any[] | null => {
     for (const c of items) {
       if (c.id === target) return [...trail, c]
@@ -182,7 +306,6 @@ const tagGroups = computed(() => {
 })
 
 const genreOptions: { value: Genre; label: string }[] = [
-  { value: 'all', label: '全部' },
   { value: 'image', label: '图片' },
   { value: 'gif', label: 'GIF' },
   { value: 'chat_record', label: '聊天记录' },
@@ -203,17 +326,79 @@ async function deleteChatRecord(recordId: number) {
   }
   chatRecordDetails.value?.close()
   showToast('聊天记录已删除')
-  search()
+  await refreshLibraryView('structure')
+}
+
+async function onChatRecordSaved(_recordId: number) {
+  showToast('聊天记录管理信息已保存')
+  await refreshLibraryView('structure')
+}
+
+async function createChatCollection() {
+  const name = await inputDialog.value?.open(
+    '新建分组路径', '', '例如：角色/爱丽丝/问候',
+  )
+  if (!name) return
+  const result = await api('create_collection', name)
+  if (!result?.ok) { showToast(result?.error || '分组创建失败'); return }
+  showToast('分组已创建，请点击保存完成归属')
+  await refreshCollections()
+  await chatRecordDetails.value?.reload()
+}
+
+async function createChatCategory() {
+  const name = await inputDialog.value?.open(
+    '新建类别路径', '', '例如：来源/QQ/群聊',
+  )
+  if (!name) return
+  const result = await api('create_category', name, null)
+  if (!result?.ok) { showToast(result?.error || '类别创建失败'); return }
+  showToast('类别已创建，请点击保存完成归属')
+  await refreshCategories()
+  await chatRecordDetails.value?.reload()
+}
+
+async function promptCreateHierarchy(
+  kind: 'collection' | 'category',
+  parentId: number | null = null,
+) {
+  const label = kind === 'category' ? '类别' : '分组'
+  const relative = parentId != null
+  const title = relative ? `在当前${label}下新建路径` : `新建${label}路径`
+  const placeholder = relative
+    ? `输入相对子路径，例如：子${label}/更下一级`
+    : `例如：一级${label}/二级${label}/三级${label}`
+  const path = await inputDialog.value?.open(title, '', placeholder)
+  if (!path) return null
+  const result = await api(
+    kind === 'category' ? 'create_category' : 'create_collection',
+    path,
+    parentId,
+  )
+  if (!result?.ok) {
+    showToast(result?.error || `${label}创建失败`)
+    return null
+  }
+  return result
+}
+
+async function onSidebarAdd() {
+  const kind = sidebarTab.value === 'categories' ? 'category' : 'collection'
+  const result = await promptCreateHierarchy(kind)
+  if (!result) return
+  showToast(`${kind === 'category' ? '类别' : '分组'}路径已创建`)
+  if (kind === 'category') await refreshCategories()
+  else await refreshCollections()
 }
 
 function onBreadcrumbClick(id: number | null) {
-  if (sidebarTab.value === 'categories') setActiveCategory(id)
+  if (sidebarTab.value === 'categories') setActiveCategory(id === -1 ? null : id)
   else setActiveCollection(id)
 }
 
 function onSidebarSelect(id: number) {
-  if (sidebarTab.value === 'categories') setActiveCategory(id)
-  else setActiveCollection(id)
+  if (sidebarTab.value === 'categories') setActiveCategory(id === -1 ? null : id)
+  else setActiveCollection(id, id === -5 && state.activeCollection === -5)
 }
 
 function onFolderCardClick(childId: number) {
@@ -235,6 +420,7 @@ function onFolderCardContext(e: MouseEvent, childId: number, childName: string) 
 
 function switchSidebarTab(tab: 'collections' | 'categories') {
   if (sidebarTab.value === tab) return
+  hoveredSidebarNode.value = null
   sidebarTab.value = tab
   state.activeCollection = null
   state.activeCategory = null
@@ -251,7 +437,10 @@ async function handleCopy(meme: Meme) {
   // 整理/多选模式：不复制（勾选由 drag-select 处理）
   if (sortEnabled.value || selectMode.value) return
   const ok = await copyMeme(meme.id)
-  if (ok) showToast(`${meme.name} 已复制`)
+  if (ok) {
+    await refreshRecentUsage()
+    showToast(`${meme.name} 已复制`)
+  }
   else showToast('复制失败')
 }
 
@@ -302,7 +491,10 @@ async function openSettings() {
     showToast('无法打开设置窗口')
   }
 }
-function toggleSidebar() { sidebarCollapsed.value = !sidebarCollapsed.value }
+function toggleSidebar() {
+  hoveredSidebarNode.value = null
+  sidebarCollapsed.value = !sidebarCollapsed.value
+}
 
 function toggleSort() {
   sortEnabled.value = !sortEnabled.value
@@ -329,17 +521,11 @@ function showNotionImport() {
 }
 
 function onImportDone() {
-  search()
-  refreshTags()
-  refreshCollections()
-  refreshCategories()
+  void refreshLibraryView('structure')
 }
 
 function onMemeDetailsSaved() {
-  search()
-  refreshTags()
-  refreshCollections()
-  refreshCategories()
+  void refreshLibraryView('structure')
 }
 
 function onMemeStructureCreated() {
@@ -377,9 +563,7 @@ function onSyncDone() {
 
 function rescanCache() {
   showToast('缓存刷新中...')
-  search()
-  refreshCollections()
-  refreshCategories()
+  void refreshLibraryView('structure')
 }
 
 function hideWindow() {
@@ -439,7 +623,10 @@ function onMemeRightClick(e: MouseEvent, meme: Meme) {
   }
   const items: MenuItem[] = [
     { action: 'meme-details', label: '查看表情包详情' },
-    { action: 'copy-original', label: '复制原件' },
+    {
+      action: 'copy-original',
+      label: meme.compressed_only ? '复制归档版（无原件）' : '复制原件',
+    },
     { action: 'rename', label: '重命名' },
     { action: 'favorite', label: meme.favorited ? '取消收藏' : '收藏' },
     { action: 'tag', label: '打标签' },
@@ -453,7 +640,7 @@ function onMemeRightClick(e: MouseEvent, meme: Meme) {
     items.push({ action: 'remove-recent', label: '从最近使用中删除' })
   }
   items.push({ action: 'delete', label: '删除', danger: true })
-  ctx.show(items, { memeId: meme.id, filename: meme.filename, memeName: meme.name, favorited: meme.favorited }, e.clientX, e.clientY)
+  ctx.show(items, { memeId: meme.id, filename: meme.filename, memeName: meme.name, favorited: meme.favorited, compressedOnly: meme.compressed_only }, e.clientX, e.clientY)
 }
 
 function onFolderRightClick(e: MouseEvent, folderId: number, folderName: string) {
@@ -463,12 +650,18 @@ function onFolderRightClick(e: MouseEvent, folderId: number, folderName: string)
     onCategoryRightClick(e, folderId, folderName)
     return
   }
-  const items: MenuItem[] = [{ action: 'rename-collection', label: '重命名' }]
+  if (folderId === -5) return
+  const systemHidden = !!findCollectionNode(state.collections, folderId)?.system_hidden
+  const items: MenuItem[] = systemHidden
+    ? []
+    : [{ action: 'rename-collection', label: '重命名' }]
   if (folderId === -3) {
     items.push({ action: 'clear-recent', label: '清空最近使用', danger: true })
   } else if (folderId > 0) {
-    items.push({ action: 'add-to-subgroup', label: '新建子分组' })
-    items.push({ action: 'delete-collection', label: '删除', danger: true })
+    items.push({ action: 'new-collection-child', label: '新建子分组路径' })
+    if (!systemHidden) {
+      items.push({ action: 'delete-collection', label: '删除', danger: true })
+    }
   }
   ctx.show(items, { folderId, folderName, isFolder: true }, e.clientX, e.clientY)
 }
@@ -479,7 +672,7 @@ function onCategoryRightClick(e: MouseEvent, categoryId: number, categoryName: s
   const items: MenuItem[] = []
   if (categoryId > 0) {
     items.push({ action: 'rename-category', label: '重命名' })
-    items.push({ action: 'new-category-child', label: '新建子类别' })
+    items.push({ action: 'new-category-child', label: '新建子类别路径' })
     items.push({ action: 'delete-category', label: '删除', danger: true })
   }
   if (items.length) {
@@ -487,20 +680,11 @@ function onCategoryRightClick(e: MouseEvent, categoryId: number, categoryName: s
   }
 }
 
-// 右键「加入分组」子菜单：表情上下文任意视图可用，列出全部分组树（子分组带「父/子」路径）
-// 文件夹上下文（新建子分组）保持旧行为：仅列当前分组的子分组；均走缓存的 state.collections，无桥接等待
+// 右键「加入分组」子菜单：表情上下文任意视图可用，列出全部分组树（子分组带「父/子」路径）。
 function onShowSubmenu(_items: any[], x: number, y: number) {
-  const trigger = ctx.trigger.value
   const targetCol = state.activeCollection && state.activeCollection > 0 ? state.activeCollection : null
   const sub: { action: string; label: string }[] = []
-  if (trigger.isFolder) {
-    // 文件夹上下文仅保留新建子分组（在右键的分组下创建，见 __new-subgroup__）；
-    // 已有分组列表项依赖 t.memeId，对文件夹无意义
-    sub.push({ action: '__new-subgroup__', label: '新建子分组' })
-    ctx.showSubmenu(sub, x, y)
-    return
-  }
-  sub.push({ action: '__new-subgroup__', label: targetCol ? '新建小分组' : '新建分组' })
+  sub.push({ action: '__new-subgroup__', label: targetCol ? '新建子分组路径' : '新建分组路径' })
   const opts: CollectionOption[] = []
   flattenCollections(state.collections, '', opts)
   for (const o of opts) {
@@ -521,7 +705,10 @@ async function onCtxAction(action: string) {
     }
     case 'copy-original': {
       const result = await window.pywebview?.api?.copy_meme_original(t.memeId)
-      showToast(result?.ok ? '原件已复制' : '复制原件失败')
+      if (result?.ok) await refreshRecentUsage()
+      showToast(result?.ok
+        ? (t.compressedOnly ? '归档压缩版已复制' : '原件已复制')
+        : '复制失败')
       break
     }
     case 'rename': {
@@ -553,28 +740,23 @@ async function onCtxAction(action: string) {
     case 'collection': { showCollectionBuilder(t.memeId); break }
     case 'add-to-subgroup': { /* 子菜单在 hover 时加载，点击走 subgroup-N / __new-subgroup__ */ break }
     case '__new-subgroup__': {
-      // 文件夹上下文：在右键的分组下新建子分组（不涉及表情）
-      if (t.isFolder && t.folderId > 0) {
-        const name = await inputDialog.value?.open('新建子分组', '', '输入小分组名称')
-        if (!name) break
-        const r = await window.pywebview?.api?.create_subcollection(name, t.folderId)
-        if (r && r.ok) { showToast('分组已创建'); refreshCollections() }
-        else showToast(r?.error || '创建失败')
-        break
-      }
-      const isSub = state.activeCollection && state.activeCollection > 0
-      const name = await inputDialog.value?.open(isSub ? '新建小分组' : '新建分组', '', isSub ? '输入小分组名称' : '输入分组名称')
-      if (!name) break
-      const targetCol = isSub ? state.activeCollection : null
-      let ok: any
-      if (targetCol) {
-        const r = await window.pywebview?.api?.create_subcollection(name, targetCol)
-        if (r && r.ok) ok = await window.pywebview?.api?.add_to_existing_collection(t.memeId, r.id)
-      } else {
-        ok = await window.pywebview?.api?.add_to_collection(t.memeId, name)
-      }
+      const targetCol = state.activeCollection && state.activeCollection > 0
+        ? state.activeCollection
+        : null
+      const result = await promptCreateHierarchy('collection', targetCol)
+      if (!result) break
+      const ok = await window.pywebview?.api?.add_to_existing_collection(
+        t.memeId, result.id,
+      )
       if (ok) { showToast('已添加'); refreshCollections(); search() }
       else showToast('添加分组失败')
+      break
+    }
+    case 'new-collection-root':
+    case 'new-collection-child': {
+      const parentId = action === 'new-collection-child' ? t.folderId : null
+      const result = await promptCreateHierarchy('collection', parentId)
+      if (result) { showToast('分组路径已创建'); await refreshCollections() }
       break
     }
     case 'remove-collection': {
@@ -587,7 +769,7 @@ async function onCtxAction(action: string) {
         await refreshCollections()
         // 递归查找分组节点（子分组不在顶层），据此判断是否清空后再删
         const c = findCollectionNode(state.collections, removedFrom)
-        if (!c || c.count === 0) {
+        if ((!c || c.count === 0) && !c?.system_hidden) {
           if (removedFrom > 0) await window.pywebview?.api?.delete_collection(removedFrom)
           setActiveCollection(parent ? parent.id : -4)
         }
@@ -601,7 +783,14 @@ async function onCtxAction(action: string) {
       break
     }
     case 'delete': {
-      if (await confirmAsk('删除表情包', '确定删除这个表情包吗？')) { await window.pywebview?.api?.delete_meme(t.memeId); search(); refreshCollections(); refreshCategories(); refreshTags() }
+      if (!await confirmAsk('删除表情包', '确定删除这个表情包吗？')) break
+      const deleted = await window.pywebview?.api?.delete_meme(t.memeId)
+      if (!deleted) {
+        showToast('删除失败')
+        break
+      }
+      showToast('表情包已删除')
+      await refreshLibraryView('structure')
       break
     }
     case 'rename-collection': {
@@ -621,50 +810,20 @@ async function onCtxAction(action: string) {
     case 'new-category-root':
     case 'new-category-child': {
       const parentId = action === 'new-category-child' ? t.folderId : null
-      const name = await inputDialog.value?.open(parentId ? '新建子类别' : '新建类别', '', parentId ? '输入子类别名称' : '输入类别名称')
-      if (!name) break
-      const result = await window.pywebview?.api?.create_category(name, parentId)
-      if (result?.ok) { showToast('类别已创建'); await refreshCategories() }
-      else showToast(result?.error || '创建失败')
+      const result = await promptCreateHierarchy('category', parentId)
+      if (result) { showToast('类别路径已创建'); await refreshCategories() }
       break
     }
     case 'delete-category': {
-      if (await confirmAsk('删除类别', '确定删除此类别吗？其表情包和子类别将移到上一级目录。')) {
-        const result = await window.pywebview?.api?.delete_category(t.folderId)
-        if (result?.ok) {
-          showToast('类别已删除')
-          if (state.activeCategory === t.folderId) setActiveCategory(null)
-          await refreshCategories()
-          search()
-        } else showToast(result?.error || '删除失败')
-      }
+      await deleteHierarchyNode('category', t.folderId, t.folderName)
       break
     }
     case 'delete-collection': {
-      if (await confirmAsk('删除分组', '确定删除这个分组吗？')) {
-        // 先移除组内表情到上层，再删组
-        const parent = findParentCollection(state.collections, t.folderId)
-        const members = (await window.pywebview?.api?.search_memes('', [], t.folderId, 0, 9999)) || []
-        for (const mm of members) {
-          if (parent) await window.pywebview?.api?.add_to_existing_collection(mm.id, parent.id)
-        }
-        await window.pywebview?.api?.delete_collection(t.folderId)
-        if (state.activeCollection === t.folderId) setActiveCollection(parent ? parent.id : -4)
-        refreshCollections(); search()
-      }
+      await deleteHierarchyNode('collection', t.folderId, t.folderName)
       break
     }
     case 'delete-folder': {
-      if (await confirmAsk('删除小分组', '确定删除小分组「' + t.folderName + '」？分组内表情包将移回上层分组。')) {
-        const parent = findParentCollection(state.collections, t.folderId)
-        const members = (await window.pywebview?.api?.search_memes('', [], t.folderId, 0, 9999)) || []
-        for (const mm of members) {
-          if (parent) await window.pywebview?.api?.add_to_existing_collection(mm.id, parent.id)
-        }
-        await window.pywebview?.api?.delete_collection(t.folderId)
-        if (state.activeCollection === t.folderId) setActiveCollection(parent ? parent.id : -4)
-        refreshCollections(); search()
-      }
+      await deleteHierarchyNode('collection', t.folderId, t.folderName)
       break
     }
     case 'clear-recent': {
@@ -706,22 +865,11 @@ async function batchDelete() {
   if (result.deleted === 0) {
     // 后端一个都没删掉（所选 id 在库中已不存在），刷新以对齐 UI
     showToast('没有删除任何表情包')
-    await search(false)
-    refreshCollections()
-    refreshCategories()
-    refreshTags()
+    await refreshLibraryView('structure')
     return
   }
   showToast(`已删除 ${result.deleted ?? ids.length} 个表情包`)
-  await search(false) // search() 内已清空选择
-  // 当前页删空时钳回新末页，避免空页
-  if (state.memes.length === 0 && state.page > 1) {
-    state.page = Math.max(1, Math.min(state.page, state.pageCount))
-    await search(false)
-  }
-  refreshCollections()
-  refreshCategories()
-  refreshTags()
+  await refreshLibraryView('structure')
 }
 
 // 批量加入分组：CollectionBuilder 选择模式，追加语义（不覆盖已有成员）
@@ -768,7 +916,12 @@ function batchMoveToCollection() {
     await refreshCollections()
     await refreshCategories()
     const node = findCollectionNode(state.collections, fromId)
-    if (fromId > 0 && (!node || node.count === 0) && !(node?.children || []).length) {
+    if (
+      fromId > 0
+      && (!node || node.count === 0)
+      && !(node?.children || []).length
+      && !node?.system_hidden
+    ) {
       const parent = findParentCollection(state.collections, fromId)
       await window.pywebview?.api?.delete_collection(fromId)
       setActiveCollection(parent ? parent.id : -4)
@@ -876,9 +1029,34 @@ let nativeDragStart: {
   x: number
   y: number
   memeId: number
+  pointerId: number
+  card: HTMLElement
   longPressTimer: ReturnType<typeof setTimeout> | null
 } | null = null
-let chatRecordDragStart: { x: number; y: number; recordId: number } | null = null
+let chatRecordDragStart: {
+  x: number
+  y: number
+  recordId: number
+  pointerId: number
+  card: HTMLElement
+} | null = null
+type LibraryItemType = 'meme' | 'chat_record'
+type LibraryTargetType = 'collection' | 'category'
+type LibraryDropTarget = {
+  type: LibraryTargetType
+  id: number
+  name: string
+}
+let libraryDrag: {
+  itemType: LibraryItemType
+  itemId: number
+  pointerId: number
+  startX: number
+  startY: number
+  card: HTMLElement
+  target: LibraryDropTarget | null
+} | null = null
+const libraryDropTargetKey = ref('')
 let ignoreClick = false
 let ignoreChatRecordClick = false
 let longPressCopyBlock: { memeId: number; pointerId: number; until: number } | null = null
@@ -892,7 +1070,13 @@ function clearCardGesture() {
 
 function onChatRecordPointerDown(e: PointerEvent, record: ChatRecordSummary) {
   if (e.button !== 0 || sortEnabled.value || selectMode.value) return
-  chatRecordDragStart = { x: e.clientX, y: e.clientY, recordId: record.id }
+  chatRecordDragStart = {
+    x: e.clientX,
+    y: e.clientY,
+    recordId: record.id,
+    pointerId: e.pointerId,
+    card: e.currentTarget as HTMLElement,
+  }
   ignoreChatRecordClick = false
 }
 
@@ -909,6 +1093,8 @@ function onCardPointerDown(e: PointerEvent, meme: Meme, card: HTMLElement) {
     x: e.clientX,
     y: e.clientY,
     memeId: meme.id,
+    pointerId: e.pointerId,
+    card,
     longPressTimer: null as ReturnType<typeof setTimeout> | null,
   }
   gesture.longPressTimer = setTimeout(() => {
@@ -921,9 +1107,144 @@ function onCardPointerDown(e: PointerEvent, meme: Meme, card: HTMLElement) {
   nativeDragStart = gesture
 }
 
+function clearLibraryDrag() {
+  const current = libraryDrag
+  if (current) {
+    current.card.classList.remove('library-dragging')
+    try {
+      if (current.card.hasPointerCapture(current.pointerId)) {
+        current.card.releasePointerCapture(current.pointerId)
+      }
+    } catch (_) {}
+  }
+  libraryDrag = null
+  libraryDropTargetKey.value = ''
+}
+
+function beginLibraryDrag(
+  itemType: LibraryItemType,
+  itemId: number,
+  pointerId: number,
+  startX: number,
+  startY: number,
+  card: HTMLElement,
+) {
+  clearLibraryDrag()
+  libraryDrag = { itemType, itemId, pointerId, startX, startY, card, target: null }
+  card.classList.add('library-dragging')
+  try { card.setPointerCapture(pointerId) } catch (_) {}
+}
+
+function libraryTargetAt(x: number, y: number): LibraryDropTarget | null {
+  const element = document.elementFromPoint(x, y) as HTMLElement | null
+  const row = element?.closest<HTMLElement>('[data-library-drop-kind]')
+  if (!row) return null
+  const type = row.dataset.libraryDropKind as LibraryTargetType
+  const id = Number(row.dataset.libraryDropId)
+  if (type === 'collection' && id <= 0) return null
+  if (type === 'category' && id !== -4 && id <= 0) return null
+  if (!Number.isInteger(id)) return null
+  return { type, id, name: row.dataset.libraryDropName || '' }
+}
+
+function showChatDragResult(result: any) {
+  if (result?.cancelled) return
+  if (!result?.ok) {
+    showToast(result?.error || '聊天记录拖拽发送失败')
+    return
+  }
+  const suffix = result.degraded_media_count
+    ? `（${result.degraded_media_count} 个媒体已转为占位）`
+    : ''
+  const rebuildSource = result.self_native_relay
+    ? '（自聊重建后原生转发，发送者为自己）'
+    : result.native_filtered_replay
+      ? '（筛选后原生负载重放）'
+      : result.native_replay
+        ? '（原生负载重放）'
+        : result.native_rebuild ? '（QQNT 原生重组）' : ''
+  const targetSource = result.target_source === 'napcat_plugin'
+    ? '（NapCat 会话 ID）'
+    : ''
+  showToast(`已发送到 ${result.target_label || '当前 QQ 会话'}${targetSource}${rebuildSource}${suffix}`)
+}
+
+function startExternalLibraryDrag(itemType: LibraryItemType, itemId: number) {
+  clearLibraryDrag()
+  nativeDragActive = true
+  if (itemType === 'chat_record') {
+    api('start_chat_record_drag', itemId).then((result) => {
+      nativeDragActive = false
+      showChatDragResult(result)
+    }).catch(() => {
+      nativeDragActive = false
+      showToast('聊天记录拖拽发送失败')
+    })
+    return
+  }
+  startNativeDrag(itemId).then((result) => {
+    nativeDragActive = false
+    if (result?.cancelled) return
+    if (!result?.ok) {
+      showToast(result?.error || '拖拽失败：本地文件不存在')
+      return
+    }
+    void refreshRecentUsage()
+    if (result.sent_as_sticker) {
+      const targetSource = result.target_source === 'napcat_plugin'
+        ? '（NapCat 会话 ID）'
+        : ''
+      showToast(`已作为表情包发送到 ${result.target_label || '当前 QQ 会话'}${targetSource}`)
+    }
+  }).catch(() => { nativeDragActive = false })
+}
+
+function updateLibraryDrag(e: PointerEvent) {
+  if (!libraryDrag) return
+  const target = libraryTargetAt(e.clientX, e.clientY)
+  libraryDrag.target = target
+  libraryDropTargetKey.value = target ? `${target.type}:${target.id}` : ''
+  const outside = (
+    e.clientX <= 0 || e.clientY <= 0
+    || e.clientX >= window.innerWidth || e.clientY >= window.innerHeight
+  )
+  const movingTowardSidebar = e.clientX < libraryDrag.startX - 4
+  const distance = Math.hypot(
+    e.clientX - libraryDrag.startX, e.clientY - libraryDrag.startY,
+  )
+  if (outside || (!target && !movingTowardSidebar && distance > 20)) {
+    const { itemType, itemId } = libraryDrag
+    startExternalLibraryDrag(itemType, itemId)
+  }
+}
+
+async function finishLibraryDrop() {
+  if (!libraryDrag) return
+  const { itemType, itemId, target } = libraryDrag
+  clearLibraryDrag()
+  if (itemType === 'meme') ignoreClick = true
+  else ignoreChatRecordClick = true
+  if (!target) return
+  const result = await api(
+    'assign_library_item', itemType, itemId, target.type, target.id,
+  )
+  if (!result?.ok) {
+    showToast(result?.error || '修改归属失败')
+    return
+  }
+  const itemLabel = itemType === 'meme' ? '表情包' : '聊天记录'
+  const action = target.type === 'collection' ? '已加入分组' : '已切换到类别'
+  showToast(`${itemLabel}${action}「${target.name}」`)
+  await refreshLibraryView('structure')
+}
+
 function onDocPointerMove(e: PointerEvent) {
   if (drag.dragState.memeId) {
     drag.onPointerMove(e)
+    return
+  }
+  if (libraryDrag) {
+    updateLibraryDrag(e)
     return
   }
   if (chatRecordDragStart && !nativeDragActive) {
@@ -932,46 +1253,26 @@ function onDocPointerMove(e: PointerEvent) {
       e.clientY - chatRecordDragStart.y,
     )
     if (dist > LONG_PRESS_MOVE_PX) {
-      const recordId = chatRecordDragStart.recordId
+      const start = chatRecordDragStart
       chatRecordDragStart = null
       ignoreChatRecordClick = true
-      nativeDragActive = true
-      api('start_chat_record_drag', recordId).then((result) => {
-        nativeDragActive = false
-        if (result?.cancelled) return
-        if (!result?.ok) {
-          showToast(result?.error || '聊天记录拖拽发送失败')
-          return
-        }
-        const suffix = result.degraded_media_count
-          ? `（${result.degraded_media_count} 个媒体已转为占位）`
-          : ''
-        const rebuildSource = result.native_replay
-          ? '（原生负载重放）'
-          : result.native_rebuild ? '（QQNT 原生重组）' : ''
-        const targetSource = result.target_source === 'napcat_plugin'
-          ? '（NapCat 会话 ID）'
-          : ''
-        showToast(`已发送到 ${result.target_label || '当前 QQ 会话'}${targetSource}${rebuildSource}${suffix}`)
-      }).catch(() => {
-        nativeDragActive = false
-        showToast('聊天记录拖拽发送失败')
-      })
+      beginLibraryDrag(
+        'chat_record', start.recordId, start.pointerId, start.x, start.y, start.card,
+      )
+      updateLibraryDrag(e)
     }
     return
   }
   if (!nativeDragStart || sortEnabled.value || selectMode.value) return
   const dist = Math.hypot(e.clientX - nativeDragStart.x, e.clientY - nativeDragStart.y)
   if (dist > LONG_PRESS_MOVE_PX) {
-    const id = nativeDragStart.memeId
+    const start = nativeDragStart
     clearCardGesture()
-    // 原生拖拽进行中置标志，回拖到窗口视为取消（不触发 drop 导入）
-    nativeDragActive = true
-    startNativeDrag(id).then((ok) => {
-      nativeDragActive = false
-      ignoreClick = true
-      if (!ok) showToast('拖拽失败：本地文件不存在')
-    }).catch(() => { nativeDragActive = false })
+    ignoreClick = true
+    beginLibraryDrag(
+      'meme', start.memeId, start.pointerId, start.x, start.y, start.card,
+    )
+    updateLibraryDrag(e)
   }
 }
 
@@ -979,6 +1280,10 @@ async function onDocPointerUp(e: PointerEvent) {
   if (drag.dragState.memeId) {
     const wasActive = await drag.onPointerUp()
     if (wasActive) ignoreClick = true
+    return
+  }
+  if (libraryDrag) {
+    await finishLibraryDrop()
     return
   }
   if (longPressCopyBlock?.pointerId === e.pointerId) {
@@ -991,6 +1296,7 @@ async function onDocPointerUp(e: PointerEvent) {
 
 function onDocPointerCancel() {
   if (drag.dragState.memeId) drag.cancel()
+  clearLibraryDrag()
   longPressCopyBlock = null
   chatRecordDragStart = null
   clearCardGesture()
@@ -1013,6 +1319,87 @@ function onDragLeave(e: DragEvent) {
   if (nativeDragActive) return
   dragCounter--
   if (dragCounter <= 0) { dragCounter = 0; dragOver.value = false }
+}
+
+async function finishMemeImport() {
+  showToast('导入成功')
+  await refreshLibraryView('structure')
+}
+
+async function finishChatRecordImport(result: any) {
+  showToast(result?.created === false ? '聊天记录已更新' : '聊天记录导入成功')
+  await refreshLibraryView('content')
+}
+
+function duplicateIds(result: any): number[] {
+  const values = Array.isArray(result?.duplicate_ids)
+    ? result.duplicate_ids
+    : (result?.existing_id ? [result.existing_id] : [])
+  return [...new Set(values.map(Number).filter(Number.isInteger))]
+}
+
+async function revealExistingImports(ids: number[]) {
+  const uniqueIds = [...new Set((ids || []).map(Number).filter(Number.isInteger))]
+  if (!uniqueIds.length) {
+    showToast('该图片已存在，但无法定位本地记录')
+    return
+  }
+  const recorded = await api('record_meme_uses', uniqueIds)
+  if (!recorded?.ok || !recorded.ids?.length) {
+    showToast('该图片已存在，但无法更新最近使用')
+    return
+  }
+  sidebarTab.value = 'collections'
+  state.activeGenres = [...ALL_GENRES]
+  state.activeTags = new Set()
+  state.searchQuery = ''
+  state.activeCategory = null
+  state.activeCollection = -3
+  await Promise.all([refreshTags(), refreshCollections(), refreshCategories()])
+  await search()
+  showToast(recorded.ids.length > 1
+    ? `发现 ${recorded.ids.length} 个已有表情`
+    : '该图片已存在')
+}
+
+async function handleSimilarImport(result: any) {
+  const action = await similarImportDialog.value?.open(result?.candidates || [])
+  if (!action) return
+  const resolved = await api('resolve_similar_import', result.token, action)
+  if (resolved?.ok && resolved.imported) await finishMemeImport()
+  else if (resolved?.ok && resolved.existing_id) {
+    await revealExistingImports([resolved.existing_id])
+  }
+  else if (resolved?.ok) showToast('已跳过该图片')
+  else showToast(resolved?.error || '处理失败')
+}
+
+async function handleLargeMemeImport(result: any) {
+  const choice = await largeMemeImportDialog.value?.open(result?.count || 1)
+  if (!choice) {
+    await api('cancel_large_meme_import', result?.token || '')
+    return
+  }
+  const resolved = await api(
+    'resolve_large_meme_import',
+    result.token,
+    choice.mode,
+    choice.remember,
+  )
+  if (resolved?.async) {
+    onImporting()
+    return
+  }
+  if (resolved?.similar_pending) {
+    await handleSimilarImport(resolved)
+    return
+  }
+  if (resolved?.duplicate) {
+    await revealExistingImports(duplicateIds(resolved))
+    return
+  }
+  if (resolved?.ok) await finishMemeImport()
+  else showToast(resolved?.error || '导入失败')
 }
 
 async function onDrop(e: DragEvent) {
@@ -1056,16 +1443,20 @@ async function onDrop(e: DragEvent) {
   if (uri) {
     try {
       const r = await window.pywebview?.api?.download_original_image(uri)
-      if (r?.ok) { showToast('导入成功'); search(); refreshCollections(); refreshCategories(); return }
-      if (r?.duplicate) { showToast('该图片已存在'); return }
+      if (r?.large_file_pending) {
+        await handleLargeMemeImport(r)
+        return
+      }
+      if (r?.ok) {
+        await finishMemeImport()
+        return
+      }
+      if (r?.duplicate) {
+        await revealExistingImports(duplicateIds(r))
+        return
+      }
       if (r?.similar_pending) {
-        const action = await similarImportDialog.value?.open(r.candidates || [])
-        if (action) {
-          const rr = await window.pywebview?.api?.resolve_similar_import(r.token, action)
-          if (rr?.ok && rr.imported) { showToast('导入成功'); search(); refreshCollections(); refreshCategories() }
-          else if (rr?.ok) { showToast('已跳过该图片') }
-          else { showToast(rr?.error || '处理失败') }
-        }
+        await handleSimilarImport(r)
         return
       }
       showToast(r?.error || '导入失败')
@@ -1092,18 +1483,27 @@ async function onDrop(e: DragEvent) {
       const res = await fetch('/api/upload/', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ files: [{ name: file.name, data: b64 }] }) })
       let j: any = null
       try { j = await res.json() } catch (_) { j = null }
-      if (j?.similar_pending) {
-        const action = await similarImportDialog.value?.open(j.candidates || [])
-        if (action) {
-          const rr = await window.pywebview?.api?.resolve_similar_import(j.token, action)
-          if (rr?.ok && rr.imported) { showToast('导入成功'); search(); refreshCollections(); refreshCategories() }
-          else if (rr?.ok) { showToast('已跳过该图片') }
-          else { showToast(rr?.error || '处理失败') }
-        }
+      if (j?.large_file_pending) {
+        await handleLargeMemeImport(j)
         return
       }
-      if (j?.duplicate) { showToast('该图片已存在'); return }
-      if (res.ok || j?.ok) { showToast('导入成功'); search(); refreshCollections(); refreshCategories() }
+      if (j?.similar_pending) {
+        await handleSimilarImport(j)
+        return
+      }
+      if (j?.duplicate) {
+        await revealExistingImports(duplicateIds(j))
+        return
+      }
+      if (j?.ok === true && j?.chat_record) {
+        await finishChatRecordImport(j)
+        return
+      }
+      // Bottle 对业务失败也可能返回 HTTP 200；必须以响应体的 ok 为准，
+      // 否则后端回滚导入时仍会误报“导入成功”。
+      if (j?.ok === true) {
+        await finishMemeImport()
+      }
       else { showToast(j?.error || '导入失败：服务器返回错误') }
     } catch (_) {
       showToast('导入失败：网络或服务异常')
@@ -1235,11 +1635,11 @@ onUnmounted(() => {
             >类别</button>
           </div>
           <button
-            v-if="!sidebarCollapsed && sidebarTab === 'categories'"
+            v-if="!sidebarCollapsed"
             class="sidebar-add"
-            title="新建类别"
-            aria-label="新建类别"
-            @click="ctx.show([{ action: 'new-category-root', label: '新建类别' }], {}, $event.clientX, $event.clientY)"
+            :title="sidebarTab === 'categories' ? '新建类别路径' : '新建分组路径'"
+            :aria-label="sidebarTab === 'categories' ? '新建类别路径' : '新建分组路径'"
+            @click="onSidebarAdd"
           >＋</button>
         </div>
         <div id="tree">
@@ -1250,7 +1650,10 @@ onUnmounted(() => {
             :active-id="sidebarCollapsed ? activeTopLevel : activeSidebarId"
             :depth="0"
             :collapsed="sidebarCollapsed"
+            :drop-kind="sidebarTab === 'categories' ? 'category' : 'collection'"
+            :drop-target-key="libraryDropTargetKey"
             @select="onSidebarSelect"
+            @node-hover="onSidebarNodeHover"
             @folder-context="onFolderRightClick"
           />
         </div>
@@ -1274,14 +1677,14 @@ onUnmounted(() => {
               v-for="item in genreOptions"
               :key="item.value"
               class="tag genre-tag"
-              :class="{ active: state.activeGenre === item.value }"
-              role="button"
+              :class="{ active: state.activeGenres.includes(item.value) }"
+              role="checkbox"
               tabindex="0"
-              :aria-pressed="state.activeGenre === item.value"
-              @click="setGenre(item.value)"
-              @keydown.enter.prevent="setGenre(item.value)"
-              @keydown.space.prevent="setGenre(item.value)"
-            >{{ item.label }}</span>
+              :aria-checked="state.activeGenres.includes(item.value)"
+              @click="toggleGenre(item.value)"
+              @keydown.enter.prevent="toggleGenre(item.value)"
+              @keydown.space.prevent="toggleGenre(item.value)"
+            ><svg class="genre-check" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><rect x="1.5" y="1.5" width="13" height="13" rx="3"/><path v-if="state.activeGenres.includes(item.value)" d="m4 8 2.5 2.5L12 5"/></svg>{{ item.label }}</span>
           </div>
           <div v-for="group in tagGroups" :key="group.category" class="tag-group">
             <span class="tag-category">{{ group.category }}</span>
@@ -1357,8 +1760,8 @@ onUnmounted(() => {
               class="meme-card chat-record-card"
               role="button"
               tabindex="0"
-              :aria-label="'查看聊天记录 ' + record.title"
-              title="点击查看详情；拖到 QQ 当前聊天窗口直接发送"
+              :aria-label="'查看聊天记录 ' + (record.name || record.title)"
+              title="点击查看详情；拖到侧栏修改归属，拖出窗口发送到 QQ"
               @click="openChatRecord(record)"
               @pointerdown="onChatRecordPointerDown($event, record)"
               @keydown.enter.prevent="openChatRecord(record)"
@@ -1371,7 +1774,7 @@ onUnmounted(() => {
                 <span class="chat-record-count">{{ record.node_count }} 条消息</span>
               </div>
               <span class="genre-badge">聊天记录</span>
-              <span class="meme-name">{{ record.title }}</span>
+              <span class="meme-name">{{ record.name || record.title }}</span>
             </div>
           </div>
 
@@ -1397,11 +1800,16 @@ onUnmounted(() => {
               >
                 <div
                   class="meme-card"
-                  :class="{ 'dragging': drag.dragState.active && drag.dragState.memeId === meme.id, selected: state.selectedIds.has(meme.id) }"
+                  :class="{
+                    dragging: drag.dragState.active && drag.dragState.memeId === meme.id,
+                    selected: state.selectedIds.has(meme.id),
+                    'sidebar-related': isMemeInHoveredSidebarNode(meme),
+                  }"
                   :data-meme-id="meme.id"
                   role="button"
                   tabindex="0"
                   :aria-label="meme.name"
+                  title="拖到侧栏修改归属，拖出窗口发送或复制文件"
                   @click="handleCopy(meme)"
                   @contextmenu="onMemeRightClick($event, meme)"
                   @pointerdown="onCardPointerDown($event, meme, $event.currentTarget as HTMLElement)"
@@ -1410,7 +1818,12 @@ onUnmounted(() => {
                   @keydown.enter.prevent="handleCopy(meme)"
                   @keydown.space.prevent="handleCopy(meme)"
                 >
-                  <img :src="memeSrc(meme)" :alt="meme.name" loading="lazy">
+                  <img
+                    :src="memeSrc(meme)"
+                    :alt="meme.name"
+                    :draggable="false"
+                    loading="lazy"
+                  >
                   <span v-if="state.selectedIds.has(meme.id)" class="select-badge">✓</span>
                   <button
                     v-if="!selectMode && !sortEnabled"
@@ -1436,8 +1849,8 @@ onUnmounted(() => {
               <path d="M3 7a2 2 0 0 1 2-2h4l2 3h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z"/>
               <path d="M8.5 13.5h7M8.5 16.5h4.5"/>
             </svg>
-            <div class="text">没有符合条件的内容</div>
-            <button v-if="state.activeGenre !== 'chat_record'" class="btn btn-primary" @click="showImportMenu()">导入表情包</button>
+            <div class="text">{{ state.activeGenres.length ? '没有符合条件的内容' : '请选中至少一种体裁' }}</div>
+            <button v-if="state.activeGenres.some(genre => genre !== 'chat_record')" class="btn btn-primary" @click="showImportMenu()">导入表情包</button>
           </div>
         </div>
       </div>
@@ -1445,8 +1858,8 @@ onUnmounted(() => {
   </div>
 
   <CollectionBuilder />
-  <ImportMenu ref="importMenu" @imported="onImportDone" @importing="onImporting" @notion="showNotionImport" />
-  <ImportProgressOverlay ref="importProgress" @imported="onImportDone" />
+  <ImportMenu ref="importMenu" @imported="onImportDone" @importing="onImporting" @notion="showNotionImport" @duplicates="revealExistingImports" @large-pending="handleLargeMemeImport" />
+  <ImportProgressOverlay ref="importProgress" @imported="onImportDone" @duplicates="revealExistingImports" />
   <NotionImportDialog ref="notionImportDialog" @imported="onImportDone" />
   <SyncOverlay ref="syncOverlay" @synced="onSyncDone" />
   <MemeDetails
@@ -1458,12 +1871,17 @@ onUnmounted(() => {
   <ChatRecordDetails
     ref="chatRecordDetails"
     @copied="showToast('发送命令已复制')"
+    @saved="onChatRecordSaved"
+    @request-create-collection="createChatCollection"
+    @request-create-category="createChatCategory"
     @request-delete="deleteChatRecord"
   />
   <TagEditor ref="tagEditor" />
   <UpdateDialog ref="updateDialog" />
   <InputDialog ref="inputDialog" />
   <ConfirmDialog ref="confirmDialog" />
+  <HierarchyDeleteDialog ref="hierarchyDeleteDialog" />
+  <LargeMemeImportDialog ref="largeMemeImportDialog" />
   <SimilarImportDialog ref="similarImportDialog" />
   <ContextMenu
     :visible="ctx.visible.value" :x="ctx.x.value" :y="ctx.y.value"
@@ -1479,7 +1897,7 @@ onUnmounted(() => {
       <div class="drop-icon">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/></svg>
       </div>
-      <div class="drop-text">拖放图片到此处导入</div>
+      <div class="drop-text">拖放图片或聊天记录到此处导入</div>
     </div>
   </div>
 

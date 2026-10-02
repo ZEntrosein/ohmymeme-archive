@@ -11,6 +11,7 @@ declare global {
     refreshTags: () => void
     refreshCollections: () => void
     refreshCategories: () => void
+    refreshRecent: () => void
     refreshLibrary: (kind?: 'content' | 'structure') => void
     showLanDeviceConfirm: (device: any) => void
   }

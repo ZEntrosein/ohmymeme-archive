@@ -272,8 +272,8 @@ def create_daily_copy(source, target_dir, file_hash: str) -> dict:
         tmp_path = Path(tmp_name)
         try:
             saver(image, str(tmp_path))
-            size, _ = _validate_image(tmp_path, frame_count)
             final_path = encoded_path
+            size, _ = _validate_image(tmp_path, frame_count)
             # 小型、已高度压缩的源文件不因重新编码变大；仍复制到日常副本目录，
             # 保持原件与日常使用文件在物理上隔离。
             can_reuse_original = (

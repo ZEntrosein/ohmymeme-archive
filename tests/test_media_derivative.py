@@ -169,7 +169,6 @@ class TestMediaDerivative(unittest.TestCase):
             self.assertEqual(image.format, "WEBP")
             self.assertEqual(image.n_frames, 2)
 
-
 class TestLargeOriginalImport(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
@@ -199,12 +198,18 @@ class TestLargeOriginalImport(unittest.TestCase):
         with (
             mock.patch("src.webui.get_config", return_value=self.cfg),
             mock.patch("src.webui.get_db", return_value=self.db),
-            mock.patch("src.webui.build_manifest"),
+            mock.patch("src.webui.add_memes_to_manifest", return_value=True),
+            mock.patch("src.webui.request_manifest_rebuild") as rebuild,
+            mock.patch("src.webui.build_manifest") as full_rebuild,
+            mock.patch("src.library_events.notify_changed") as notify_changed,
         ):
             result = ui._do_import([str(source)], ["大原件"])
+            duplicate = ui._do_import([str(source)], ["大原件"])
 
         self.assertEqual(result["rejected"], 0)
         self.assertEqual(len(result["ids"]), 1)
+        self.assertEqual(duplicate["skipped_dup"], 1)
+        self.assertEqual(duplicate["duplicate_ids"], result["ids"])
         row = self.db.get_by_id(result["ids"][0])
         self.assertEqual(row["file_size"], source_size)
         self.assertGreater(row["file_size"], 20 * 1024 * 1024)
@@ -212,6 +217,51 @@ class TestLargeOriginalImport(unittest.TestCase):
         daily = self.data / "derivatives" / row["daily_filename"]
         self.assertTrue(daily.is_file())
         self.assertLess(daily.stat().st_size, source_size)
+        rebuild.assert_not_called()
+        full_rebuild.assert_not_called()
+        notify_changed.assert_called_once_with("structure")
+
+    def test_import_over_20_mib_can_archive_only_compressed_copy(self):
+        from src.webui import WebUI
+
+        source = self.tmp / "compressed-only.png"
+        Image.new("RGB", (64, 64), (30, 90, 150)).save(source)
+        with source.open("ab") as output:
+            output.truncate(20 * 1024 * 1024 + 1)
+        source_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+
+        ui = WebUI.__new__(WebUI)
+        ui._cfg = self.cfg
+        with (
+            mock.patch("src.webui.get_config", return_value=self.cfg),
+            mock.patch("src.webui.get_db", return_value=self.db),
+            mock.patch("src.webui.add_memes_to_manifest", return_value=True),
+            mock.patch("src.library_events.notify_changed"),
+        ):
+            result = ui._do_import(
+                [str(source)],
+                ["仅压缩"],
+                large_file_mode="compressed_only",
+            )
+            duplicate = ui._do_import(
+                [str(source)],
+                ["仅压缩"],
+                large_file_mode="compressed_only",
+            )
+
+        self.assertEqual(len(result["ids"]), 1)
+        self.assertEqual(duplicate["duplicate_ids"], result["ids"])
+        row = self.db.get_by_id(result["ids"][0])
+        stored = self.cache / row["filename"]
+        self.assertEqual(row["compressed_only"], 1)
+        self.assertEqual(row["source_file_hash"], source_hash)
+        self.assertNotEqual(row["file_hash"], source_hash)
+        self.assertEqual(row["daily_filename"], row["filename"])
+        self.assertTrue(stored.is_file())
+        self.assertLess(stored.stat().st_size, source.stat().st_size)
+        self.assertFalse(
+            (self.cfg.derivative_dir / row["daily_filename"]).exists()
+        )
 
     def test_normal_copy_uses_daily_asset_and_original_copy_uses_source(self):
         from src.webui import JsApi, WebUI
@@ -274,13 +324,17 @@ class TestLargeOriginalImport(unittest.TestCase):
         api._db = self.db
         api._webui = ui
 
-        with mock.patch("src.webui.build_manifest"):
+        with (
+            mock.patch("src.webui.remove_memes_from_manifest", return_value=True),
+            mock.patch("src.library_events.notify_changed") as notify_changed,
+        ):
             self.assertTrue(api.delete_meme(meme_id))
 
         self.assertFalse(source.exists())
         self.assertFalse((self.cfg.derivative_dir / daily_result["filename"]).exists())
         self.assertFalse(thumb.exists())
         self.assertIsNone(self.db.get_by_id(meme_id))
+        notify_changed.assert_called_once_with("structure")
 
     def test_thumbnail_from_local_daily_copy_skips_virtual_drive_gate(self):
         from src.webui import WebUI

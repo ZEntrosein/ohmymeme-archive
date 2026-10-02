@@ -15,6 +15,8 @@ import json
 import shutil
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -24,7 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src import sync
 from src.config import Config
-from src.manifest import INDEX_FILENAME
+from src.manifest import INDEX_FILENAME, add_memes
 from src.sync import SyncError, cleanup_remote_orphans, get_sync_progress
 
 
@@ -177,6 +179,14 @@ class _FakeDb:
                 return dict(r, id=i + 1)
         return None
 
+    def get_by_id(self, meme_id):
+        if 0 < meme_id <= len(self.rows):
+            return dict(self.rows[meme_id - 1], id=meme_id, category_id=None)
+        return None
+
+    def get_category_path_names(self, category_id):
+        return []
+
     def reorder_memes(self, meme_ids):
         id_to_name = {i + 1: r["filename"] for i, r in enumerate(self.rows)}
         self.order = [id_to_name.get(i) for i in meme_ids]
@@ -185,18 +195,23 @@ class _FakeDb:
         self,
         filename,
         file_hash="",
+        source_file_hash="",
+        compressed_only=0,
         width=0,
         height=0,
         file_size=0,
         mime_type="image/png",
         original_name="",
         tags=None,
+        category_id=None,
     ):
         self.rows.append(
             {
                 "filename": filename,
                 "original_name": original_name,
                 "file_hash": file_hash,
+                "source_file_hash": source_file_hash,
+                "compressed_only": compressed_only,
                 "file_size": file_size,
             }
         )
@@ -286,6 +301,50 @@ class TestSyncPush(unittest.TestCase):
         return {m["filename"] for m in self.fake_backend.manifest_payload["memes"]}
 
     # ─── 既有用例（止血修复） ───
+
+    def test_incremental_manifest_add_does_not_read_virtual_originals(self):
+        meme_id = self.fake_db.add_meme(
+            "new.png",
+            file_hash="new-hash",
+            file_size=123,
+            original_name="新图片",
+        )
+
+        with patch(
+            "src.manifest.guarded_read",
+            side_effect=AssertionError("增量清单更新不应读取原件"),
+        ):
+            self.assertTrue(add_memes([meme_id]))
+
+        manifest = json.loads(
+            (self.data_dir / INDEX_FILENAME).read_text(encoding="utf-8")
+        )
+        self.assertEqual(manifest["memes"][0]["filename"], "new.png")
+        self.assertEqual(manifest["memes"][0]["sha256"], "new-hash")
+        self.assertEqual(manifest["memes"][0]["mtime"], "")
+
+    def test_incremental_manifest_add_does_not_wait_for_full_rebuild_lock(self):
+        import src.manifest as manifest_module
+
+        meme_id = self.fake_db.add_meme("new.png", file_hash="new-hash")
+        locked = threading.Event()
+        release = threading.Event()
+
+        def hold_manifest_lock():
+            with manifest_module._MANIFEST_LOCK:
+                locked.set()
+                release.wait(2)
+
+        holder = threading.Thread(target=hold_manifest_lock)
+        holder.start()
+        self.assertTrue(locked.wait(1))
+        started = time.monotonic()
+        try:
+            self.assertFalse(add_memes([meme_id]))
+            self.assertLess(time.monotonic() - started, 0.2)
+        finally:
+            release.set()
+            holder.join(2)
 
     def test_meme_upload_failure_aborts_manifest(self):
         """普通图片上传失败时：抛 SyncError、不上传 manifest、状态为 error"""
@@ -755,6 +814,53 @@ class TestSafeRemoteFname(unittest.TestCase):
             None,
         ):
             self.assertFalse(sync._safe_remote_fname(name), name)
+
+
+class TestApplyRemoteCollections(unittest.TestCase):
+    def test_preserves_nested_and_empty_collection_paths(self):
+        class FakeDb:
+            def __init__(self):
+                self.created = []
+                self.members = []
+
+            def create_collection(self, name, parent_id=None):
+                cid = len(self.created) + 1
+                self.created.append((cid, name, parent_id))
+                return cid
+
+            def get_by_filename(self, filename):
+                return {"id": 9} if filename == "hello.png" else None
+
+            def add_to_collection(self, meme_id, collection_id):
+                self.members.append((meme_id, collection_id))
+
+        db = FakeDb()
+        remote = {
+            "collections": [
+                {
+                    "name": "角色",
+                    "filenames": [],
+                    "children": [
+                        {
+                            "name": "爱丽丝",
+                            "filenames": [],
+                            "children": [
+                                {"name": "问候", "filenames": ["hello.png"]}
+                            ],
+                        }
+                    ],
+                }
+            ]
+        }
+
+        with patch("src.sync.get_db", return_value=db):
+            sync._apply_remote_collections(remote)
+
+        self.assertEqual(
+            db.created,
+            [(1, "角色", None), (2, "爱丽丝", 1), (3, "问候", 2)],
+        )
+        self.assertEqual(db.members, [(9, 3)])
 
 
 if __name__ == "__main__":

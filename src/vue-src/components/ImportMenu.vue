@@ -7,6 +7,8 @@ const emit = defineEmits<{
   importing: []
   notion: []
   error: [msg: string]
+  duplicates: [ids: number[]]
+  largePending: [result: any]
 }>()
 
 const visible = ref(false)
@@ -30,8 +32,16 @@ async function importLocal() {
   pending.value = true
   try {
     const result = await api('import_memes')
+    if (result?.large_file_pending) {
+      emit('largePending', result)
+      return
+    }
     if (result?.ok) {
       if (result.async) { emit('importing'); return }  // 后台导入，覆盖层轮询
+      if (result.duplicate_ids?.length) {
+        emit('duplicates', result.duplicate_ids)
+        return
+      }
       emit('imported')
       showToast(result.imported > 0 ? '导入完成' : '未导入文件')
     } else if (!result?.cancelled) {
@@ -50,12 +60,20 @@ async function importFolder() {
   try {
     const r = await api('import_folder', makeGroup)
     if (!r) return
+    if (r.large_file_pending) {
+      emit('largePending', r)
+      return
+    }
     if (!r.ok) {
       if (r.cancelled) return
       showToast(r.error || '导入失败')
       return
     }
     if (r.async) { emit('importing'); return }  // 后台导入，覆盖层轮询
+    if (r.duplicate_ids?.length) {
+      emit('duplicates', r.duplicate_ids)
+      return
+    }
     emit('imported')
     showToast(r.imported > 0 ? '导入完成，共 ' + r.imported + ' 个表情' : '未导入文件')
   } finally {
@@ -70,6 +88,17 @@ async function importClipboard() {
   try {
     const result = await api('import_from_clipboard')
     if (!result) { showToast('导入失败'); return }
+    if (result.large_file_pending) {
+      emit('largePending', result)
+      return
+    }
+    const duplicateIds = Array.isArray(result.duplicate_ids)
+      ? result.duplicate_ids
+      : (result.existing_id ? [result.existing_id] : [])
+    if (duplicateIds.length) {
+      emit('duplicates', duplicateIds)
+      return
+    }
     if (!result.ok) { showToast(result.error || '导入失败'); return }
     if (result.id > 0) {
       emit('imported')

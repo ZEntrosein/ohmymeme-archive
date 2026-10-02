@@ -5,6 +5,7 @@ import { api, rememberFocus, restoreFocus, trapTabFocus } from '../utils/api'
 
 interface MemeDetail extends Meme {
   file_size?: number
+  compressed_only?: boolean
   created_at?: string
   updated_at?: string
   manual_description: string
@@ -155,7 +156,7 @@ const categoryOptions = computed(() => {
   const out: CategoryDetail[] = []
   const walk = (items: CategoryDetail[]) => {
     for (const item of items) {
-      out.push(item)
+      if (item.id > 0) out.push(item)
       if (item.children?.length) walk(item.children)
     }
   }
@@ -891,6 +892,10 @@ defineExpose({ open })
             <div>
               <dt>大小</dt>
               <dd>{{ formatFileSize(detail.file_size) }}</dd>
+            </div>
+            <div v-if="detail.compressed_only">
+              <dt>归档</dt>
+              <dd>仅压缩版（无原件）</dd>
             </div>
           </dl>
 

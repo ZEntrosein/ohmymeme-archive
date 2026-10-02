@@ -95,6 +95,9 @@ class Config:
         "bulk_read_pause_seconds": 1.0,
         # 当前筛选存在后续页时，后台按限流参数补建日常副本和缩略图
         "bulk_read_prefetch_pages": False,
+        # 超过 20 MiB 的普通媒体：ask 每次询问；keep_original 保留原件；
+        # compressed_only 仅归档日常压缩版。聊天记录媒体不经过此设置。
+        "large_meme_import_mode": "ask",
         # 本地备份
         "backup_dir": "",  # 自定义备份输出目录（空=默认 data_dir/backups）
         # 云端同步
@@ -152,6 +155,7 @@ class Config:
         "napcat_webui_token": "",
         "napcat_command": "/omm",
         "napcat_send_mode": "original_native",
+        "napcat_image_send_mode": "sticker",
         # Telegram 导入
         "tg_tdata_path": "",  # 手动指定的 Telegram tdata 目录
         # Notion 只读导入
@@ -174,6 +178,10 @@ class Config:
         "search_description": True,
         "search_image_text": True,
         "show_uncategorized": True,  # 显示「未分组」分组
+        # “隐藏”系统分组及其子级内容只在该子树中显示
+        "hidden_collection_enabled": True,
+        # 删除分组/类别层级：ask 每次询问；promote 提升子级；cascade 删除子树
+        "hierarchy_delete_mode": "ask",
         "record_recent_use": True,  # 复制时记录最近使用
         "show_startup_animation": True,  # 启动时播放启动动画（关闭时降级 300ms 延时）
     }
@@ -253,6 +261,12 @@ class Config:
     def _migrate(self, raw):
         """配置文件版本迁移"""
         saved_ver = raw.get("version", "")
+        if (
+            "napcat_image_send_mode" not in raw
+            and raw.get("napcat_gif_send_mode") in ("sticker", "image")
+        ):
+            self._data["napcat_image_send_mode"] = raw["napcat_gif_send_mode"]
+            self._dirty = True
         if saved_ver == _CONFIG_VERSION:
             return
         # 0.2.0 及之前：删除 window_width/window_height

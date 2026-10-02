@@ -199,6 +199,7 @@ function collectNapCatSettings() {
     napcat_token: document.getElementById('s-napcat-token')?.value || '',
     napcat_command: document.getElementById('s-napcat-command')?.value.trim() || '/omm',
     napcat_send_mode: document.getElementById('s-napcat-send-mode')?.value || 'original_native',
+    napcat_image_send_mode: document.getElementById('s-napcat-image-send-mode')?.value || 'sticker',
   };
 }
 
@@ -308,8 +309,8 @@ async function refreshNapCatListenerStatus() {
   }
   const lines = [headline, '本地已保存 ' + Number(r.saved_count || 0) + ' 份聊天记录'];
   const latest = r.latest || r.last_saved;
-  if (latest && latest.title) {
-    lines.push('最近保存：' + latest.title + ' · ' + Number(latest.node_count || 0) + ' 条消息');
+  if (latest && (latest.name || latest.title)) {
+    lines.push('最近保存：' + (latest.name || latest.title) + ' · ' + Number(latest.node_count || 0) + ' 条消息');
   }
   if (r.last_error) {
     lines.push('最近错误：' + r.last_error);
@@ -434,8 +435,12 @@ async function getSettings() {
   if (cm) cm.value = String(s.copy_resize_mode ?? 1);
   if (as) as.checked = s.auto_start === true;
   if (ss) ss.checked = s.silent_start === true;
-  const unc = document.getElementById('s-show-uncategorized');
-  if (unc) unc.checked = s.show_uncategorized !== false;
+  const hiddenCollection = document.getElementById('s-hidden-collection-enabled');
+  if (hiddenCollection) hiddenCollection.checked = s.hidden_collection_enabled !== false;
+  const hierarchyDeleteMode = document.getElementById('s-hierarchy-delete-mode');
+  if (hierarchyDeleteMode) hierarchyDeleteMode.value = ['promote', 'cascade'].includes(s.hierarchy_delete_mode) ? s.hierarchy_delete_mode : 'ask';
+  const largeMemeImportMode = document.getElementById('s-large-meme-import-mode');
+  if (largeMemeImportMode) largeMemeImportMode.value = ['keep_original', 'compressed_only'].includes(s.large_meme_import_mode) ? s.large_meme_import_mode : 'ask';
   const rec = document.getElementById('s-record-recent');
   if (rec) rec.checked = s.record_recent_use !== false;
   const searchDescription = document.getElementById('s-search-description');
@@ -520,6 +525,8 @@ async function getSettings() {
   if (napcatCommand) napcatCommand.value = s.napcat_command || '/omm';
   const napcatSendMode = document.getElementById('s-napcat-send-mode');
   if (napcatSendMode) napcatSendMode.value = s.napcat_send_mode || 'original_native';
+  const napcatImageSendMode = document.getElementById('s-napcat-image-send-mode');
+  if (napcatImageSendMode) napcatImageSendMode.value = s.napcat_image_send_mode || 'sticker';
   const tgtd = document.getElementById('s-tg-tdata');
   if (tgtd && s.tg_tdata_path) tgtd.value = s.tg_tdata_path;
   checkConnectivity();  // DeepSeek V4 Flash
@@ -772,7 +779,9 @@ async function saveSettings() {
   const hotkey_show_at_mouse = document.getElementById('s-hotkey-show-at-mouse')?.checked === true;
   const auto_start = document.getElementById('s-auto-start')?.checked === true;
   const silent_start = document.getElementById('s-silent-start')?.checked === true;
-  const show_uncategorized = document.getElementById('s-show-uncategorized')?.checked !== false;
+  const hidden_collection_enabled = document.getElementById('s-hidden-collection-enabled')?.checked !== false;
+  const hierarchy_delete_mode = document.getElementById('s-hierarchy-delete-mode')?.value || 'ask';
+  const large_meme_import_mode = document.getElementById('s-large-meme-import-mode')?.value || 'ask';
   const record_recent_use = document.getElementById('s-record-recent')?.checked !== false;
   const search_description = document.getElementById('s-search-description')?.checked !== false;
   const search_image_text = document.getElementById('s-search-image-text')?.checked !== false;
@@ -794,7 +803,7 @@ async function saveSettings() {
     hotkey, hotkey_show_at_mouse, auto_play_gif: gif, hover_to_play: hover_play,
     try_original_image: try_original,  // DeepSeek V4 Flash
     copy_resize_mode: copy_mode,
-    auto_start, silent_start, show_uncategorized, record_recent_use,
+    auto_start, silent_start, hidden_collection_enabled, hierarchy_delete_mode, large_meme_import_mode, record_recent_use,
     search_description, search_image_text,
     show_startup_animation, virtual_drive_compat, bulk_read_protection,
     bulk_read_batch_size, bulk_read_pause_seconds, bulk_read_prefetch_pages,
@@ -832,6 +841,12 @@ async function resetSettings() {
     if (cm) cm.value = String(s.copy_resize_mode ?? 1);
     if (as) as.checked = s.auto_start === true;
     if (ss) ss.checked = s.silent_start === true;
+    const hierarchyDeleteMode = document.getElementById('s-hierarchy-delete-mode');
+    if (hierarchyDeleteMode) hierarchyDeleteMode.value = s.hierarchy_delete_mode || 'ask';
+    const hiddenCollection = document.getElementById('s-hidden-collection-enabled');
+    if (hiddenCollection) hiddenCollection.checked = s.hidden_collection_enabled !== false;
+    const largeMemeImportMode = document.getElementById('s-large-meme-import-mode');
+    if (largeMemeImportMode) largeMemeImportMode.value = s.large_meme_import_mode || 'ask';
     toggleSilentStart();
     checkConnectivity();  // DeepSeek V4 Flash
     const ff = document.getElementById('s-sync-fetch');
@@ -913,6 +928,8 @@ async function resetSettings() {
     if (napcatCommand) napcatCommand.value = s.napcat_command || '/omm';
     const napcatSendMode = document.getElementById('s-napcat-send-mode');
     if (napcatSendMode) napcatSendMode.value = s.napcat_send_mode || 'original_native';
+    const napcatImageSendMode = document.getElementById('s-napcat-image-send-mode');
+    if (napcatImageSendMode) napcatImageSendMode.value = s.napcat_image_send_mode || 'sticker';
     const napcatStatus = document.getElementById('napcat-status');
     if (napcatStatus) { napcatStatus.textContent = ''; setStatusColor(napcatStatus, ''); }
     refreshNapCatListenerStatus();

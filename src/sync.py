@@ -1024,6 +1024,10 @@ def _pull_worker(entries, remote_root, cache_dir, db):
                         meme_kwargs = {
                             "filename": fname,
                             "file_hash": rentry.get("sha256", ""),
+                            "source_file_hash": rentry.get("source_sha256", ""),
+                            "compressed_only": int(
+                                bool(rentry.get("compressed_only", False))
+                            ),
                             "width": w,
                             "height": h,
                             "file_size": fsize,
@@ -1359,15 +1363,24 @@ def sync_test() -> str:
 
 def _apply_remote_collections(remote_data: dict):
     db = get_db()
-    for rc in remote_data.get("collections", []):
-        cname = rc["name"]
-        cid = db.create_collection(cname)
-        if cid < 0:
-            continue
-        for fname in rc.get("filenames", []):
-            row = db.get_by_filename(fname)
-            if row:
-                db.add_to_collection(row["id"], cid)
+
+    def walk(items, parent_id=None):
+        for rc in items or []:
+            if not isinstance(rc, dict):
+                continue
+            cname = str(rc.get("name") or "").strip()
+            if not cname:
+                continue
+            cid = db.create_collection(cname, parent_id=parent_id)
+            if cid < 0:
+                continue
+            for fname in rc.get("filenames", []):
+                row = db.get_by_filename(fname)
+                if row:
+                    db.add_to_collection(row["id"], cid)
+            walk(rc.get("children", []), cid)
+
+    walk(remote_data.get("collections", []))
 
 
 def _apply_remote_categories(remote_data: dict):

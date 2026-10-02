@@ -483,18 +483,15 @@ body {
 
 .genre-tag {
   position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
 }
 
-.genre-tag::before {
-  content: '';
-  width: 5px;
-  height: 5px;
-  margin-right: 5px;
-  display: inline-block;
-  border-radius: 50%;
-  background: currentColor;
-  vertical-align: 1px;
-  opacity: .65;
+.genre-check {
+  width: 12px;
+  height: 12px;
+  flex-shrink: 0;
 }
 
 .tag-category {
@@ -557,6 +554,12 @@ body {
 
 .meme-card:hover {
   border-color: var(--primary);
+}
+
+.meme-card.sidebar-related {
+  border-color: var(--primary);
+  outline: 2px solid var(--primary-strong);
+  outline-offset: 2px;
 }
 
 .meme-card:active {
@@ -633,6 +636,13 @@ body {
   cursor: grabbing !important;
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
   border-color: var(--primary) !important;
+}
+
+.meme-card.library-dragging {
+  opacity: 0.58;
+  cursor: grabbing !important;
+  border-color: var(--primary) !important;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.32);
 }
 
 /* TransitionGroup FLIP 动画 */

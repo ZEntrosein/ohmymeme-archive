@@ -39,11 +39,16 @@ _MAX_ARCHIVE_RECORDS = 100
 _MAX_ARCHIVE_DEPTH = 12
 _MAX_ARCHIVE_NODES = 20000
 _MAX_ARCHIVE_BYTES = 64 * 1024 * 1024
+_CHAT_RECORD_PLUGIN_TIMEOUT = 10 * 60
+_MAX_CHAT_RECORD_PLUGIN_RESPONSE_BYTES = _MAX_ARCHIVE_BYTES
 _MAX_NAPCAT_NESTED_FORWARD_DEPTH = 2
 _MAX_JSON_CARD_BYTES = 1024 * 1024
 _MAX_ARCHIVE_IMAGE_BYTES = 64 * 1024 * 1024
 _MAX_ARCHIVE_MEDIA_BYTES = 512 * 1024 * 1024
 _ARCHIVE_MEDIA_KINDS = ("image", "record", "video", "file")
+_CHAT_RECORD_NODE_PATH_RE = re.compile(
+    r"^n(?:0|[1-9]\d*)(?:/s(?:0|[1-9]\d*)/n(?:0|[1-9]\d*))*$"
+)
 _WEBUI_CREDENTIAL_TTL = 45 * 60
 _WEBUI_CREDENTIAL_CACHE = {}
 _WEBUI_CREDENTIAL_LOCK = threading.Lock()
@@ -54,7 +59,9 @@ _CHAT_RECORD_SEND_MODES = {
     "original_native",
     "original_rebuild",
     "archive_rebuild",
+    "self_native_relay",
 }
+_IMAGE_SEND_MODES = {"sticker", "image"}
 
 
 def _open_request(request, timeout):
@@ -110,18 +117,20 @@ def _plugin_api_url(http_url, plugin_id, route):
         raise OneBotError("NapCat 插件 ID 无效")
     if not route or not re.fullmatch(r"[A-Za-z0-9._/-]+", route):
         raise OneBotError("NapCat 插件接口路径无效")
-    return (
-        f"{normalize_http_url(http_url)}/api/Plugin/ext/"
-        f"{plugin_id}/{route}"
-    )
+    return f"{normalize_http_url(http_url)}/api/Plugin/ext/" f"{plugin_id}/{route}"
 
 
 def _normalize_token(token):
-    """拒绝可造成 HTTP/WebSocket 头注入的 Token。"""
-    value = str(token or "")
+    """清理复制时带入的首尾空白，并拒绝内部换行注入。"""
+    value = str(token or "").strip()
     if len(value) > 4096 or "\r" in value or "\n" in value:
         raise OneBotError("Access Token 格式无效")
     return value
+
+
+def normalize_token(token):
+    """规范化用户在设置页粘贴的 OneBot/WebUI Token。"""
+    return _normalize_token(token)
 
 
 def call_action(http_url, token, action, params=None, timeout=5):
@@ -204,9 +213,7 @@ def _webui_login(http_url, token, timeout=5):
     if not token:
         raise OneBotError("NapCat WebUI Token 未配置")
     body = json.dumps(
-        {
-            "hash": hashlib.sha256((token + ".napcat").encode("utf-8")).hexdigest()
-        },
+        {"hash": hashlib.sha256((token + ".napcat").encode("utf-8")).hexdigest()},
         ensure_ascii=False,
     ).encode("utf-8")
     request = Request(
@@ -268,9 +275,22 @@ def _webui_credential(http_url, token, timeout=5):
 
 
 def call_webui_plugin_api(
-    http_url, token, plugin_id, route, timeout=5, params=None
+    http_url,
+    token,
+    plugin_id,
+    route,
+    timeout=5,
+    params=None,
+    max_response_bytes=_MAX_RESPONSE_BYTES,
 ):
     """通过 NapCat WebUI 登录凭证调用受保护的插件 GET 路由。"""
+    try:
+        response_limit = int(max_response_bytes)
+    except (TypeError, ValueError):
+        response_limit = _MAX_RESPONSE_BYTES
+    response_limit = max(
+        1024, min(response_limit, _MAX_CHAT_RECORD_PLUGIN_RESPONSE_BYTES)
+    )
     normalized_url = normalize_http_url(http_url)
     cache_key = (normalized_url, str(token or ""))
     request_url = _plugin_api_url(normalized_url, plugin_id, route)
@@ -285,7 +305,7 @@ def call_webui_plugin_api(
     for attempt in range(2):
         # NapCat 重启会使旧 Credential 失效。第一次 401/403 时清缓存并
         # 重新登录一次，避免拖拽路径误回退到不可靠的标题识别。
-        _, credential = _webui_credential(normalized_url, token, timeout)
+        _, credential = _webui_credential(normalized_url, token, min(timeout, 10))
         request = Request(
             request_url,
             headers={
@@ -296,7 +316,7 @@ def call_webui_plugin_api(
         )
         try:
             with _open_request(request, timeout) as response:
-                raw = response.read(_MAX_RESPONSE_BYTES + 1)
+                raw = response.read(response_limit + 1)
             break
         except HTTPError as exc:
             if exc.code in (401, 403):
@@ -309,15 +329,24 @@ def call_webui_plugin_api(
                 raise OneBotError("NapCat WebUI 插件接口不存在") from exc
             raise OneBotError(f"NapCat WebUI 插件返回 HTTP {exc.code}") from exc
         except (TimeoutError, socket.timeout) as exc:
-            raise OneBotError("连接 NapCat WebUI 插件接口超时") from exc
+            raise OneBotError(
+                f"NapCat WebUI 插件处理超时（已等待 {int(timeout)} 秒）"
+            ) from exc
         except URLError as exc:
+            if isinstance(exc.reason, (TimeoutError, socket.timeout)):
+                raise OneBotError(
+                    f"NapCat WebUI 插件处理超时（已等待 {int(timeout)} 秒）"
+                ) from exc
             raise OneBotError("无法连接 NapCat WebUI，请确认服务正在运行") from exc
         except OSError as exc:
             raise OneBotError("无法连接 NapCat WebUI，请确认服务正在运行") from exc
     if raw is None:
         raise OneBotError("NapCat WebUI 插件请求失败")
-    if len(raw) > _MAX_RESPONSE_BYTES:
-        raise OneBotError("NapCat WebUI 插件返回数据过大，已停止读取")
+    if len(raw) > response_limit:
+        raise OneBotError(
+            "NapCat WebUI 插件返回数据超过 %.1f MiB，已停止读取"
+            % (response_limit / (1024 * 1024))
+        )
     try:
         payload = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -325,6 +354,48 @@ def call_webui_plugin_api(
     if not isinstance(payload, dict):
         raise OneBotError("NapCat WebUI 插件返回格式无效")
     return payload
+
+
+def consume_chat_record_drag_ticket(webui_url, webui_token, ticket_id):
+    """消费桥接插件生成的一次性聊天记录拖拽凭据。"""
+    ticket_id = str(ticket_id or "").strip().lower()
+    if not re.fullmatch(
+        r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",
+        ticket_id,
+    ):
+        raise OneBotError("聊天记录拖拽凭据无效")
+    payload = call_webui_plugin_api(
+        webui_url,
+        webui_token,
+        "napcat-plugin-ohmymeme-current-peer",
+        "consume-chat-record-ticket",
+        timeout=_CHAT_RECORD_PLUGIN_TIMEOUT,
+        params={"ticket_id": ticket_id},
+        max_response_bytes=_MAX_CHAT_RECORD_PLUGIN_RESPONSE_BYTES,
+    )
+    if not payload.get("ok"):
+        raise OneBotError(str(payload.get("error") or "聊天记录拖拽凭据读取失败"))
+    source = payload.get("source_message")
+    if not isinstance(source, dict):
+        raise OneBotError("聊天记录拖拽凭据没有返回来源消息")
+    message_type = str(source.get("message_type") or "")
+    if message_type not in ("group", "private"):
+        raise OneBotError("聊天记录来源会话类型无效")
+    _validate_message_id(source.get("message_id"))
+    if not re.fullmatch(r"\d{1,32}", str(source.get("self_id") or "")):
+        raise OneBotError("聊天记录来源账号无效")
+    if not re.fullmatch(
+        r"\d{1,64}", str(source.get("real_seq") or source.get("message_seq") or "")
+    ):
+        raise OneBotError("聊天记录来源序号无效")
+    peer_id = (
+        source.get("group_id") if message_type == "group" else source.get("target_id")
+    )
+    if not re.fullmatch(r"\d{1,32}", str(peer_id or "")):
+        raise OneBotError("聊天记录来源会话无效")
+    if not _message_segments(source.get("message")):
+        raise OneBotError("聊天记录来源消息正文为空")
+    return source
 
 
 def _mask_user_id(user_id):
@@ -417,6 +488,31 @@ def _json_card_forward(segment):
     }
 
 
+def _json_card_preview(segment):
+    """读取 JSON 卡片自带的人类可读摘要。
+
+    QQ 已经把用于会话列表和合并转发预览的文案放在
+    ``prompt`` 中；其他卡片则可能放在 meta 子项的标题或描述里。
+    这里只读摘要字段，完整 JSON 仍保留在归档消息段中。
+    """
+    card = _decode_json_card(segment)
+    if not card:
+        return ""
+    containers = [card]
+    meta = card.get("meta")
+    if isinstance(meta, dict):
+        containers.extend(value for value in meta.values() if isinstance(value, dict))
+    for container in containers:
+        for key in ("prompt", "desc", "description", "title", "summary", "name"):
+            value = container.get(key)
+            if not isinstance(value, str):
+                continue
+            value = " ".join(value.split()).strip()
+            if value:
+                return value
+    return ""
+
+
 def _forward_segments(segments):
     """识别标准 forward、JSON 卡片与 NapCat 的内嵌 node 包装。"""
     result = []
@@ -435,9 +531,11 @@ def _forward_segments(segments):
                     child.get("type") == "node"
                     or isinstance(child.get("message"), list)
                     or isinstance(
-                        child.get("data", {}).get("message")
-                        if isinstance(child.get("data"), dict)
-                        else None,
+                        (
+                            child.get("data", {}).get("message")
+                            if isinstance(child.get("data"), dict)
+                            else None
+                        ),
                         list,
                     )
                 )
@@ -463,6 +561,7 @@ def _segment_preview(message, raw_message="", max_length=80):
     labels = {
         "image": "图片",
         "face": "表情",
+        "mface": "表情",
         "record": "语音",
         "video": "视频",
         "file": "文件",
@@ -475,6 +574,8 @@ def _segment_preview(message, raw_message="", max_length=80):
         data = segment.get("data") if isinstance(segment.get("data"), dict) else {}
         if kind == "text":
             parts.append(str(data.get("text") or ""))
+        elif kind == "json":
+            parts.append(_json_card_preview(segment) or "[json]")
         elif kind:
             parts.append(f"[{labels.get(kind, kind)}]")
     preview = "".join(parts).strip() or str(raw_message or "").strip()
@@ -721,6 +822,14 @@ def normalize_send_mode(send_mode):
     return value
 
 
+def normalize_image_send_mode(send_mode):
+    """校验图片拖到 QQ 后的发送形式。"""
+    value = str(send_mode or "sticker").strip()
+    if value not in _IMAGE_SEND_MODES:
+        raise OneBotError("图片发送形式无效")
+    return value
+
+
 def parse_command_event(event, command="/omm"):
     """识别自己发出的保存、列表或发送命令。"""
     if not isinstance(event, dict):
@@ -801,8 +910,7 @@ def _collect_archive_nodes(nodes, depth, state, queue_items):
         for segment in segments:
             kind = str(segment.get("type") or "unknown")
             state["segment_types"].add(kind)
-            if kind in ("image", "record", "video", "file"):
-                state["media_count"] += 1
+        state["media_count"] += sum(1 for _kind, _data in _iter_segment_media(segments))
         for segment in forward_segments:
             data = segment.get("data") if isinstance(segment.get("data"), dict) else {}
             content = data.get("content")
@@ -814,7 +922,13 @@ def _collect_archive_nodes(nodes, depth, state, queue_items):
 
 
 def _merge_recovered_forward_data(data, recovered):
-    """用插件恢复的 forward 段补齐标准 OneBot 结果，不覆盖已解析的丰富消息段。"""
+    """用插件恢复结果补齐标准 OneBot 正文，不覆盖其已解析的普通消息段。
+
+    NapCat 的标准 OneBot 结果通常比桥接层支持更多消息类型，因此这里仍以
+    ``data`` 为主体；桥接层只补充标准结果中缺失的媒体地址、嵌套转发，以及
+    reply 段里的 ``omm_quoted_message``。拖拽导入会直接得到这些引用信息，
+    ``/omm`` 则依赖此合并步骤，两条入口必须保持相同语义。
+    """
     standard = _list_from_data(data, ("messages",))
     restored = _list_from_data(recovered, ("messages",))
     if not restored:
@@ -837,11 +951,9 @@ def _merge_recovered_forward_data(data, recovered):
             continue
         # 主 action 的普通段继续使用标准 OneBot 结果（它支持更多消息类型）；
         # 插件只负责把被 NapCat 丢弃的嵌套 forward 接回原位置。
-        additions = [
-            segment
-            for segment in _forward_segments(new_segments)
-            if segment not in _forward_segments(old_segments)
-        ]
+        old_forwards = _forward_segments(old_segments)
+        new_forwards = _forward_segments(new_segments)
+        additions = new_forwards[len(old_forwards) :]
         combined_segments = []
         recovered_media = {}
         for media_kind in _ARCHIVE_MEDIA_KINDS:
@@ -853,12 +965,63 @@ def _merge_recovered_forward_data(data, recovered):
                     and isinstance(segment.get("data"), dict)
                 ]
             )
-        media_changed = False
+        recovered_replies = iter(
+            [segment for segment in new_segments if segment.get("type") == "reply"]
+        )
+        recovered_forwards = iter(new_forwards)
+        content_changed = False
         for segment in old_segments:
             kind = str(segment.get("type") or "")
-            if kind not in recovered_media or not isinstance(
-                segment.get("data"), dict
-            ):
+            segment_data = (
+                segment.get("data") if isinstance(segment.get("data"), dict) else {}
+            )
+            if kind == "reply":
+                replacement = next(recovered_replies, None)
+                replacement_data = (
+                    replacement.get("data")
+                    if isinstance(replacement, dict)
+                    and isinstance(replacement.get("data"), dict)
+                    else {}
+                )
+                quoted = replacement_data.get("omm_quoted_message")
+                if isinstance(quoted, dict) and quoted:
+                    updated_segment = dict(segment)
+                    updated_data = dict(segment_data)
+                    updated_data["omm_quoted_message"] = quoted
+                    updated_segment["data"] = updated_data
+                    combined_segments.append(updated_segment)
+                    content_changed = True
+                else:
+                    combined_segments.append(segment)
+                continue
+            if kind == "forward":
+                replacement = next(recovered_forwards, None)
+                replacement_data = (
+                    replacement.get("data")
+                    if isinstance(replacement, dict)
+                    and isinstance(replacement.get("data"), dict)
+                    else {}
+                )
+                old_content = segment_data.get("content")
+                new_content = replacement_data.get("content")
+                if isinstance(old_content, list) and isinstance(new_content, list):
+                    nested = _merge_recovered_forward_data(
+                        {"messages": old_content}, {"messages": new_content}
+                    )
+                    merged_content = _list_from_data(nested, ("messages",))
+                    if merged_content != old_content:
+                        updated_segment = dict(segment)
+                        updated_data = dict(segment_data)
+                        updated_data["content"] = merged_content
+                        updated_segment["data"] = updated_data
+                        combined_segments.append(updated_segment)
+                        content_changed = True
+                    else:
+                        combined_segments.append(segment)
+                else:
+                    combined_segments.append(segment)
+                continue
+            if kind not in recovered_media or not isinstance(segment.get("data"), dict):
                 combined_segments.append(segment)
                 continue
             replacement = next(recovered_media[kind], None)
@@ -906,16 +1069,14 @@ def _merge_recovered_forward_data(data, recovered):
                 updated_data["path"] = replacement_path
             updated_segment["data"] = updated_data
             combined_segments.append(updated_segment)
-            media_changed = True
-        if not additions and not media_changed:
+            content_changed = True
+        if not additions and not content_changed:
             merged.append(old)
             continue
         combined = dict(old)
         combined["message"] = combined_segments + additions
         if additions:
-            combined["raw_message"] = (
-                str(old.get("raw_message") or "") + "[聊天记录]"
-            )
+            combined["raw_message"] = str(old.get("raw_message") or "") + "[聊天记录]"
         merged.append(combined)
     metadata = {}
     native_payload = recovered.get("native_payload_b64")
@@ -937,25 +1098,131 @@ def _recover_forward_resource(webui_url, webui_token, forward_id, source=None):
     identity = _persistent_source_identity(source)
     if identity:
         params.update(
-            {
-                key: value
-                for key, value in identity.items()
-                if value not in (None, "")
-            }
+            {key: value for key, value in identity.items() if value not in (None, "")}
         )
     payload = call_webui_plugin_api(
         webui_url,
         webui_token,
         "napcat-plugin-ohmymeme-current-peer",
         "recover-forward-resource",
-        timeout=120,
+        timeout=_CHAT_RECORD_PLUGIN_TIMEOUT,
         params=params,
+        max_response_bytes=_MAX_CHAT_RECORD_PLUGIN_RESPONSE_BYTES,
     )
     if not payload.get("ok"):
         raise OneBotError(str(payload.get("error") or "桥接插件未能恢复多层聊天记录"))
     if not _list_from_data(payload, ("messages",)):
         raise OneBotError("桥接插件没有返回多层聊天记录正文")
     return payload
+
+
+def _recover_original_message_by_identity(webui_url, webui_token, source):
+    """按持久会话位置重新读取外层原消息。
+
+    NapCat 重启后 OneBot message_id 可能失效，但会话 ID + QQ 真实
+    msgSeq 仍可以由桥接插件定位。
+    """
+    identity = _persistent_source_identity(source)
+    if not identity:
+        raise OneBotError("归档缺少来源会话或真实消息序号，无法重新读取原消息")
+    payload = call_webui_plugin_api(
+        webui_url,
+        webui_token,
+        "napcat-plugin-ohmymeme-current-peer",
+        "recover-message",
+        timeout=_CHAT_RECORD_PLUGIN_TIMEOUT,
+        params={
+            key: value for key, value in identity.items() if value not in (None, "")
+        },
+        max_response_bytes=_MAX_CHAT_RECORD_PLUGIN_RESPONSE_BYTES,
+    )
+    if not payload.get("ok"):
+        raise OneBotError(str(payload.get("error") or "无法按持久位置读取原消息"))
+    recovered = payload.get("message")
+    if not isinstance(recovered, dict) or not _message_segments(
+        recovered.get("message")
+    ):
+        raise OneBotError("桥接插件没有返回外层消息正文")
+    recovered = dict(recovered)
+    native_payload = payload.get("native_payload_b64")
+    if isinstance(native_payload, str) and native_payload:
+        recovered["_omm_native_payload_b64"] = native_payload
+    native_card = payload.get("native_card")
+    if isinstance(native_card, dict):
+        recovered["_omm_native_card"] = native_card
+    source = source if isinstance(source, dict) else {}
+    for key in (
+        "self_id",
+        "message_type",
+        "group_id",
+        "group_name",
+        "target_id",
+        "user_id",
+        "sender",
+        "real_seq",
+        "time",
+    ):
+        if recovered.get(key) in (None, "") and source.get(key) not in (None, ""):
+            recovered[key] = source[key]
+    return recovered
+
+
+def _recover_original_message_by_id(webui_url, webui_token, message_id, source_context):
+    """在命令所在会话内按 QQ 原始消息 ID 恢复完整外层消息。"""
+    context = source_context if isinstance(source_context, dict) else {}
+    message_type = str(context.get("message_type") or "")
+    self_id = str(context.get("self_id") or "")
+    if message_type == "group":
+        peer_id = context.get("group_id")
+    elif message_type == "private":
+        peer_id = context.get("target_id")
+        if peer_id in (None, "") and str(context.get("user_id") or "") != self_id:
+            peer_id = context.get("user_id")
+    else:
+        peer_id = None
+    if peer_id in (None, ""):
+        raise OneBotError("无法确定被回复消息所属的 QQ 会话")
+    payload = call_webui_plugin_api(
+        webui_url,
+        webui_token,
+        "napcat-plugin-ohmymeme-current-peer",
+        "recover-message-by-id",
+        timeout=_CHAT_RECORD_PLUGIN_TIMEOUT,
+        params={
+            "message_id": _validate_message_id(message_id),
+            "source_type": message_type,
+            "source_peer_id": peer_id,
+            "source_self_id": self_id,
+        },
+        max_response_bytes=_MAX_CHAT_RECORD_PLUGIN_RESPONSE_BYTES,
+    )
+    if not payload.get("ok"):
+        raise OneBotError(str(payload.get("error") or "无法按消息标识读取原消息"))
+    recovered = payload.get("message")
+    if not isinstance(recovered, dict) or not _message_segments(
+        recovered.get("message")
+    ):
+        raise OneBotError("桥接插件没有返回外层消息正文")
+    recovered = dict(recovered)
+    native_payload = payload.get("native_payload_b64")
+    if isinstance(native_payload, str) and native_payload:
+        recovered["_omm_native_payload_b64"] = native_payload
+    native_card = payload.get("native_card")
+    if isinstance(native_card, dict):
+        recovered["_omm_native_card"] = native_card
+    for key in (
+        "self_id",
+        "message_type",
+        "group_id",
+        "group_name",
+        "target_id",
+        "user_id",
+        "sender",
+        "time",
+    ):
+        if recovered.get(key) in (None, "") and context.get(key) not in (None, ""):
+            recovered[key] = context[key]
+    return recovered
 
 
 def build_chat_record_package(
@@ -965,18 +1232,35 @@ def build_chat_record_package(
     trigger_event=None,
     webui_url="",
     webui_token="",
+    source_message=None,
 ):
     """读取一条合并转发消息并组装可持久化的完整结构包。"""
     message_id = _validate_message_id(message_id)
-    source = call_action(
-        http_url, token, "get_msg", {"message_id": message_id}, timeout=10
-    )
+    trigger_event = trigger_event if isinstance(trigger_event, dict) else {}
+    source = source_message
+    source_from_onebot = source is None
+    if source_from_onebot:
+        try:
+            source = call_action(
+                http_url, token, "get_msg", {"message_id": message_id}, timeout=10
+            )
+        except OneBotError as direct_error:
+            if not webui_url or not webui_token:
+                raise
+            try:
+                source = _recover_original_message_by_id(
+                    webui_url, webui_token, message_id, trigger_event
+                )
+            except OneBotError as recovery_error:
+                raise OneBotError(
+                    f"OneBot 无法读取被回复消息；桥接插件按消息标识恢复也失败："
+                    f"{recovery_error}"
+                ) from direct_error
     if not isinstance(source, dict):
         raise OneBotError("NapCat 返回的消息格式无效")
     source = dict(source)
     if source.get("message_id") in (None, ""):
         source["message_id"] = message_id
-    trigger_event = trigger_event if isinstance(trigger_event, dict) else {}
     if not source.get("self_id"):
         source["self_id"] = trigger_event.get("self_id")
     if not source.get("message_type"):
@@ -985,6 +1269,23 @@ def build_chat_record_package(
         source["group_id"] = trigger_event.get("group_id")
     if not source.get("target_id") and trigger_event.get("target_id"):
         source["target_id"] = trigger_event.get("target_id")
+    if (
+        source_from_onebot
+        and source.get("real_seq") in (None, "")
+        and webui_url
+        and webui_token
+    ):
+        # 当前 NapCat 的 get_msg 对回复目标有时只返回消息正文和短 ID，
+        # 没有可供 recover-message 使用的真实 msgSeq。/omm 已明确处于目标
+        # 会话中，因此按回复段携带的 QQ 原始 msgId 恢复一次完整消息。
+        try:
+            source = _recover_original_message_by_id(
+                webui_url, webui_token, message_id, source
+            )
+        except OneBotError as exc:
+            logger.info("NapCat 命令消息按原始 ID 增强恢复失败: %s", exc)
+    recovered_native_payload = str(source.pop("_omm_native_payload_b64", "") or "")
+    recovered_native_card = source.pop("_omm_native_card", None)
     archive_bytes = len(
         json.dumps(source, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     )
@@ -992,13 +1293,60 @@ def build_chat_record_package(
         raise OneBotError("聊天记录结构超过 64 MiB，未执行保存")
 
     root_segments = _message_segments(source.get("message"))
-    native_card = None
+    native_card = (
+        recovered_native_card if isinstance(recovered_native_card, dict) else None
+    )
     for segment in root_segments:
         card = _decode_json_card(segment)
         if card and str(card.get("app") or "").lower() == "com.tencent.multimsg":
             native_card = card
             break
     root_forwards = _forward_segments(root_segments)
+    if (
+        not recovered_native_payload
+        and any(
+            isinstance(
+                segment.get("data") if isinstance(segment, dict) else None,
+                dict,
+            )
+            and isinstance(segment["data"].get("content"), list)
+            for segment in root_forwards
+        )
+        and webui_url
+        and webui_token
+    ):
+        # parseMultMsg 会把根记录直接内联成 data.content，此时旧流程不会
+        # 进入 forward_records 队列。重新从外层 QQ 原消息读取一次原始
+        # 长消息负载，正文仍沿用已经取得的 OneBot 结果。
+        try:
+            recovered_source = _recover_original_message_by_identity(
+                webui_url, webui_token, source
+            )
+        except OneBotError as exc:
+            logger.info("NapCat 根聊天记录原生负载补全失败: %s", exc)
+        else:
+            recovered_native_payload = str(
+                recovered_source.pop("_omm_native_payload_b64", "") or ""
+            )
+            recovered_card = recovered_source.pop("_omm_native_card", None)
+            if isinstance(recovered_card, dict):
+                native_card = recovered_card
+            # get_msg/parseMultMsg 的正文仍作为主体，但它会把 reply 段压缩为
+            # 只有消息 ID。把 recover-message 中已经恢复的引用正文合回内联
+            # 节点，使 /omm 与拖拽导入获得相同的被引用媒体。
+            recovered_segments = _message_segments(recovered_source.get("message"))
+            if recovered_segments:
+                merged_source = _merge_recovered_forward_data(
+                    {"messages": [{"message": root_segments}]},
+                    {"messages": [{"message": recovered_segments}]},
+                )
+                merged_nodes = _list_from_data(merged_source, ("messages",))
+                if merged_nodes:
+                    merged_segments = _node_segments(merged_nodes[0])
+                    if merged_segments:
+                        source["message"] = merged_segments
+                        root_segments = merged_segments
+                        root_forwards = _forward_segments(root_segments)
     prefetched_records = {}
     if not root_forwards:
         # NapCat 偶尔会让 get_msg 丢失 forward 段，但 get_forward_msg 仍可用
@@ -1098,7 +1446,9 @@ def build_chat_record_package(
                     recovery_errors.append(str(exc))
                     logger.info("NapCat 多层聊天记录 action 恢复失败: %s", exc)
                 else:
-                    logger.info("NapCat 聊天记录媒体补全失败，继续使用后备链路: %s", exc)
+                    logger.info(
+                        "NapCat 聊天记录媒体补全失败，继续使用后备链路: %s", exc
+                    )
         archive_bytes += len(
             json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         )
@@ -1111,9 +1461,7 @@ def build_chat_record_package(
 
     if state["empty_node_count"]:
         recovery_note = (
-            f"；桥接插件恢复失败：{recovery_errors[-1]}"
-            if recovery_errors
-            else ""
+            f"；桥接插件恢复失败：{recovery_errors[-1]}" if recovery_errors else ""
         )
         raise OneBotError(
             f"检测到 {state['empty_node_count']} 个未解析的空消息节点；"
@@ -1154,6 +1502,8 @@ def build_chat_record_package(
             "media_localized": False,
         },
     }
+    if recovered_native_payload:
+        package["omm_native_payload_b64"] = recovered_native_payload
     encoded = json.dumps(package, ensure_ascii=False, separators=(",", ":")).encode(
         "utf-8"
     )
@@ -1170,6 +1520,7 @@ def archive_chat_record(
     db=None,
     webui_url="",
     webui_token="",
+    source_message=None,
 ):
     """读取并把聊天记录包写入本地数据库。"""
     package = build_chat_record_package(
@@ -1179,6 +1530,7 @@ def archive_chat_record(
         trigger_event=trigger_event,
         webui_url=webui_url,
         webui_token=webui_token,
+        source_message=source_message,
     )
     from .config import get_config
 
@@ -1192,7 +1544,11 @@ def archive_chat_record(
         str(source.get("self_id") or ""), str(source.get("message_id") or "")
     )
     if previous:
+        previous_folder = str(previous.get("_omm_media_folder") or "").strip()
+        if previous_folder:
+            package["_omm_media_folder"] = previous_folder
         _reuse_archived_media_paths(previous, package)
+        _reuse_archived_native_forward(previous, package)
     cfg = get_config()
     media_root = cfg.chat_record_media_dir
     _localize_archive_media(
@@ -1204,6 +1560,12 @@ def archive_chat_record(
     )
     saved = db.save_chat_record(package)
     _prune_archive_media(package, media_root, storage_root=cfg.cache_dir)
+    saved_entry = db.get_chat_record_entry(saved["id"])
+    display_name = (
+        str(saved_entry.get("name") or "").strip()
+        if isinstance(saved_entry, dict)
+        else ""
+    )
     # 归档由后台 OneBot worker 完成，不经过主窗口点击事件。
     from .library_events import notify_changed
 
@@ -1213,8 +1575,31 @@ def archive_chat_record(
         "id": saved["id"],
         "created": saved["created"],
         "title": package["title"],
+        "name": display_name or package["title"],
         **package["summary"],
     }
+
+
+def archive_dragged_chat_record(
+    http_url,
+    token,
+    webui_url,
+    webui_token,
+    ticket_id,
+    db=None,
+):
+    """消费 QQ 拖拽凭据并复用标准聊天记录归档流程。"""
+    source = consume_chat_record_drag_ticket(webui_url, webui_token, ticket_id)
+    return archive_chat_record(
+        http_url,
+        token,
+        source.get("message_id"),
+        trigger_event=source,
+        db=db,
+        webui_url=webui_url,
+        webui_token=webui_token,
+        source_message=source,
+    )
 
 
 def migrate_legacy_chat_record_media(db=None, cfg=None):
@@ -1293,9 +1678,7 @@ def migrate_legacy_chat_record_media(db=None, cfg=None):
                 copied.append(destination)
                 if in_legacy:
                     old_sources.append(source_resolved)
-            data["local_path"] = _stored_archive_media_path(
-                destination, cfg.cache_dir
-            )
+            data["local_path"] = _stored_archive_media_path(destination, cfg.cache_dir)
             migrated_files += 1
             changed = True
         if not changed:
@@ -1427,6 +1810,31 @@ def _node_segments(node):
     return _message_segments(data.get("content"))
 
 
+def _quoted_message(segment):
+    """读取桥接层随 reply 段保存的被引用原消息。"""
+    if not isinstance(segment, dict) or segment.get("type") != "reply":
+        return {}
+    data = segment.get("data") if isinstance(segment.get("data"), dict) else {}
+    quoted = data.get("omm_quoted_message")
+    return quoted if isinstance(quoted, dict) else {}
+
+
+def _quoted_segments(segment):
+    quoted = _quoted_message(segment)
+    return _message_segments(quoted.get("message"))
+
+
+def _iter_segment_media(segments, quote_depth=0):
+    """按消息顺序遍历正文及回复引用中的媒体段。"""
+    for segment in _message_segments(segments):
+        kind = str(segment.get("type") or "")
+        data = segment.get("data")
+        if kind in _ARCHIVE_MEDIA_KINDS and isinstance(data, dict):
+            yield kind, data
+        if kind == "reply" and quote_depth < 3:
+            yield from _iter_segment_media(_quoted_segments(segment), quote_depth + 1)
+
+
 def _nested_nodes(package, segment):
     """读取一个 forward 段引用的内嵌或已归档节点。"""
     data = segment.get("data") if isinstance(segment.get("data"), dict) else {}
@@ -1438,6 +1846,70 @@ def _nested_nodes(package, segment):
     return _list_from_data(record, ("messages",))
 
 
+def _indexed_forward_segments(segments):
+    """保留原消息段下标地识别所有 forward 兼容表示。"""
+    for segment_index, segment in enumerate(segments):
+        for forward_segment in _forward_segments([segment]):
+            yield segment_index, forward_segment
+
+
+def normalize_chat_record_blocked_paths(values):
+    """校验并压缩详情页选中的消息节点路径。
+
+    父节点被屏蔽时整个子树都不发送，因此同时保存子路径没有意义。
+    """
+    if values is None:
+        return []
+    if not isinstance(values, (list, tuple, set)):
+        raise ValueError("聊天记录屏蔽数据无效")
+    unique = set()
+    for value in values:
+        path = str(value or "").strip()
+        if not path or len(path) > 256 or not _CHAT_RECORD_NODE_PATH_RE.fullmatch(path):
+            raise ValueError("聊天记录屏蔽路径无效")
+        unique.add(path)
+        if len(unique) > _MAX_ARCHIVE_NODES:
+            raise ValueError("聊天记录屏蔽数量超过上限")
+    result = []
+    for path in sorted(unique, key=lambda item: (item.count("/"), item)):
+        if any(path.startswith(f"{parent}/") for parent in result):
+            continue
+        result.append(path)
+    return result
+
+
+def chat_record_blocked_paths(package):
+    """读取归档中的发送屏蔽规则；旧包或损坏值按未设置处理。"""
+    package = package if isinstance(package, dict) else {}
+    send_filter = package.get("send_filter")
+    send_filter = send_filter if isinstance(send_filter, dict) else {}
+    try:
+        return normalize_chat_record_blocked_paths(
+            send_filter.get("blocked_node_paths", [])
+        )
+    except ValueError:
+        return []
+
+
+def set_chat_record_blocked_paths(package, values):
+    """在完整归档包中写入非破坏性的发送屏蔽规则。"""
+    if not isinstance(package, dict):
+        raise ValueError("聊天记录包格式无效")
+    paths = normalize_chat_record_blocked_paths(values)
+    send_filter = package.get("send_filter")
+    send_filter = dict(send_filter) if isinstance(send_filter, dict) else {}
+    if paths:
+        send_filter["blocked_node_paths"] = paths
+        package["send_filter"] = send_filter
+    else:
+        send_filter.pop("blocked_node_paths", None)
+        if send_filter:
+            package["send_filter"] = send_filter
+        else:
+            package.pop("send_filter", None)
+    return paths
+
+
 def _iter_archive_nodes(package):
     """按详情页与媒体归档共用的顺序遍历聊天节点。
 
@@ -1447,30 +1919,32 @@ def _iter_archive_nodes(package):
     seen_forward_ids = set()
     visited_nodes = 0
 
-    def walk(nodes, depth):
+    def walk(nodes, depth, parent_path=""):
         nonlocal visited_nodes
         if depth > _MAX_ARCHIVE_DEPTH:
             return
-        for node in nodes:
+        for node_index, node in enumerate(nodes):
             if not isinstance(node, dict) or visited_nodes >= _MAX_ARCHIVE_NODES:
                 continue
+            node_path = (
+                f"{parent_path}/n{node_index}" if parent_path else f"n{node_index}"
+            )
             visited_nodes += 1
-            yield node, depth
+            yield node, depth, node_path
             segments = _node_segments(node)
-            for segment in _forward_segments(segments):
+            for segment_index, segment in _indexed_forward_segments(segments):
                 data = (
-                    segment.get("data")
-                    if isinstance(segment.get("data"), dict)
-                    else {}
+                    segment.get("data") if isinstance(segment.get("data"), dict) else {}
                 )
+                child_path = f"{node_path}/s{segment_index}"
                 if isinstance(data.get("content"), list):
-                    yield from walk(data["content"], depth + 1)
+                    yield from walk(data["content"], depth + 1, child_path)
                     continue
                 forward_id = str(data.get("id") or "")
                 if not forward_id or forward_id in seen_forward_ids:
                     continue
                 seen_forward_ids.add(forward_id)
-                yield from walk(_nested_nodes(package, segment), depth + 1)
+                yield from walk(_nested_nodes(package, segment), depth + 1, child_path)
 
     yield from walk(_archive_root_nodes(package), 0)
 
@@ -1478,14 +1952,14 @@ def _iter_archive_nodes(package):
 def chat_record_view(package, media_url_factory=None):
     """把完整归档包转换为详情页可直接展示的扁平消息列表。
 
-    ``media_url_factory`` 可选，用于为已经保存到本地的图片生成详情页预览
-    地址。媒体序号包含图片、视频和语音等所有媒体段，以便与归档文件名保持
-    一致；当前前端只渲染图片/GIF。
+    ``media_url_factory`` 可选，用于为已经保存到本地的图片和视频生成详情页
+    预览地址。媒体序号包含图片、视频和语音等所有媒体段，以便与归档文件名
+    保持一致。
     """
     messages = []
     media_index = 0
 
-    for node, depth in _iter_archive_nodes(package):
+    for node, depth, node_path in _iter_archive_nodes(package):
         sender = node.get("sender")
         sender = sender if isinstance(sender, dict) else {}
         data = node.get("data") if isinstance(node.get("data"), dict) else {}
@@ -1498,10 +1972,9 @@ def chat_record_view(package, media_url_factory=None):
             or "未知发送者"
         )
         sender_id = sender.get("user_id") or data.get("user_id") or data.get("uin")
-        preview = _segment_preview(
-            segments, node.get("raw_message"), max_length=4000
-        )
+        preview = _segment_preview(segments, node.get("raw_message"), max_length=4000)
         message = {
+            "path": node_path,
             "depth": depth,
             "sender": str(nickname),
             "sender_id": str(sender_id or ""),
@@ -1512,28 +1985,24 @@ def chat_record_view(package, media_url_factory=None):
             ),
         }
         media = []
-        media_slot = 0
-        for segment in segments:
-            kind = str(segment.get("type") or "")
-            segment_data = segment.get("data")
-            if kind not in _ARCHIVE_MEDIA_KINDS or not isinstance(
-                segment_data, dict
-            ):
-                continue
-            current_media_slot = media_slot
-            media_slot += 1
+        quotes = []
+
+        def append_media(kind, segment_data, target, slot, quoted=False):
+            nonlocal media_index
             media_index += 1
             if (
-                kind == "image"
+                kind in ("image", "video")
                 and str(segment_data.get("local_path") or "").strip()
                 and callable(media_url_factory)
             ):
                 descriptor = {
-                    "kind": "image",
+                    "kind": kind,
                     "index": media_index,
-                    "slot": current_media_slot,
+                    "slot": slot,
                     "url": str(media_url_factory(media_index, kind) or ""),
                 }
+                if quoted:
+                    descriptor["quoted"] = True
                 label = (
                     segment_data.get("file")
                     or segment_data.get("name")
@@ -1541,9 +2010,55 @@ def chat_record_view(package, media_url_factory=None):
                 )
                 if label:
                     descriptor["alt"] = str(label)
-                media.append(descriptor)
+                target.append(descriptor)
+
+        media_slot = 0
+        for segment in segments:
+            kind = str(segment.get("type") or "")
+            segment_data = segment.get("data")
+            if kind in _ARCHIVE_MEDIA_KINDS and isinstance(segment_data, dict):
+                append_media(kind, segment_data, media, media_slot)
+                media_slot += 1
+                continue
+            if kind != "reply":
+                continue
+            quoted = _quoted_message(segment)
+            quoted_segments = _quoted_segments(segment)
+            if not quoted_segments:
+                continue
+            quoted_media = []
+            for quoted_slot, (quoted_kind, quoted_data) in enumerate(
+                _iter_segment_media(quoted_segments)
+            ):
+                append_media(
+                    quoted_kind,
+                    quoted_data,
+                    quoted_media,
+                    quoted_slot,
+                    quoted=True,
+                )
+            quote_sender = quoted.get("sender")
+            quote_sender = quote_sender if isinstance(quote_sender, dict) else {}
+            quote = {
+                "sender": str(
+                    quote_sender.get("card") or quote_sender.get("nickname") or "原消息"
+                ),
+                "time": quoted.get("time") or 0,
+                "preview": _segment_preview(
+                    quoted_segments,
+                    quoted.get("raw_message"),
+                    max_length=4000,
+                )
+                or "[未解析的引用内容]",
+            }
+            if quoted_media:
+                quote["media"] = quoted_media
+                media.extend(quoted_media)
+            quotes.append(quote)
         if media:
             message["media"] = media
+        if quotes:
+            message["quotes"] = quotes
         messages.append(message)
 
     return messages
@@ -1601,9 +2116,11 @@ def _archive_media_source(data, cfg=None, storage_root=None):
         virtual_compat = (
             cfg.get("virtual_drive_compat", False)
             if hasattr(cfg, "get")
-            else getattr(cfg, "virtual_drive_compat", False)
-            if cfg is not None
-            else False
+            else (
+                getattr(cfg, "virtual_drive_compat", False)
+                if cfg is not None
+                else False
+            )
         ) is True
         if virtual_compat:
             normalized_root = Path(os.path.abspath(os.path.normpath(str(root))))
@@ -1633,8 +2150,96 @@ def _archive_media_dir(package, media_root):
     source = package.get("source") if isinstance(package, dict) else {}
     source = source if isinstance(source, dict) else {}
     archive_key = f"{source.get('self_id') or ''}:{source.get('message_id') or ''}"
-    folder = hashlib.sha256(archive_key.encode("utf-8")).hexdigest()[:24]
+    folder = str(package.get("_omm_media_folder") or "").strip()
+    if (
+        not folder
+        or folder in (".", "..")
+        or Path(folder).name != folder
+        or "/" in folder
+        or "\\" in folder
+    ):
+        folder = hashlib.sha256(archive_key.encode("utf-8")).hexdigest()[:24]
     return Path(media_root) / folder
+
+
+def rename_chat_record_media_folder(package, new_folder, cfg=None):
+    """重命名归档媒体目录并同步改写包内路径。
+
+    返回 ``(old_dir, new_dir, moved)``，供调用方在数据库事务失败时回滚。
+    路径判断刻意采用词法规范化，不调用 ``resolve()``，兼容 CloudDrive2。
+    """
+    from .config import get_config
+
+    if cfg is None:
+        cfg = get_config()
+    if not isinstance(package, dict):
+        raise ValueError("聊天记录结构无效")
+    folder = str(new_folder or "").strip()
+    if (
+        not folder
+        or folder in (".", "..")
+        or Path(folder).name != folder
+        or "/" in folder
+        or "\\" in folder
+    ):
+        raise ValueError("媒体文件夹名无效")
+    root = Path(cfg.chat_record_media_dir)
+    old_dir = _archive_media_dir(package, root)
+    new_dir = root / folder
+    old_key = os.path.normcase(os.path.abspath(os.path.normpath(str(old_dir))))
+    new_key = os.path.normcase(os.path.abspath(os.path.normpath(str(new_dir))))
+    moved = False
+    same_spelling = str(old_dir) == str(new_dir)
+    if not same_spelling:
+        if new_dir.exists() and old_key != new_key:
+            raise ValueError("该媒体文件夹名已被占用")
+        try:
+            if old_key == new_key:
+                temporary = root / f".omm-chat-rename-{time.time_ns()}"
+                os.replace(str(old_dir), str(temporary))
+                try:
+                    os.replace(str(temporary), str(new_dir))
+                except Exception:
+                    os.replace(str(temporary), str(old_dir))
+                    raise
+            else:
+                os.replace(str(old_dir), str(new_dir))
+            moved = True
+        except FileNotFoundError:
+            # 没有成功本地化任何媒体的记录本来就不会创建子目录，仍允许
+            # 用户先设置目录名，后续重新归档会写入该目录。
+            has_local_media = any(
+                str(data.get("local_path") or "").strip()
+                for _kind, data in _archive_media_entries(package)
+            )
+            if has_local_media:
+                raise FileNotFoundError("找不到聊天记录媒体文件夹")
+        except OSError as exc:
+            raise OSError(f"媒体文件夹重命名失败：{exc}") from exc
+
+    old_folder = old_dir.name
+    for _kind, data in _archive_media_entries(package):
+        value = str(data.get("local_path") or "").strip()
+        if not value:
+            continue
+        candidate = Path(value.replace("\\", "/"))
+        parts = candidate.parts
+        if (
+            not candidate.is_absolute()
+            and len(parts) >= 3
+            and parts[0].casefold() == "chat-record-media"
+            and parts[1].casefold() == old_folder.casefold()
+        ):
+            data["local_path"] = Path(parts[0], folder, *parts[2:]).as_posix()
+            continue
+        if candidate.is_absolute():
+            parent_key = os.path.normcase(
+                os.path.abspath(os.path.normpath(str(candidate.parent)))
+            )
+            if parent_key == old_key:
+                data["local_path"] = str(new_dir / candidate.name)
+    package["_omm_media_folder"] = folder
+    return old_dir, new_dir, moved
 
 
 def _stored_archive_media_path(path, storage_root):
@@ -1649,23 +2254,16 @@ def _stored_archive_media_path(path, storage_root):
 
 
 def _archive_media_entries(package):
-    """按聊天节点顺序返回全部媒体段及类型。"""
+    """按聊天节点顺序返回正文及回复引用中的全部媒体段。"""
     result = []
-    for node, _depth in _iter_archive_nodes(package):
-        for segment in _node_segments(node):
-            kind = str(segment.get("type") or "")
-            if kind in _ARCHIVE_MEDIA_KINDS and isinstance(
-                segment.get("data"), dict
-            ):
-                result.append((kind, segment["data"]))
+    for node, _depth, _node_path in _iter_archive_nodes(package):
+        result.extend(_iter_segment_media(_node_segments(node)))
     return result
 
 
 def _archive_image_data(package):
     """兼容旧调用：只返回图片数据。"""
-    return [
-        data for kind, data in _archive_media_entries(package) if kind == "image"
-    ]
+    return [data for kind, data in _archive_media_entries(package) if kind == "image"]
 
 
 def _image_suffix(path, data):
@@ -1705,9 +2303,7 @@ def _media_suffix(path, data, kind):
         suffix = Path(value).suffix.lower()
         if re.fullmatch(r"\.[a-z0-9]{1,10}", suffix):
             return suffix
-    return {"record": ".silk", "video": ".mp4", "file": ".bin"}.get(
-        kind, ".bin"
-    )
+    return {"record": ".silk", "video": ".mp4", "file": ".bin"}.get(kind, ".bin")
 
 
 def _download_archive_image(http_url, token, data):
@@ -1737,9 +2333,7 @@ def _download_archive_image(http_url, token, data):
         except OneBotError as exc:
             logger.info("NapCat 归档图片 URL 下载失败: %s", exc)
             continue
-        source = _media_send_source(
-            downloaded if isinstance(downloaded, dict) else {}
-        )
+        source = _media_send_source(downloaded if isinstance(downloaded, dict) else {})
         if source:
             return source
     return _napcat_image_source(http_url, token, data)
@@ -1777,9 +2371,7 @@ def _download_archive_media(http_url, token, kind, data):
         except OneBotError as exc:
             logger.info("NapCat 归档%s URL 下载失败: %s", kind, exc)
             continue
-        source = _media_send_source(
-            downloaded if isinstance(downloaded, dict) else {}
-        )
+        source = _media_send_source(downloaded if isinstance(downloaded, dict) else {})
         if source:
             return source
     if kind == "record":
@@ -1804,17 +2396,19 @@ def _download_archive_media(http_url, token, kind, data):
     return ""
 
 
-def _localize_archive_media(
-    http_url, token, package, media_root, storage_root=None
-):
+def _localize_archive_media(http_url, token, package, media_root, storage_root=None):
     """保存归档全部媒体本体，并把稳定路径写回结构包。"""
     archive_dir = _archive_media_dir(package, media_root)
+    entries = _archive_media_entries(package)
+    reserved_names = {
+        Path(str(data.get("local_path") or "")).name
+        for _kind, data in entries
+        if data.get("local_path")
+    }
     localized = 0
-    for index, (kind, data) in enumerate(_archive_media_entries(package), 1):
+    for index, (kind, data) in enumerate(entries, 1):
         current = _archive_media_source(data, storage_root=storage_root)
-        source_path = current or _download_archive_media(
-            http_url, token, kind, data
-        )
+        source_path = current or _download_archive_media(http_url, token, kind, data)
         if not source_path:
             continue
         path = Path(source_path)
@@ -1823,27 +2417,35 @@ def _localize_archive_media(
         except OSError:
             continue
         limit = (
-            _MAX_ARCHIVE_IMAGE_BYTES
-            if kind == "image"
-            else _MAX_ARCHIVE_MEDIA_BYTES
+            _MAX_ARCHIVE_IMAGE_BYTES if kind == "image" else _MAX_ARCHIVE_MEDIA_BYTES
         )
         if size <= 0 or size > limit:
             logger.info("归档%s大小超出限制: %s", kind, size)
             continue
         archive_dir.mkdir(parents=True, exist_ok=True)
-        destination = archive_dir / (
-            f"{index:05d}{_media_suffix(path, data, kind)}"
-        )
+        if os.path.normcase(os.path.abspath(path.parent)) == os.path.normcase(
+            os.path.abspath(archive_dir)
+        ):
+            data["local_path"] = _stored_archive_media_path(path, storage_root)
+            localized += 1
+            continue
+        destination = archive_dir / (f"{index:05d}{_media_suffix(path, data, kind)}")
         try:
             same_file = path.resolve() == destination.resolve()
         except OSError:
             same_file = path == destination
         if same_file:
-            data["local_path"] = _stored_archive_media_path(
-                destination, storage_root
-            )
+            data["local_path"] = _stored_archive_media_path(destination, storage_root)
             localized += 1
             continue
+        try:
+            occupied = destination.name in reserved_names or destination.exists()
+        except OSError:
+            occupied = True
+        if occupied:
+            destination = destination.with_name(
+                f"{destination.stem}-{os.urandom(8).hex()}{destination.suffix}"
+            )
         temporary = destination.with_suffix(destination.suffix + ".tmp")
         try:
             shutil.copyfile(path, temporary)
@@ -1856,6 +2458,7 @@ def _localize_archive_media(
                 pass
             continue
         data["local_path"] = _stored_archive_media_path(destination, storage_root)
+        reserved_names.add(destination.name)
         localized += 1
     summary = package.get("summary") if isinstance(package, dict) else None
     if isinstance(summary, dict):
@@ -1864,9 +2467,7 @@ def _localize_archive_media(
     return localized
 
 
-def _localize_archive_images(
-    http_url, token, package, media_root, storage_root=None
-):
+def _localize_archive_images(http_url, token, package, media_root, storage_root=None):
     """兼容旧调用；新版会持久化图片、语音、视频和文件。"""
     return _localize_archive_media(
         http_url, token, package, media_root, storage_root=storage_root
@@ -1878,6 +2479,7 @@ def _prune_archive_media(package, media_root, storage_root=None):
     archive_dir = _archive_media_dir(package, media_root)
     if not archive_dir.is_dir():
         return 0
+
     def lexical(path):
         return os.path.normcase(os.path.abspath(os.path.normpath(str(path))))
 
@@ -1929,18 +2531,64 @@ def _prune_archive_media(package, media_root, storage_root=None):
 
 
 def _reuse_archived_media_paths(archived_package, refreshed_package):
-    """把已持久化媒体按节点顺序与类型合并到重新读取的消息结构。"""
-    archived = _archive_media_entries(archived_package)
-    refreshed = _archive_media_entries(refreshed_package)
+    """按节点和正文/引用位置复用媒体，新增引用不能使正文媒体错位。"""
+
+    def slots(package):
+        result = {}
+
+        def read(segments, node_path, quote_path=(), depth=0):
+            counters = {}
+            reply_index = 0
+            for segment in _message_segments(segments):
+                kind = str(segment.get("type") or "")
+                data = segment.get("data")
+                if kind in _ARCHIVE_MEDIA_KINDS and isinstance(data, dict):
+                    index = counters.get(kind, 0)
+                    counters[kind] = index + 1
+                    result[(node_path, quote_path, kind, index)] = data
+                if kind == "reply" and depth < 3:
+                    read(
+                        _quoted_segments(segment),
+                        node_path,
+                        quote_path + (reply_index,),
+                        depth + 1,
+                    )
+                    reply_index += 1
+
+        for node, _depth, node_path in _iter_archive_nodes(package):
+            read(_node_segments(node), node_path)
+        return result
+
+    archived = slots(archived_package)
+    refreshed = slots(refreshed_package)
     reused = 0
-    for (old_kind, old), (new_kind, new) in zip(archived, refreshed):
-        if old_kind != new_kind:
+    for key, new in refreshed.items():
+        old = archived.get(key)
+        if old is None:
             continue
         local_path = _archive_media_source(old)
         if local_path:
             new["local_path"] = old.get("local_path")
             reused += 1
     return reused
+
+
+def _reuse_archived_native_forward(archived_package, refreshed_package):
+    """刷新读取未取得原生负载时，保留归档里已有的可重放负载。"""
+    refreshed_payload, _, _, _ = _stored_native_forward_replay(refreshed_package)
+    if refreshed_payload:
+        return False
+    archived_payload, archived_card, _, _ = _stored_native_forward_replay(
+        archived_package
+    )
+    if not archived_payload:
+        return False
+    refreshed_package["omm_native_payload_b64"] = archived_payload
+    if not isinstance(refreshed_package.get("native_card"), dict) and isinstance(
+        archived_card, dict
+    ):
+        refreshed_package["native_card"] = archived_card
+    return True
 
 
 def _reuse_archived_image_paths(archived_package, refreshed_package):
@@ -1968,7 +2616,9 @@ def _napcat_image_source(http_url, token, data):
     return ""
 
 
-def _prepare_sendable_segments(segments, degrade_media=False, media_resolver=None):
+def _prepare_sendable_segments(
+    segments, degrade_media=False, media_resolver=None, _quote_depth=0
+):
     """规范媒体来源；不可用或强制降级时以文字占位保留消息语义。"""
     result = []
     degraded = 0
@@ -1980,11 +2630,55 @@ def _prepare_sendable_segments(segments, degrade_media=False, media_resolver=Non
     }
     for segment in segments:
         kind = str(segment.get("type") or "")
-        if kind in ("reply", "forward", "node") or _json_card_forward(segment):
+        if kind == "reply":
+            quoted = _quoted_segments(segment)
+            if quoted and _quote_depth < 3:
+                quote_content, quote_degraded = _prepare_sendable_segments(
+                    quoted,
+                    degrade_media=degrade_media,
+                    media_resolver=media_resolver,
+                    _quote_depth=_quote_depth + 1,
+                )
+                if quote_content:
+                    result.append({"type": "text", "data": {"text": "[引用内容] "}})
+                    result.extend(quote_content)
+                    result.append({"type": "text", "data": {"text": "\n"}})
+                    degraded += quote_degraded
+            continue
+        if kind in ("forward", "node") or _json_card_forward(segment):
             continue
         data = segment.get("data")
         if not kind or not isinstance(data, dict):
             continue
+        if kind == "image":
+            # NapCat 接收商城表情时为兼容 OB11 会暂时表示成 image，并把
+            # marketFaceElement 的身份字段附在 data 中。重组时还原成 mface，
+            # 否则即使本地 GIF 完整，也只会作为普通图片发送。
+            emoji_id = str(data.get("emoji_id") or "").strip()
+            emoji_key = str(data.get("key") or "").strip()
+            try:
+                emoji_package_id = int(data.get("emoji_package_id"))
+            except (TypeError, ValueError):
+                emoji_package_id = -1
+            if (
+                0 <= emoji_package_id <= 2**31 - 1
+                and 0 < len(emoji_id) <= 512
+                and 0 < len(emoji_key) <= 4096
+            ):
+                summary = str(data.get("summary") or "[商城表情]")
+                summary = summary.replace("\x00", "")[:256] or "[商城表情]"
+                result.append(
+                    {
+                        "type": "mface",
+                        "data": {
+                            "emoji_package_id": emoji_package_id,
+                            "emoji_id": emoji_id,
+                            "key": emoji_key,
+                            "summary": summary,
+                        },
+                    }
+                )
+                continue
         if kind not in media_labels:
             result.append({"type": kind, "data": dict(data)})
             continue
@@ -2001,7 +2695,19 @@ def _prepare_sendable_segments(segments, degrade_media=False, media_resolver=Non
         ):
             source = _media_send_source(data)
         if source:
-            result.append({"type": kind, "data": {"file": source}})
+            send_data = {"file": source}
+            if kind == "image":
+                try:
+                    sub_type = int(data.get("sub_type"))
+                except (TypeError, ValueError):
+                    sub_type = None
+                if sub_type is not None and 0 <= sub_type <= 255:
+                    send_data["sub_type"] = sub_type
+                if data.get("summary") not in (None, ""):
+                    summary = str(data.get("summary")).replace("\x00", "")[:256]
+                    if summary:
+                        send_data["summary"] = summary
+            result.append({"type": kind, "data": send_data})
             continue
         degraded += 1
         label = media_labels[kind]
@@ -2020,6 +2726,7 @@ def _forward_nodes(package, self_id, degrade_media=False, media_resolver=None):
     """生成保留 NapCat 可发送嵌套层级的 OneBot node 树。"""
     degraded_media_count = 0
     built_node_count = 0
+    blocked_paths = set(chat_record_blocked_paths(package))
 
     def make_node(node, content, forward_data=None):
         nonlocal built_node_count
@@ -2036,10 +2743,7 @@ def _forward_nodes(package, self_id, degrade_media=False, media_resolver=None):
             or "OhMyMeme"
         )
         user_id = (
-            sender.get("user_id")
-            or data.get("user_id")
-            or data.get("uin")
-            or self_id
+            sender.get("user_id") or data.get("user_id") or data.get("uin") or self_id
         )
         node_data = {
             "user_id": user_id,
@@ -2077,13 +2781,18 @@ def _forward_nodes(package, self_id, degrade_media=False, media_resolver=None):
         built_node_count += 1
         return {"type": "node", "data": node_data}
 
-    def build(nodes, archive_depth, nested_depth):
+    def build(nodes, archive_depth, nested_depth, parent_path=""):
         nonlocal degraded_media_count
         result = []
         if archive_depth > _MAX_ARCHIVE_DEPTH:
             return result
-        for node in nodes:
+        for node_index, node in enumerate(nodes):
             if not isinstance(node, dict) or built_node_count >= _MAX_ARCHIVE_NODES:
+                continue
+            node_path = (
+                f"{parent_path}/n{node_index}" if parent_path else f"n{node_index}"
+            )
+            if node_path in blocked_paths:
                 continue
             segments = _node_segments(node)
             forward_segments = _forward_segments(segments)
@@ -2108,23 +2817,27 @@ def _forward_nodes(package, self_id, degrade_media=False, media_resolver=None):
                 normal_node = make_node(node, content)
                 if normal_node:
                     result.append(normal_node)
-            for segment in forward_segments:
+            for segment_index, segment in _indexed_forward_segments(segments):
                 forward_data = (
-                    segment.get("data")
-                    if isinstance(segment.get("data"), dict)
-                    else {}
+                    segment.get("data") if isinstance(segment.get("data"), dict) else {}
                 )
                 nested_nodes = _nested_nodes(package, segment)
+                child_path = f"{node_path}/s{segment_index}"
                 if nested_depth < _MAX_NAPCAT_NESTED_FORWARD_DEPTH:
                     children = build(
-                        nested_nodes, archive_depth + 1, nested_depth + 1
+                        nested_nodes,
+                        archive_depth + 1,
+                        nested_depth + 1,
+                        child_path,
                     )
                     if children:
                         wrapper = make_node(node, children, forward_data)
                         if wrapper:
                             result.append(wrapper)
                     continue
-                children = build(nested_nodes, archive_depth + 1, nested_depth)
+                children = build(
+                    nested_nodes, archive_depth + 1, nested_depth, child_path
+                )
                 if not children:
                     continue
                 marker = make_node(
@@ -2222,15 +2935,97 @@ def _persistent_source_identity(source):
     return {
         "source_type": message_type,
         "source_peer_id": peer_id,
+        "source_self_id": self_id,
         "source_real_seq": real_seq,
         "source_time": source.get("time"),
         "source_sender_id": sender.get("user_id") or source.get("user_id"),
     }
 
 
-def _forward_original_message_by_identity(
-    webui_url, webui_token, source, event
-):
+def chat_record_sources(*packages):
+    """合并等价的原生消息位置，只保留定位字段并按最近可用时间排序。"""
+    locations = {}
+    fields = (
+        "self_id",
+        "message_id",
+        "message_type",
+        "group_id",
+        "target_id",
+        "user_id",
+        "real_seq",
+        "time",
+        "last_success_at",
+    )
+    for package in packages:
+        if not isinstance(package, dict):
+            continue
+        sources = [package.get("source")]
+        stored = package.get("source_locations")
+        if isinstance(stored, list):
+            sources.extend(stored)
+        for source in sources:
+            if not isinstance(source, dict):
+                continue
+            identity = _persistent_source_identity(source)
+            if identity:
+                key = tuple(
+                    str(identity[field])
+                    for field in (
+                        "source_self_id",
+                        "source_type",
+                        "source_peer_id",
+                        "source_real_seq",
+                    )
+                )
+            elif source.get("message_id") not in (None, ""):
+                key = (str(source.get("self_id") or ""), str(source.get("message_id")))
+            else:
+                continue
+            location = {
+                field: source[field]
+                for field in fields
+                if isinstance(source.get(field), (str, int))
+            }
+            sender = source.get("sender")
+            if isinstance(sender, dict) and sender.get("user_id") not in (None, ""):
+                if isinstance(sender["user_id"], (str, int)):
+                    location["sender"] = {"user_id": sender["user_id"]}
+            previous = locations.get(key, {})
+            try:
+                successful_at = int(location.get("last_success_at") or 0)
+            except (TypeError, ValueError):
+                successful_at = 0
+            location["last_success_at"] = max(
+                int(previous.get("last_success_at") or 0),
+                successful_at,
+            )
+            locations.pop(key, None)
+            locations[key] = {**previous, **location}
+    return sorted(
+        reversed(list(locations.values())),
+        key=lambda item: int(item.get("last_success_at") or 0),
+        reverse=True,
+    )
+
+
+def _remember_chat_record_send(db, record_id, sent, source=None):
+    """发送已完成后尽力保存等价副本位置，记录失败不得触发重发。"""
+    location = sent.get("source_location") if isinstance(sent, dict) else None
+    recorded = False
+    try:
+        if isinstance(location, dict) and _persistent_source_identity(location):
+            recorded = bool(
+                db.add_chat_record_source(record_id, location, used_source=source)
+            )
+        elif source and _persistent_source_identity(source):
+            db.add_chat_record_source(record_id, source)
+            logger.warning("聊天记录已发送，但未取得副本的真实消息位置 #%s", record_id)
+    except Exception as exc:
+        logger.warning("聊天记录已发送，但副本位置保存失败 #%s: %s", record_id, exc)
+    return recorded
+
+
+def _forward_original_message_by_identity(webui_url, webui_token, source, event):
     """由桥接插件按真实序号重定位消息并执行 QQ 原生转发。"""
     identity = _persistent_source_identity(source)
     if not identity:
@@ -2238,22 +3033,26 @@ def _forward_original_message_by_identity(
             "归档缺少来源会话或真实消息序号，无法在 NapCat 重启后重新索引"
         )
     destination_type, destination_id = _send_destination(event)
-    payload = call_webui_plugin_api(
-        webui_url,
-        webui_token,
-        "napcat-plugin-ohmymeme-current-peer",
-        "forward-message",
-        timeout=35,
-        params={
-            **identity,
-            "destination_type": destination_type,
-            "destination_peer_id": destination_id,
-        },
-    )
-    if not payload.get("ok"):
-        raise OneBotError(
-            str(payload.get("error") or "无法通过持久索引转发原消息")
+    try:
+        payload = call_webui_plugin_api(
+            webui_url,
+            webui_token,
+            "napcat-plugin-ohmymeme-current-peer",
+            "forward-message",
+            timeout=35,
+            params={
+                **identity,
+                "destination_type": destination_type,
+                "destination_peer_id": destination_id,
+            },
         )
+    except OneBotError as exc:
+        exc.send_started = True
+        raise
+    if not payload.get("ok"):
+        error = OneBotError(str(payload.get("error") or "无法通过持久索引转发原消息"))
+        error.send_started = payload.get("retry_safe") is False
+        raise error
     return payload
 
 
@@ -2267,6 +3066,8 @@ def _send_qqnt_native_rebuilt_forward(
     native_card=None,
     native_source_type="",
     native_source_peer_id="",
+    blocked_node_paths=None,
+    self_native_relay=False,
 ):
     """通过临时节点包调用桥接插件，让 QQNT 内核原生生成合并转发。"""
     payload = {
@@ -2282,9 +3083,13 @@ def _send_qqnt_native_rebuilt_forward(
     if native_payload_b64:
         payload["native_source_type"] = str(native_source_type or "")
         payload["native_source_peer_id"] = str(native_source_peer_id or "")
-    encoded = json.dumps(
-        payload, ensure_ascii=False, separators=(",", ":")
-    ).encode("utf-8")
+        if blocked_node_paths:
+            payload["blocked_node_paths"] = normalize_chat_record_blocked_paths(
+                blocked_node_paths
+            )
+    encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode(
+        "utf-8"
+    )
     if len(encoded) > _MAX_ARCHIVE_BYTES:
         raise OneBotError("聊天记录重组数据超过 64 MiB，未执行发送")
     descriptor, payload_path = tempfile.mkstemp(
@@ -2297,7 +3102,11 @@ def _send_qqnt_native_rebuilt_forward(
             webui_url,
             webui_token,
             "napcat-plugin-ohmymeme-current-peer",
-            "send-native-forward",
+            (
+                "send-self-native-forward"
+                if self_native_relay
+                else "send-native-forward"
+            ),
             timeout=180,
             params={"payload_path": payload_path},
         )
@@ -2309,20 +3118,36 @@ def _send_qqnt_native_rebuilt_forward(
         except OSError as exc:
             logger.info("原生重组临时文件清理失败: %s", exc)
     if not response.get("ok"):
-        raise OneBotError(
-            str(response.get("error") or "QQNT 原生重组发送失败")
-        )
+        raise OneBotError(str(response.get("error") or "QQNT 原生重组发送失败"))
+    if self_native_relay and response.get("strategy") != "qqnt_self_native_relay":
+        raise OneBotError("NapCat 桥接插件版本过旧，不支持自聊原生转发")
     return response
 
 
-def _native_forward_replay(package):
-    """读取根聊天记录在导入时保存的 QQNT 原始长消息负载。"""
+def _stored_native_forward_replay(package):
+    """读取归档中保存的 QQNT 原始长消息负载，不判断筛选规则。"""
     if not isinstance(package, dict):
         return "", None, "", ""
-    records = package.get("forward_records")
-    records = records if isinstance(records, dict) else {}
     source = package.get("source")
     source = source if isinstance(source, dict) else {}
+    card = package.get("native_card")
+    card = card if isinstance(card, dict) else None
+    identity = _persistent_source_identity(source) or {}
+
+    # parseMultMsg 可能把根记录直接内联进 source.message，根资源便不会进入
+    # forward_records。新版将外层原生负载保存在包顶层；仍兼容旧归档里
+    # 跟随根 forward record 保存的格式。
+    value = package.get("omm_native_payload_b64")
+    if isinstance(value, str) and value:
+        return (
+            value,
+            card,
+            str(identity.get("source_type") or ""),
+            str(identity.get("source_peer_id") or ""),
+        )
+
+    records = package.get("forward_records")
+    records = records if isinstance(records, dict) else {}
     root_ids = []
     for segment in _forward_segments(_message_segments(source.get("message"))):
         data = segment.get("data") if isinstance(segment.get("data"), dict) else {}
@@ -2335,15 +3160,23 @@ def _native_forward_replay(package):
             continue
         value = record.get("omm_native_payload_b64")
         if isinstance(value, str) and value:
-            card = package.get("native_card")
-            identity = _persistent_source_identity(source) or {}
             return (
                 value,
-                card if isinstance(card, dict) else None,
+                card,
                 str(identity.get("source_type") or ""),
                 str(identity.get("source_peer_id") or ""),
             )
     return "", None, "", ""
+
+
+def _native_forward_replay(package):
+    """读取可按当前筛选规则安全重放的 QQNT 原始长消息负载。"""
+    # 桥接插件可以在不解码各消息头的前提下，直接移除主 MultiMsg action
+    # 中的最外层 msgBody，因此最外层筛选仍可保留其余节点的原生发送者。
+    # 嵌套节点涉及附属 action/外部资源，暂时仍须使用筛选后的 nodes 重组。
+    if any("/" in path for path in chat_record_blocked_paths(package)):
+        return "", None, "", ""
+    return _stored_native_forward_replay(package)
 
 
 def send_chat_record(
@@ -2366,57 +3199,85 @@ def send_chat_record(
         raise OneBotError(f"找不到聊天记录 #{int(record_id)}")
     send_mode = normalize_send_mode(send_mode)
     source = package.get("source") if isinstance(package.get("source"), dict) else {}
-    source_id = source.get("message_id")
+    sources = chat_record_sources(package) or [source]
     if send_mode == "original_native":
-        if source_id in (None, ""):
-            raise OneBotError("归档缺少外层消息 ID，无法原生转发")
         reindexed = False
-        try:
-            sent = _forward_original_message(http_url, token, source_id, event)
-        except OneBotError as direct_error:
-            if not webui_url:
-                raise OneBotError(
-                    f"{direct_error}；NapCat 短消息 ID 可能已因重启失效，"
-                    "请在设置中填写 NapCat WebUI 地址和 Token 后重试"
-                ) from direct_error
+        current_self_id = str(event.get("self_id") or "").strip()
+        errors = []
+        for location in sources:
             try:
-                sent = _forward_original_message_by_identity(
-                    webui_url, webui_token, source, event
-                )
-                reindexed = True
-            except OneBotError as recovery_error:
-                raise OneBotError(
-                    f"原生消息索引已失效；按持久位置重新索引也失败："
-                    f"{recovery_error}"
-                ) from recovery_error
+                if webui_url and webui_token and _persistent_source_identity(location):
+                    sent = _forward_original_message_by_identity(
+                        webui_url, webui_token, location, event
+                    )
+                    reindexed = True
+                else:
+                    account = str(location.get("self_id") or "")
+                    if account and current_self_id and account != current_self_id:
+                        raise OneBotError("该位置属于其他账号，不能复用短消息 ID")
+                    source_id = location.get("message_id")
+                    if source_id in (None, ""):
+                        raise OneBotError("该位置没有可用消息 ID，请配置 NapCat WebUI")
+                    sent = _forward_original_message(http_url, token, source_id, event)
+                break
+            except OneBotError as exc:
+                if getattr(exc, "send_started", False):
+                    raise
+                errors.append(str(exc))
+        else:
+            raise OneBotError("所有原生消息位置均不可用：" + "；".join(errors))
+        backup_recorded = _remember_chat_record_send(db, record_id, sent, location)
         return {
             "ok": True,
             "id": int(record_id),
             "title": str(package.get("title") or "聊天记录"),
-            "node_count": int(
-                (package.get("summary") or {}).get("node_count") or 0
-            ),
+            "node_count": int((package.get("summary") or {}).get("node_count") or 0),
             "source": "original_native",
             "reindexed": reindexed,
+            "backup_recorded": backup_recorded,
             "degraded_media_count": 0,
             "message_id": sent.get("message_id") if isinstance(sent, dict) else None,
         }
     if send_mode == "original_rebuild":
-        if source_id in (None, ""):
-            raise OneBotError("归档缺少外层消息 ID，无法重新读取原消息")
-        refreshed_package = build_chat_record_package(
-            http_url,
-            token,
-            source_id,
-            trigger_event=source,
-            webui_url=webui_url,
-            webui_token=webui_token,
-        )
+        errors = []
+        for location in sources:
+            try:
+                recovered_source = None
+                if webui_url and webui_token and _persistent_source_identity(location):
+                    recovered_source = _recover_original_message_by_identity(
+                        webui_url, webui_token, location
+                    )
+                elif str(location.get("self_id") or "") not in (
+                    "",
+                    str(event.get("self_id") or ""),
+                ):
+                    raise OneBotError("该位置属于其他账号，不能复用短消息 ID")
+                refreshed_package = build_chat_record_package(
+                    http_url,
+                    token,
+                    (recovered_source or {}).get("message_id")
+                    or location.get("message_id"),
+                    trigger_event=location,
+                    webui_url=webui_url,
+                    webui_token=webui_token,
+                    source_message=recovered_source,
+                )
+                break
+            except OneBotError as exc:
+                errors.append(str(exc))
+        else:
+            raise OneBotError("所有消息位置均无法重新读取：" + "；".join(errors))
+        blocked_paths = chat_record_blocked_paths(package)
         _reuse_archived_media_paths(package, refreshed_package)
+        _reuse_archived_native_forward(package, refreshed_package)
+        set_chat_record_blocked_paths(refreshed_package, blocked_paths)
+        refreshed_package["source_locations"] = chat_record_sources(
+            package, refreshed_package
+        )
         package = refreshed_package
         # 模式二取得的原始 QQNT 长消息负载也写回同一归档，使后续模式三
         # 可以完全离线地重放原生结构，而不再伪造发送者身份。
-        db.save_chat_record(package)
+        db.save_chat_record(package, record_id=int(record_id))
 
     event = event if isinstance(event, dict) else {}
     self_id = event.get("self_id") or source.get("self_id")
@@ -2428,7 +3289,19 @@ def send_chat_record(
         package, self_id, media_resolver=media_resolver
     )
     destination_type, destination_id = _send_destination(event)
-    if webui_url and webui_token:
+    if send_mode == "self_native_relay":
+        if not webui_url or not webui_token:
+            raise OneBotError("自聊重建后原生转发需要配置 NapCat WebUI 地址和 Token")
+        sent = _send_qqnt_native_rebuilt_forward(
+            webui_url,
+            webui_token,
+            destination_type,
+            destination_id,
+            nodes,
+            self_native_relay=True,
+        )
+        native_rebuild = True
+    elif webui_url and webui_token:
         (
             native_payload_b64,
             native_card,
@@ -2445,6 +3318,9 @@ def send_chat_record(
             native_card=native_card,
             native_source_type=native_source_type,
             native_source_peer_id=native_source_peer_id,
+            blocked_node_paths=(
+                chat_record_blocked_paths(package) if native_payload_b64 else None
+            ),
         )
         native_rebuild = True
     else:
@@ -2467,18 +3343,66 @@ def send_chat_record(
             )
             params["messages"] = nodes
             sent = call_action(http_url, token, action, params, 30)
+    backup_recorded = False
+    if isinstance(sent, dict) and sent.get("strategy") == "qqnt_native_replay":
+        backup_recorded = _remember_chat_record_send(db, record_id, sent)
     return {
         "ok": True,
         "id": int(record_id),
         "title": str(package.get("title") or "聊天记录"),
         "node_count": len(nodes),
         "source": send_mode,
+        "backup_recorded": backup_recorded,
         "native_rebuild": native_rebuild,
-        "native_replay": bool(
-            native_rebuild
-            and sent.get("strategy") == "qqnt_native_replay"
-        ) if isinstance(sent, dict) else False,
+        "native_replay": (
+            bool(
+                native_rebuild
+                and sent.get("strategy")
+                in (
+                    "qqnt_native_replay",
+                    "qqnt_native_filtered_replay",
+                )
+            )
+            if isinstance(sent, dict)
+            else False
+        ),
+        "native_filtered_replay": (
+            bool(
+                native_rebuild and sent.get("strategy") == "qqnt_native_filtered_replay"
+            )
+            if isinstance(sent, dict)
+            else False
+        ),
+        "self_native_relay": (
+            bool(native_rebuild and sent.get("strategy") == "qqnt_self_native_relay")
+            if isinstance(sent, dict)
+            else False
+        ),
         "degraded_media_count": degraded_media_count,
+        "message_id": sent.get("message_id") if isinstance(sent, dict) else None,
+    }
+
+
+def send_meme_image(http_url, token, path, message_type, peer_id, as_sticker=False):
+    """通过 NapCat 向指定 QQ 会话发送本地图片。"""
+    source = os.path.abspath(os.fspath(path))
+    if not os.path.isfile(source):
+        raise OneBotError("表情文件不存在")
+    image = {"file": source}
+    if as_sticker:
+        image.update({"sub_type": 1, "summary": "[表情]"})
+    message = [{"type": "image", "data": image}]
+    if message_type == "group":
+        action = "send_group_msg"
+        params = {"group_id": peer_id, "message": message}
+    elif message_type == "private":
+        action = "send_private_msg"
+        params = {"user_id": peer_id, "message": message}
+    else:
+        raise OneBotError("QQ 会话类型无效")
+    sent = call_action(http_url, token, action, params, 30)
+    return {
+        "ok": True,
         "message_id": sent.get("message_id") if isinstance(sent, dict) else None,
     }
 
@@ -2554,7 +3478,8 @@ def handle_command_event(
             lines = ["OhMyMeme：最近保存的聊天记录："]
             for item in records:
                 lines.append(
-                    f"#{item['id']} {item['title']}（{item['node_count']} 条消息）"
+                    f"#{item['id']} {item.get('name') or item['title']}"
+                    f"（{item['node_count']} 条消息）"
                 )
             lines.append(f"发送：{command} send <ID>")
         else:
@@ -2601,9 +3526,14 @@ def handle_command_event(
             "original_native": "原消息原生转发",
             "original_rebuild": "原消息重组",
             "archive_rebuild": "本地归档重组",
+            "self_native_relay": "自聊重建后原生转发",
         }
         source_label = source_labels.get(result["source"], "本地归档重组")
-        if result.get("native_replay"):
+        if result.get("self_native_relay"):
+            native_note = "（发送者统一为当前账号）"
+        elif result.get("native_filtered_replay"):
+            native_note = "（筛选后原生负载重放）"
+        elif result.get("native_replay"):
             native_note = "（QQNT 原生负载重放）"
         elif result.get("native_rebuild"):
             native_note = "（QQNT 原生重组）"
@@ -2649,7 +3579,7 @@ def handle_command_event(
         }
     action = "已保存" if result["created"] else "已更新"
     feedback = (
-        f"OhMyMeme：{action}「{result['title']}」，"
+        f"OhMyMeme：{action}「{result.get('name') or result['title']}」，"
         f"共 {result['node_count']} 条消息。"
     )
     if result["media_count"]:
@@ -2846,7 +3776,7 @@ class OneBotCommandListener:
                 if result.get("ok") and result.get("action") == "save":
                     self._last_saved = {
                         "id": result.get("id"),
-                        "title": result.get("title"),
+                        "title": result.get("name") or result.get("title"),
                         "node_count": result.get("node_count", 0),
                         "time": int(time.time()),
                     }

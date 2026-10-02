@@ -3,6 +3,7 @@ import { api } from '../utils/api'
 import type { ChatRecordSummary, Genre, Meme, TagRecord } from '../types'
 
 const MEME_PAGE = 200
+export const ALL_GENRES: Genre[] = ['image', 'gif', 'chat_record']
 
 const state = reactive({
   memes: [] as Meme[],
@@ -13,7 +14,7 @@ const state = reactive({
   activeCollection: null as number | null,
   activeCategory: null as number | null,
   activeTags: new Set<string>(),
-  activeGenre: 'all' as Genre,
+  activeGenres: [...ALL_GENRES],
   selectedIds: new Set<number>(),
   allTags: [] as TagRecord[],
   searchQuery: '',
@@ -45,12 +46,12 @@ export function useMemes() {
     query = state.searchQuery,
     collectionId = state.activeCollection,
     categoryId = state.activeCategory,
-    genre = state.activeGenre,
+    genres = state.activeGenres,
   ) {
     // 后端会先取消上一个查询的预热任务；设置未启用或没有后续页时只执行取消。
     void api(
       'start_page_cache_warmup', query, selectedTags, collectionId,
-      offset, MEME_PAGE, state.total, categoryId, genre,
+      offset, MEME_PAGE, state.total, categoryId, [...genres],
     )
   }
 
@@ -69,7 +70,7 @@ export function useMemes() {
       state.collections = data.collections || []
       state.categories = data.categories || []
       state.page = 1
-      const library = await api('search_library', '', [], null, 0, MEME_PAGE, null, state.activeGenre)
+      const library = await api('search_library', '', [], null, 0, MEME_PAGE, null, [...state.activeGenres])
       if (library && Array.isArray(library.memes) && Array.isArray(library.chat_records)) {
         state.memes = library.memes
         state.chatRecords = library.chat_records
@@ -85,7 +86,7 @@ export function useMemes() {
     }
   }
 
-  async function search(resetPage = true) {
+  async function search(resetPage = true, refreshRandom = false): Promise<boolean> {
     const gen = ++searchGen
     if (resetPage) state.page = 1
     state.loading = true
@@ -93,16 +94,17 @@ export function useMemes() {
     state.selectedIds = new Set()
     const offset = (state.page - 1) * MEME_PAGE
     const selectedTags = state.allTags.filter(tag => state.activeTags.has(tagKey(tag)))
-    // 查询条件一变化就停止旧预热；即使本次搜索失败，也不能继续读取旧结果。
-    void api('cancel_page_cache_warmup')
     try {
+      // 后端在同一次 search_library 调用内先取消旧预热，避免额外桥接竞争。
       const result = await api(
-        'search_library', state.searchQuery, selectedTags, state.activeCollection,
-        offset, MEME_PAGE, state.activeCategory, state.activeGenre,
+        'search_library',
+        state.searchQuery, selectedTags, state.activeCollection,
+        offset, MEME_PAGE, state.activeCategory, [...state.activeGenres],
+        refreshRandom,
       )
-      if (gen !== searchGen) return
+      if (gen !== searchGen) return false
       // 桥接失败（null/非数组）时保留当前分页与结果，避免暂时性故障触发空页回退或清空网格
-      if (!result || !Array.isArray(result.memes) || !Array.isArray(result.chat_records) || typeof result.total !== 'number') return
+      if (!result || !Array.isArray(result.memes) || !Array.isArray(result.chat_records) || typeof result.total !== 'number') return false
       state.total = result.total
       state.pageCount = Math.max(1, Math.ceil(state.total / MEME_PAGE))
       state.memes = result.memes
@@ -114,8 +116,9 @@ export function useMemes() {
         const target = Math.max(1, Math.min(state.page, state.pageCount))
         if (target !== state.page) { state.page = target; return search(false) }
       }
+      return true
     } catch (e) {
-      if (gen !== searchGen) return
+      return false
     } finally {
       if (gen === searchGen) state.loading = false
     }
@@ -132,32 +135,35 @@ export function useMemes() {
   }
 
   function setSearch(q: string) { state.searchQuery = q }
-  function setGenre(genre: Genre) {
-    if (state.activeGenre === genre) return
-    state.activeGenre = genre
-    if (genre === 'chat_record') {
-      state.activeTags = new Set()
-      state.activeCollection = null
-      state.activeCategory = null
-    }
+
+  function toggleGenre(genre: Genre) {
+    state.activeGenres = state.activeGenres.includes(genre)
+      ? state.activeGenres.filter(item => item !== genre)
+      : ALL_GENRES.filter(item => item === genre || state.activeGenres.includes(item))
     search()
   }
   function toggleTag(tag: TagRecord) {
-    if (state.activeGenre === 'chat_record') state.activeGenre = 'all'
     const key = tagKey(tag)
     if (state.activeTags.has(key)) state.activeTags.delete(key)
     else state.activeTags.add(key)
     search()
   }
-  function setActiveCollection(id: number | null) {
-    if (state.activeGenre === 'chat_record') state.activeGenre = 'all'
+  function setActiveCollection(id: number | null, refreshRandom = false) {
+    if (id === -5) {
+      state.activeCollection = id
+      state.activeCategory = null
+      state.searchQuery = ''
+      state.activeTags = new Set()
+      state.activeGenres = [...ALL_GENRES]
+      search(true, refreshRandom)
+      return
+    }
     if (state.activeCollection === id) state.activeCollection = null
     else state.activeCollection = id
     state.activeCategory = null
     search()
   }
   function setActiveCategory(id: number | null) {
-    if (state.activeGenre === 'chat_record') state.activeGenre = 'all'
     if (state.activeCategory === id) state.activeCategory = null
     else state.activeCategory = id
     state.activeCollection = null
@@ -205,6 +211,11 @@ export function useMemes() {
     const result = await api('copy_meme', id)
     return !!result?.ok
   }
+  async function refreshRecentUsage(): Promise<void> {
+    await refreshCollections()
+    // 最近使用按时间排序；正在查看该虚拟分组时必须重新查询内容，不能只更新计数。
+    if (state.activeCollection === -3) await search()
+  }
   async function reorderMemes(orderedIds: number[]): Promise<boolean> {
     const collectionId = state.activeCollection && state.activeCollection > 0 ? state.activeCollection : null
     const result = collectionId
@@ -227,15 +238,15 @@ export function useMemes() {
 
   function canReorder(): boolean {
     const q = state.searchQuery.trim()
-    if (state.activeGenre === 'chat_record' || state.chatTotal > 0) return false
+    if (!state.activeGenres.some(genre => genre !== 'chat_record') || state.chatTotal > 0) return false
     if (q || state.activeTags.size > 0) return false
     if (state.activeCategory !== null) return false
-    // 全部/未分组/正 ID 分组可排序；收藏夹/最近使用（-2/-3）不可排
+    // 全部/未分组/正 ID 分组可排序；收藏夹/最近使用/随机（-2/-3/-5）不可排
     return state.activeCollection === null || state.activeCollection === -4 || state.activeCollection > 0
   }
 
-  async function startNativeDrag(memeId: number): Promise<boolean> {
-    try { return !!await api('start_native_drag', memeId) } catch { return false }
+  async function startNativeDrag(memeId: number): Promise<any> {
+    try { return await api('start_meme_drag', memeId) } catch { return { ok: false } }
   }
 
   return {
@@ -244,13 +255,14 @@ export function useMemes() {
     search,
     goToPage,
     setSearch,
-    setGenre,
+    toggleGenre,
     toggleTag,
     setActiveCollection,
     setActiveCategory,
     refreshTags,
     refreshCollections,
     refreshCategories,
+    refreshRecentUsage,
     copyMeme,
     reorderMemes,
     canReorder,
