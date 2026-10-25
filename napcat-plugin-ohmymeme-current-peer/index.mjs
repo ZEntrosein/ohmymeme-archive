@@ -11,7 +11,7 @@
  */
 
 export const PLUGIN_ID = 'napcat-plugin-ohmymeme-current-peer'
-export const PLUGIN_VERSION = '0.5.42'
+export const PLUGIN_VERSION = '0.5.43'
 
 import { gzipSync, gunzipSync, inflateSync } from 'node:zlib'
 import {
@@ -43,6 +43,8 @@ const MARKET_FACE_TEMP_TTL_MS = 10 * 60 * 1000
 const CHAT_RECORD_TICKET_TTL_MS = 2 * 60 * 1000
 const CHAT_RECORD_TICKET_TYPE = 'ohmymeme.qq-chat-record-drag'
 const MARKET_FACE_CONSOLE_PREFIX = '__OHMYMEME_MARKET_FACE_DRAG__:'
+const QQ_DRAG_BRIDGE_TIMEOUT_MS = 1500
+const qqDragBridgePending = new WeakMap()
 const MARKET_FACE_DRAG_ICON = Buffer.from(
   'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
   'base64',
@@ -75,6 +77,7 @@ const state = {
   qqDragBridgeEnabled: false,
   qqDragBridgeTimer: null,
   qqDragBridgeBusy: false,
+  qqDragBridgeGeneration: 0,
   marketFaceConsoleHandlers: new Map(),
   marketFacePreparedDrags: new Map(),
   marketFaceRequestedDrags: new Map(),
@@ -4792,48 +4795,101 @@ function detachMarketFaceConsoleHandlers() {
   state.marketFaceConsoleHandlers.clear()
 }
 
-async function applyQQDragBridgeToWindows(action, browserWindows = null) {
-  let windows = browserWindows
-  if (!Array.isArray(windows)) windows = await electronBrowserWindows()
-  const results = []
-  for (let index = 0; index < windows.length; index += 1) {
-    const window = windows[index]
-    if (!window?.webContents || window.webContents.isDestroyed?.()) continue
-    try {
-      if (action === 'start') attachMarketFaceConsoleHandler(window.webContents)
-      const status = await window.webContents.executeJavaScript(
-        qqDragBridgeScript(action),
-        true,
-      )
-      results.push({ index, ok: true, status })
-    } catch {
-      results.push({ index, ok: false })
-    }
+// 只限制等待时间，不声称取消 Electron 内部尚未完成的脚本。
+function waitForQQDragBridge(operation, timeoutMs) {
+  let timer
+  return Promise.race([
+    operation,
+    new Promise((_, reject) => {
+      timer = setTimeout(() => {
+        const error = new Error('QQ 拖放桥接等待超时')
+        error.code = 'QQ_DRAG_BRIDGE_TIMEOUT'
+        reject(error)
+      }, timeoutMs)
+    }),
+  ]).finally(() => clearTimeout(timer))
+}
+
+// 同一窗口的同类未完成操作复用原 Promise，避免定时重试不断堆积脚本。
+function executeQQDragBridge(webContents, action, isCurrent) {
+  let pending = qqDragBridgePending.get(webContents)
+  if (!pending) {
+    pending = new Map()
+    qqDragBridgePending.set(webContents, pending)
   }
+  if (pending.has(action)) return pending.get(action)
+  const operation = Promise.resolve().then(() => {
+    if (!isCurrent() || webContents.isDestroyed?.()) return null
+    if (action === 'start') attachMarketFaceConsoleHandler(webContents)
+    return webContents.executeJavaScript(qqDragBridgeScript(action), true)
+  })
+  pending.set(action, operation)
+  const settled = () => {
+    if (pending.get(action) === operation) pending.delete(action)
+  }
+  operation.then(settled, settled)
+  return operation
+}
+
+async function applyQQDragBridgeToWindows(
+  action,
+  browserWindows = null,
+  timeoutMs = QQ_DRAG_BRIDGE_TIMEOUT_MS,
+  isCurrent = () => true,
+) {
   if (action === 'stop') {
     detachMarketFaceConsoleHandlers()
     cleanupMarketFaceTempFiles()
   }
-  return results
+  let windows = browserWindows
+  if (!Array.isArray(windows)) {
+    windows = await waitForQQDragBridge(electronBrowserWindows(), timeoutMs)
+  }
+  if (!isCurrent()) return []
+  const results = await Promise.all(windows.map(async (window, index) => {
+    if (!isCurrent() || !window?.webContents || window.webContents.isDestroyed?.()) {
+      return null
+    }
+    try {
+      const status = await waitForQQDragBridge(
+        executeQQDragBridge(window.webContents, action, isCurrent), timeoutMs,
+      )
+      return status === null ? null : { index, ok: true, status }
+    } catch (error) {
+      return { index, ok: false, ...(error?.code === 'QQ_DRAG_BRIDGE_TIMEOUT'
+        ? { timed_out: true } : {}) }
+    }
+  }))
+  return results.filter(Boolean)
 }
 
 function stopQQDragBridgeTimer() {
   if (state.qqDragBridgeTimer) clearInterval(state.qqDragBridgeTimer)
   state.qqDragBridgeTimer = null
   state.qqDragBridgeBusy = false
+  state.qqDragBridgeGeneration += 1
+}
+
+// 后台重试只属于当前生命周期，不能拖住插件初始化或释放新一轮的忙碌标记。
+async function refreshQQDragBridge(generation, browserWindows = null, timeoutMs = QQ_DRAG_BRIDGE_TIMEOUT_MS) {
+  const isCurrent = () => generation === state.qqDragBridgeGeneration
+    && state.active && state.qqDragBridgeEnabled
+  if (!isCurrent() || state.qqDragBridgeBusy) return []
+  state.qqDragBridgeBusy = true
+  try {
+    return await applyQQDragBridgeToWindows('start', browserWindows, timeoutMs, isCurrent)
+  } catch {
+    return []
+  } finally {
+    if (generation === state.qqDragBridgeGeneration) state.qqDragBridgeBusy = false
+  }
 }
 
 function startQQDragBridgeTimer() {
   stopQQDragBridgeTimer()
-  state.qqDragBridgeTimer = setInterval(async () => {
-    if (!state.qqDragBridgeEnabled || state.qqDragBridgeBusy) return
-    state.qqDragBridgeBusy = true
-    try {
-      await applyQQDragBridgeToWindows('start')
-    } catch {
-    } finally {
-      state.qqDragBridgeBusy = false
-    }
+  const generation = state.qqDragBridgeGeneration
+  state.qqDragBridgeTimer = setInterval(() => {
+    void refreshQQDragBridge(generation)
   }, 5000)
   state.qqDragBridgeTimer.unref?.()
 }
@@ -5183,11 +5239,7 @@ export async function plugin_init(ctx) {
   state.listener = listener
   state.listenerHandlers = listenerHandlers
   installForwardCardCompatibility(ctx)
-  try {
-    await applyQQDragBridgeToWindows('start')
-  } catch (error) {
-    ctx.logger.warn?.('QQ 内容拖放桥接首次注入失败，将自动重试', error)
-  }
+  void refreshQQDragBridge(state.qqDragBridgeGeneration)
   ctx.logger.info('OhMyMeme 当前会话桥接已启动（已默认启用 QQ 内容拖放）')
 }
 
@@ -5248,6 +5300,8 @@ export const __test = {
   nativeHandleText,
   rendererTitleResponse,
   qqDragBridgeScript,
+  refreshQQDragBridge,
+  stopQQDragBridgeTimer,
   marketFacePendingScript,
   marketFaceReadyScript,
   marketFaceResetScript,

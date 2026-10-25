@@ -58,6 +58,22 @@ def _ensure_vue_frontend():
         logger.warning("Vue 自动编译失败: %s", e)
 
 
+def _start_qq_drag_temp_cleanup(cfg):
+    """按启动设置后台清理过期拖拽临时文件，不阻塞主窗口。"""
+    if cfg.get("qq_drag_cleanup_on_start", True) is not True:
+        return
+    try:
+        from .onebot import cleanup_qq_drag_temp_files
+
+        threading.Thread(
+            target=cleanup_qq_drag_temp_files,
+            name="qq-drag-temp-cleanup",
+            daemon=True,
+        ).start()
+    except Exception as exc:
+        logger.warning("QQ 拖拽临时文件清理无法启动: %s", exc)
+
+
 class OhMyMemeApp:
     def __init__(self):
         self._cfg = get_config()
@@ -81,6 +97,8 @@ class OhMyMemeApp:
             cleanup_stale_temp_files()
         except Exception as e:
             logger.debug("cleanup stale temp files: %s", e)
+
+        _start_qq_drag_temp_cleanup(self._cfg)
 
         # 1. 创建 WebUI（先不启动 GUI 循环）
         self._webui = WebUI(

@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, ref } from 'vue'
 import type { Meme, TagRecord } from '../types'
-import { api, rememberFocus, restoreFocus, trapTabFocus } from '../utils/api'
+import { api, createBackdropClickGuard, focusNextDetailInput, handleDetailSaveShortcut, rememberFocus, restoreFocus, trapTabFocus } from '../utils/api'
 
 interface MemeDetail extends Meme {
   file_size?: number
@@ -45,6 +45,7 @@ const emit = defineEmits<{
 }>()
 
 const visible = ref(false)
+const backdrop = createBackdropClickGuard(close)
 const loading = ref(false)
 const saving = ref(false)
 const loadError = ref('')
@@ -75,6 +76,7 @@ const renaming = ref(false)
 const detail = ref<MemeDetail | null>(null)
 const previewFilename = ref('')
 const boxEl = ref<HTMLElement>()
+const contentEl = ref<HTMLElement>()
 const infoEl = ref<HTMLElement>()
 const closeEl = ref<HTMLButtonElement>()
 const renameInputEl = ref<HTMLInputElement>()
@@ -281,14 +283,16 @@ async function loadDetails(memeId: number, fallback?: Meme) {
 
 // 打开详情，并按需加载全部可编辑字段。
 async function open(target: Meme) {
+  backdrop.reset()
   rememberFocus()
   visible.value = true
   dirty.value = false
   await loadDetails(target.id, target)
   await nextTick()
-  // 首次打开详情时从右侧信息栏顶部开始；切图走 navigate/loadDetails，
+  // 首次打开详情时从信息栏及窄窗口内容顶部开始；切图走 navigate/loadDetails，
   // 不会经过这里，因此会保留用户当前的滚动位置。
   closeEl.value?.focus({ preventScroll: true })
+  if (contentEl.value) contentEl.value.scrollTop = 0
   if (infoEl.value) infoEl.value.scrollTop = 0
 }
 
@@ -464,6 +468,7 @@ async function confirmCategoryCreate() {
 }
 
 function onCategoryInputKeydown(e: KeyboardEvent) {
+  if (e.isComposing || e.keyCode === 229) return
   if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
     e.preventDefault()
     categoryDropdownOpen.value = true
@@ -474,10 +479,12 @@ function onCategoryInputKeydown(e: KeyboardEvent) {
       ? (step > 0 ? 0 : count - 1)
       : (activeCategorySuggestion.value + step + count) % count
   } else if (e.key === 'Enter') {
-    e.preventDefault()
     const item = categorySuggestions.value[activeCategorySuggestion.value]
-    if (item) selectCategory(item)
-    else if (canCreateCategory.value) beginCategoryCreate()
+    if (item || canCreateCategory.value) {
+      e.preventDefault()
+      if (item) selectCategory(item)
+      else beginCategoryCreate()
+    }
   } else if (e.key === 'Escape' && categoryDropdownOpen.value) {
     e.preventDefault()
     e.stopPropagation()
@@ -510,6 +517,7 @@ async function moveActiveCollectionSuggestion(step: number) {
 }
 
 function onCollectionInputKeydown(e: KeyboardEvent) {
+  if (e.isComposing || e.keyCode === 229) return
   if (e.key === 'ArrowDown') {
     e.preventDefault()
     collectionDropdownOpen.value = true
@@ -519,10 +527,12 @@ function onCollectionInputKeydown(e: KeyboardEvent) {
     collectionDropdownOpen.value = true
     void moveActiveCollectionSuggestion(-1)
   } else if (e.key === 'Enter') {
-    e.preventDefault()
     const suggestion = collectionSuggestions.value[activeCollectionSuggestion.value]
-    if (suggestion) addCollection(suggestion)
-    else if (canCreateCollection.value) beginCollectionCreate()
+    if (suggestion || canCreateCollection.value) {
+      e.preventDefault()
+      if (suggestion) addCollection(suggestion)
+      else beginCollectionCreate()
+    }
   } else if (e.key === 'Escape' && collectionDropdownOpen.value) {
     e.preventDefault()
     e.stopPropagation()
@@ -587,6 +597,7 @@ async function moveActiveSuggestion(step: number) {
 }
 
 function onTagInputKeydown(e: KeyboardEvent) {
+  if (e.isComposing || e.keyCode === 229) return
   if (e.key === 'ArrowDown') {
     e.preventDefault()
     tagDropdownOpen.value = true
@@ -596,10 +607,12 @@ function onTagInputKeydown(e: KeyboardEvent) {
     tagDropdownOpen.value = true
     void moveActiveSuggestion(-1)
   } else if (e.key === 'Enter') {
-    e.preventDefault()
     const suggestion = tagSuggestions.value[activeSuggestion.value]
-    if (tagDropdownOpen.value && suggestion) selectTag(suggestion)
-    else addTag()
+    if ((tagDropdownOpen.value && suggestion) || tagInput.value.trim()) {
+      e.preventDefault()
+      if (tagDropdownOpen.value && suggestion) selectTag(suggestion)
+      else addTag()
+    }
   } else if (e.key === 'Escape' && tagDropdownOpen.value) {
     e.preventDefault()
     e.stopPropagation()
@@ -775,6 +788,7 @@ function close() {
     saving.value || renaming.value
     || creatingCollection.value || creatingCategory.value
   ) return
+  backdrop.reset()
   requestGeneration++
   loading.value = false
   dirty.value = false
@@ -790,17 +804,14 @@ function isTextEditing(target: EventTarget | null) {
 }
 
 function onKeydown(e: KeyboardEvent) {
+  if (e.isComposing || e.keyCode === 229) return
   if (e.key === 'Escape') {
     e.preventDefault()
     e.stopPropagation()
-    void close()
+    if (!e.repeat) close()
     return
   }
-  if ((e.ctrlKey || e.metaKey) && e.key.toLocaleLowerCase() === 's') {
-    e.preventDefault()
-    void saveChanges()
-    return
-  }
+  if (boxEl.value && focusNextDetailInput(boxEl.value, e)) return
   if (!isTextEditing(e.target) && e.key === 'ArrowLeft') {
     e.preventDefault()
     void navigate(detail.value?.previous_id || null)
@@ -812,11 +823,18 @@ function onKeydown(e: KeyboardEvent) {
   }
 }
 
-defineExpose({ open })
+defineExpose({ open, close, isOpen: () => visible.value })
 </script>
 
 <template>
-  <div v-if="visible" class="details-overlay" @click.self="close">
+  <div
+    v-if="visible"
+    class="details-overlay"
+    @pointerdown.capture="backdrop.onPointerDown"
+    @pointerup.capture="backdrop.onPointerUp"
+    @pointercancel.capture="backdrop.reset"
+    @click="backdrop.onClick"
+  >
     <div
       v-if="detail"
       ref="boxEl"
@@ -824,6 +842,7 @@ defineExpose({ open })
       role="dialog"
       aria-modal="true"
       aria-labelledby="details-title"
+      @keydown.capture="handleDetailSaveShortcut($event, saveChanges)"
       @keydown="onKeydown"
     >
       <div class="details-heading">
@@ -831,7 +850,7 @@ defineExpose({ open })
         <div class="details-position" aria-live="polite">{{ detail.position }} / {{ detail.total }}</div>
       </div>
 
-      <div class="details-content">
+      <div ref="contentEl" class="details-content">
         <div class="details-preview-pane">
           <img :src="previewUrl" :alt="detail.name" class="details-preview">
           <div v-if="loading" class="details-preview-loading">正在加载...</div>
@@ -1289,17 +1308,18 @@ defineExpose({ open })
               @input="markDirty"
             />
           </label>
-
-          <div class="details-actions">
-            <span v-if="dirty" class="details-unsaved">有未保存的修改</span>
-            <button ref="closeEl" class="btn btn-secondary" :disabled="saving || renaming || creatingCollection || creatingCategory" @click="close">
-              {{ dirty ? '放弃修改并关闭' : '关闭' }}
-            </button>
-            <button class="btn btn-primary" :disabled="!dirty || loading || saving || renaming || creatingCollection || creatingCategory" @click="saveChanges">
-              {{ saving ? '保存中...' : '保存更改' }}
-            </button>
-          </div>
         </div>
+      </div>
+
+      <div class="details-actions">
+        <span class="details-shortcuts">Enter 下一项 · Shift+Enter 换行 · Ctrl+Enter 保存</span>
+        <span v-if="dirty" class="details-unsaved">有未保存的修改</span>
+        <button ref="closeEl" class="btn btn-secondary" title="关闭详情，返回主页面（Esc）" :disabled="saving || renaming || creatingCollection || creatingCategory" @click="close">
+          {{ dirty ? '放弃修改并关闭' : '关闭' }}
+        </button>
+        <button class="btn btn-primary" title="保存更改（Ctrl+Enter / Ctrl+S）" :disabled="!dirty || loading || saving || renaming || creatingCollection || creatingCategory" @click="saveChanges">
+          {{ saving ? '保存中...' : '保存更改' }}
+        </button>
       </div>
     </div>
   </div>
@@ -1320,6 +1340,8 @@ defineExpose({ open })
 .details-box {
   width: min(960px, calc(100vw - 32px));
   max-height: calc(100vh - 32px);
+  display: flex;
+  flex-direction: column;
   overflow: hidden;
   box-sizing: border-box;
   padding: 20px 22px 22px;
@@ -1330,6 +1352,7 @@ defineExpose({ open })
 }
 
 .details-heading {
+  flex-shrink: 0;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -1345,8 +1368,10 @@ defineExpose({ open })
 .details-position { color: var(--muted); font-size: 12px; }
 
 .details-content {
+  flex: 1;
   display: grid;
   grid-template-columns: minmax(360px, 1.45fr) minmax(300px, 1fr);
+  grid-template-rows: minmax(0, 1fr);
   gap: 20px;
   min-height: 0;
 }
@@ -1354,7 +1379,8 @@ defineExpose({ open })
 .details-preview-pane {
   position: relative;
   height: min(72vh, 610px);
-  min-height: 360px;
+  min-height: 0;
+  max-height: 100%;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -1413,6 +1439,7 @@ defineExpose({ open })
 
 .details-info {
   max-height: min(72vh, 610px);
+  min-height: 0;
   min-width: 0;
   overflow-y: auto;
   padding-right: 3px;
@@ -1933,27 +1960,31 @@ defineExpose({ open })
 .details-textarea:disabled { opacity: 0.65; }
 
 .details-actions {
+  flex-shrink: 0;
   display: flex;
   align-items: center;
   justify-content: flex-end;
   gap: 8px;
-  margin-top: 4px;
+  flex-wrap: wrap;
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
 }
 
 .details-unsaved {
-  margin-right: auto;
   color: var(--muted);
   font-size: 11px;
 }
+
+.details-shortcuts { margin-right: auto; color: var(--muted); font-size: 11px; }
 
 @media (hover: none) {
   .details-nav:not(:disabled) { opacity: 1; }
 }
 
 @media (max-width: 760px) {
-  .details-box { overflow-y: auto; }
-  .details-content { grid-template-columns: 1fr; }
-  .details-preview-pane { height: min(48vh, 380px); min-height: 240px; }
+  .details-content { grid-template-columns: 1fr; grid-template-rows: auto auto; overflow-y: auto; }
+  .details-preview-pane { height: min(48vh, 380px); min-height: 240px; max-height: none; }
   .details-info { max-height: none; overflow-y: visible; }
 }
 

@@ -41,6 +41,66 @@ export function renderMarkdown(md: string): string {
   return s
 }
 
+// 仅将同一次主指针在遮罩上按下、松开产生的点击视为关闭请求。
+export function createBackdropClickGuard(onClose: () => void) {
+  let pointerId: number | null = null
+  let releasedOnBackdrop = false
+
+  function reset() {
+    pointerId = null
+    releasedOnBackdrop = false
+  }
+
+  function onPointerDown(e: PointerEvent) {
+    reset()
+    if (e.isPrimary && e.button === 0 && e.target === e.currentTarget) {
+      pointerId = e.pointerId
+    }
+  }
+
+  function onPointerUp(e: PointerEvent) {
+    releasedOnBackdrop = pointerId === e.pointerId
+      && e.button === 0 && e.target === e.currentTarget
+    pointerId = null
+  }
+
+  function onClick(e: MouseEvent) {
+    const shouldClose = releasedOnBackdrop && e.target === e.currentTarget
+    reset()
+    if (shouldClose) onClose()
+  }
+
+  return { onPointerDown, onPointerUp, onClick, reset }
+}
+
+// 捕获保存组合键，避免 Ctrl+Enter 同时触发输入框或表单自己的 Enter 行为。
+export function handleDetailSaveShortcut(e: KeyboardEvent, onSave: () => unknown) {
+  if (e.isComposing || e.keyCode === 229 || e.altKey || !(e.ctrlKey || e.metaKey)) return
+  if (e.key !== 'Enter' && e.key.toLocaleLowerCase() !== 's') return
+  e.preventDefault()
+  e.stopPropagation()
+  if (!e.repeat) void onSave()
+}
+
+// 普通 Enter 按页面顺序继续编辑；Shift+Enter、候选确认和输入法保持原行为。
+export function focusNextDetailInput(box: HTMLElement, e: KeyboardEvent) {
+  if (
+    e.key !== 'Enter' || e.defaultPrevented || e.isComposing || e.keyCode === 229
+    || e.ctrlKey || e.metaKey || e.altKey || e.shiftKey
+  ) return false
+  const target = e.target
+  const selector = 'input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]):not([type="button"]):not([type="submit"]):not([type="reset"]):not([type="file"]), textarea, select'
+  if (!(target instanceof HTMLElement) || !target.matches(selector) || target.tagName === 'SELECT') return false
+  const fields = Array.from(box.querySelectorAll<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>(selector))
+    .filter(field => !field.matches(':disabled') && !('readOnly' in field && field.readOnly)
+      && field.tabIndex >= 0 && field.getClientRects().length > 0 && !field.closest('[inert]'))
+  const index = fields.indexOf(target as HTMLInputElement | HTMLTextAreaElement)
+  if (index < 0) return false
+  e.preventDefault()
+  fields[index + 1]?.focus()
+  return true
+}
+
 // ── 弹窗焦点管理（无障碍） ──
 let _focusTarget: HTMLElement | null = null
 

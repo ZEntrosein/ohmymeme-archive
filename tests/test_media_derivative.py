@@ -184,6 +184,79 @@ class TestLargeOriginalImport(unittest.TestCase):
         self.db = MemeDB(self.tmp / "memes.db")
         self.addCleanup(self.db.close)
 
+    def test_large_dimensions_import_with_limit_off_and_keep_small_daily_copy(self):
+        from src.webui import WebUI
+
+        source = self.tmp / "wide-original.png"
+        Image.new("RGB", (3000, 40), (30, 90, 150)).save(source)
+        original = source.read_bytes()
+        ui = WebUI.__new__(WebUI)
+        ui._cfg = self.cfg
+        with (
+            mock.patch("src.webui.get_config", return_value=self.cfg),
+            mock.patch("src.webui.get_db", return_value=self.db),
+            mock.patch("src.webui.add_memes_to_manifest", return_value=True),
+            mock.patch("src.library_events.notify_changed"),
+        ):
+            self.cfg.set("import_resolution_limit_enabled", True)
+            rejected = ui._do_import([str(source)])
+            self.assertEqual(rejected["rejected"], 1)
+            self.assertEqual(rejected["ids"], [])
+            self.cfg.set("import_resolution_limit_enabled", False)
+            result = ui._do_import([str(source)])
+
+        self.assertEqual(result["rejected"], 0)
+        row = self.db.get_by_id(result["ids"][0])
+        self.assertEqual(row["width"], 3000)
+        self.assertEqual((self.cache / row["filename"]).read_bytes(), original)
+        with Image.open(self.cfg.derivative_dir / row["daily_filename"]) as image:
+            self.assertLessEqual(max(image.size), DAILY_COPY_MAX_SIDE)
+
+    def test_single_image_checks_custom_limit_and_size_independently(self):
+        from src.webui import _prepare_image_import
+
+        source = self.tmp / "custom-limit.png"
+        Image.new("RGB", (3000, 40), (30, 90, 150)).save(source)
+        with (
+            mock.patch("src.webui.get_config", return_value=self.cfg),
+            mock.patch("src.webui.get_db", return_value=self.db),
+            mock.patch("src.webui._find_similar_candidates", return_value=[]),
+        ):
+            self.assertEqual(_prepare_image_import(source)["status"], "ok")
+            self.cfg.set("import_resolution_limit_enabled", True)
+            self.cfg.set("import_resolution_limit_px", 2999)
+            rejected = _prepare_image_import(source)
+            self.assertEqual(rejected["status"], "rejected")
+            self.assertIn("2999", rejected["error"])
+            self.cfg.set("import_resolution_limit_px", 3000)
+            self.assertEqual(_prepare_image_import(source)["status"], "ok")
+            self.cfg.set("import_resolution_limit_enabled", False)
+            with mock.patch("src.webui._IMPORT_MAX_BYTES", 1):
+                rejected = _prepare_image_import(source)
+                self.assertEqual(rejected["status"], "rejected")
+                self.assertIn("原件上限", rejected["error"])
+
+    def test_cache_scan_respects_optional_resolution_limit(self):
+        from src.webui import WebUI
+
+        source = self.cache / "wide-scan.png"
+        Image.new("RGB", (3000, 40), (30, 90, 150)).save(source)
+        ui = WebUI.__new__(WebUI)
+        ui._cfg = self.cfg
+        with (
+            mock.patch("src.webui.get_config", return_value=self.cfg),
+            mock.patch("src.webui.get_db", return_value=self.db),
+            mock.patch("src.webui.build_manifest"),
+        ):
+            self.cfg.set("import_resolution_limit_enabled", True)
+            self.assertEqual(ui.scan_cache(), 0)
+            self.assertTrue(source.is_file())
+            self.cfg.set("import_resolution_limit_enabled", False)
+            self.assertEqual(ui.scan_cache(), 1)
+            self.cfg.set("import_resolution_limit_enabled", True)
+            self.assertEqual(ui.scan_cache(), 0)
+            self.assertIsNotNone(self.db.get_by_filename(source.name))
+
     def test_import_keeps_over_20_mib_original_and_builds_small_daily_copy(self):
         from src.webui import WebUI
 

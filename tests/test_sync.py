@@ -468,6 +468,34 @@ class TestSyncPush(unittest.TestCase):
 
     # ─── PR2 新增用例 ───
 
+    def test_pull_respects_optional_resolution_limit(self):
+        from PIL import Image
+
+        source = self.tmp_dir / "remote-wide.png"
+        Image.new("RGB", (3000, 40), (30, 90, 150)).save(source)
+        data = source.read_bytes()
+        entries = [("wide.png", _entry("wide.png", "wide-hash", len(data)))]
+
+        def download(remote_path, local_path):
+            Path(local_path).write_bytes(data)
+            return True
+
+        with patch.object(self.fake_backend, "download_file", side_effect=download):
+            self.cfg.set("import_resolution_limit_enabled", True)
+            self.cfg.set("import_resolution_limit_px", 2999)
+            rejected = sync._pull_worker(
+                entries, "remote", self.cfg.cache_dir, self.fake_db
+            )
+            self.assertEqual(rejected["skipped"], 1)
+            self.assertFalse((self.cfg.cache_dir / "wide.png").exists())
+            self.cfg.set("import_resolution_limit_enabled", False)
+            accepted = sync._pull_worker(
+                entries, "remote", self.cfg.cache_dir, self.fake_db
+            )
+
+        self.assertEqual(accepted["downloaded"], 1)
+        self.assertIsNotNone(self.fake_db.get_by_filename("wide.png"))
+
     def test_pull_partial_failure_raises(self):
         """pull 部分下载失败 → 抛 SyncError、status=error、本地清单不含失败项"""
         self.fake_backend.remote_memes = {

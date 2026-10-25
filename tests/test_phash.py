@@ -1,7 +1,11 @@
 """感知哈希算法单元测试：同内容不同编码应判相似，不同内容应判相异"""
 
+import hashlib
+import io
 import random
+from contextlib import nullcontext
 
+import pytest
 from PIL import Image
 
 from src.webui import (
@@ -75,3 +79,75 @@ class TestPerceptualHash:
         b = Image.eval(_textured(22), lambda v: min(255, int(v * 1.6) + 60))
         da = _phash_hamming(_perceptual_hash(a), _perceptual_hash(b))
         assert da > _PHASH_SIMILAR_DIST
+
+
+@pytest.mark.parametrize("cached_thumbnail", [False, True])
+def test_similar_candidate_thumbnail_uses_stored_file_hash(
+    tmp_path, monkeypatch, cached_thumbnail
+):
+    """真实候选查询必须给出可访问的缩略图地址，且不需要重读原件。"""
+    from test_thumbnails import _build_app, _request
+
+    from src import config as config_module
+    from src import webui
+    from src.config import Config
+    from src.database import MemeDB
+    from src.media_derivative import create_daily_copy
+
+    monkeypatch.setattr(config_module, "_get_data_dir", lambda: tmp_path / "data")
+    cfg = Config(tmp_path / "config.json")
+    cfg.set("cache_dir", str(tmp_path / "originals"))
+    db = MemeDB(tmp_path / "memes.db")
+    monkeypatch.setattr(webui, "get_config", lambda: cfg)
+    monkeypatch.setattr(webui, "get_db", lambda: db)
+    monkeypatch.setattr(webui, "guarded_read", lambda **kwargs: nullcontext())
+    try:
+        original = cfg.cache_dir / "stored.png"
+        image = _textured()
+        image.save(original)
+        original_bytes = original.read_bytes()
+        file_hash = hashlib.sha256(original_bytes).hexdigest()
+        daily = create_daily_copy(original, cfg.derivative_dir, file_hash)
+        meme_id = db.add_meme(
+            original.name,
+            file_hash=file_hash,
+            original_name="库中候选",
+            perceptual_hash=_perceptual_hash(image),
+            daily_filename=daily["filename"],
+            daily_profile=daily["profile"],
+        )
+        incoming = tmp_path / "incoming.png"
+        incoming.write_bytes(original_bytes + b"\nnew-metadata")
+        assert hashlib.sha256(incoming.read_bytes()).hexdigest() != file_hash
+
+        ui = webui.WebUI.__new__(webui.WebUI)
+        ui._cfg = cfg
+        ui._port = 17999
+        monkeypatch.setattr(
+            ui,
+            "_find_daily_file",
+            lambda *args, **kwargs: pytest.fail("已有日用副本，不应重读原件"),
+        )
+        monkeypatch.setattr(
+            ui,
+            "_find_meme_file",
+            lambda *args: pytest.fail("不应扫描原件目录"),
+        )
+        if cached_thumbnail:
+            assert ui._get_thumbnail_path(file_hash, original.name)
+        original.unlink()
+
+        prepared = webui._prepare_image_import(incoming)
+        assert prepared["status"] == "similar"
+        (candidate,) = prepared["candidates"]
+        assert candidate["id"] == meme_id
+        assert candidate["file_hash"] == file_hash
+        assert candidate["name"] == "库中候选"
+        app = _build_app(monkeypatch, ui)
+        status, body = _request(app, f"/api/thumb/{candidate['file_hash']}")
+        assert status.startswith("200")
+        with Image.open(io.BytesIO(body)) as thumbnail:
+            assert thumbnail.format == "WEBP"
+            assert max(thumbnail.size) <= 150
+    finally:
+        db.close()

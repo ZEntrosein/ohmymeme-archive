@@ -196,14 +196,17 @@ onMounted(() => {
 })
 // 网格列数由 CSS repeat(auto-fill, minmax(112px, 1fr)) 随容器宽度自适应
 
-// 当前分组（正 ID）下的子分组列表，用于网格顶部显示文件夹卡片
+// 侧栏浏览树与右侧当前内容独立，切换侧栏不改变内容导航
 const sidebarTab = ref<'collections' | 'categories'>('collections')
 const sidebarItems = computed(() => sidebarTab.value === 'categories' ? state.categories : state.collections)
 const activeSidebarId = computed(() => (
   sidebarTab.value === 'categories'
-    ? (state.activeCategory ?? -1)
+    ? (state.activeCategory ?? (state.activeCollection == null ? -1 : null))
     : state.activeCollection
 ))
+const contentTab = computed(() => state.activeCategory != null ? 'categories' : 'collections')
+const contentItems = computed(() => contentTab.value === 'categories' ? state.categories : state.collections)
+const activeContentId = computed(() => state.activeCategory ?? state.activeCollection)
 const hoveredSidebarNode = ref<{
   kind: 'collection' | 'category'
   id: number
@@ -251,6 +254,7 @@ function isMemeInHoveredSidebarNode(meme: Meme): boolean {
   if (hovered.kind === 'category') {
     if (hovered.id === -1) return true
     if (hovered.id === -4) return meme.category_id == null
+    if (hovered.id < -4) return meme.category_id === -hovered.id - 4
     return hoveredSidebarIds.value.has(Number(meme.category_id))
   }
   if (hovered.id === -2) return meme.favorited === true
@@ -261,10 +265,10 @@ function isMemeInHoveredSidebarNode(meme: Meme): boolean {
 }
 
 const folderCards = computed(() => {
-  if (!activeSidebarId.value || activeSidebarId.value < 0) return []
+  if (!activeContentId.value || activeContentId.value < 0) return []
   const find = (items: any[]): any[] => {
     for (const c of items) {
-      if (c.id === activeSidebarId.value) return c.children || []
+      if (c.id === activeContentId.value) return c.children || []
       if (c.children && c.children.length) {
         const r = find(c.children)
         if (r.length) return r
@@ -272,13 +276,12 @@ const folderCards = computed(() => {
     }
     return []
   }
-  return find(sidebarItems.value)
+  return find(contentItems.value)
 })
 
-// 面包屑：当前分组从「全部」到自身的祖先链
+// 面包屑：当前分组或类别从「全部」到自身的祖先链
 const breadcrumb = computed(() => {
-  if (!activeSidebarId.value) return []
-  if (sidebarTab.value === 'categories' && activeSidebarId.value === -1) return []
+  if (!activeContentId.value) return []
   const walk = (items: any[], target: number, trail: any[]): any[] | null => {
     for (const c of items) {
       if (c.id === target) return [...trail, c]
@@ -289,15 +292,16 @@ const breadcrumb = computed(() => {
     }
     return null
   }
-  const path = walk(sidebarItems.value, activeSidebarId.value, [])
+  const path = walk(contentItems.value, activeContentId.value, [])
   if (path) return [{ id: null, name: '全部' }, ...path]
-  const sys = sidebarItems.value.find(c => c.id === activeSidebarId.value)
+  const sys = contentItems.value.find(c => c.id === activeContentId.value)
   return sys ? [{ id: null, name: '全部' }, sys] : []
 })
 
 // 图标条祖先高亮：当前分组所属的顶层分组 id（用于折叠时高亮）
 const activeTopLevel = computed(() => {
-  if (!activeSidebarId.value || activeSidebarId.value < 0) return activeSidebarId.value
+  const id = activeSidebarId.value
+  if (!id || (id < 0 && (sidebarTab.value === 'collections' || id >= -4))) return id
   const findTop = (items: any[], target: number, inherited: number | null): number | null => {
     for (const c of items) {
       const thisTop = inherited ?? c.id
@@ -411,7 +415,7 @@ async function onSidebarAdd() {
 }
 
 function onBreadcrumbClick(id: number | null) {
-  if (sidebarTab.value === 'categories') setActiveCategory(id === -1 ? null : id)
+  if (contentTab.value === 'categories') setActiveCategory(id === -1 ? null : id)
   else setActiveCollection(id)
 }
 
@@ -421,14 +425,14 @@ function onSidebarSelect(id: number) {
 }
 
 function onFolderCardClick(childId: number) {
-  if (sidebarTab.value === 'categories') setActiveCategory(childId)
+  if (contentTab.value === 'categories') setActiveCategory(childId)
   else setActiveCollection(childId)
 }
 
 function onFolderCardContext(e: MouseEvent, childId: number, childName: string) {
   e.preventDefault()
   e.stopPropagation()
-  if (sidebarTab.value === 'categories') {
+  if (contentTab.value === 'categories') {
     onCategoryRightClick(e, childId, childName)
     return
   }
@@ -441,9 +445,6 @@ function switchSidebarTab(tab: 'collections' | 'categories') {
   if (sidebarTab.value === tab) return
   hoveredSidebarNode.value = null
   sidebarTab.value = tab
-  state.activeCollection = null
-  state.activeCategory = null
-  search()
 }
 
 async function handleCopy(meme: Meme, e?: Event) {
@@ -768,6 +769,7 @@ function onFolderRightClick(e: MouseEvent, folderId: number, folderName: string)
 }
 
 function onCategoryRightClick(e: MouseEvent, categoryId: number, categoryName: string) {
+  if (categoryId < -4) { e.preventDefault(); return }
   e.preventDefault()
   e.stopPropagation()
   const items: MenuItem[] = []
@@ -995,6 +997,21 @@ function batchAddToCollection() {
       showToast(result?.error || '加入分组失败')
     }
   }, 'add', ids)
+}
+
+// 批量设置类别：替换单归属类别，由后端同步移动原件。
+function batchSetCategory() {
+  const ids = [...state.selectedIds]
+  if (!ids.length) return
+  cb.openPick(async (r) => {
+    const result = await api('batch_set_meme_category', ids, r.existingId, r.existingId === null ? r.name : '')
+    if (!result?.ok) {
+      showToast(result?.error || '设置类别失败')
+      return
+    }
+    showToast(`已为 ${result.count} 个表情包设置类别：${r.name}`)
+    await refreshLibraryView('structure')
+  }, 'category', ids)
 }
 
 // 批量移动分组：从当前分组移出并加入所选分组，原分组移空且无子分组时删除
@@ -1264,6 +1281,118 @@ function clearLibraryDrag() {
   libraryDropTargetKey.value = ''
 }
 
+let hierarchyDrag: {
+  kind: LibraryTargetType
+  id: number
+  row: HTMLElement
+  pointerId: number
+  x: number
+  y: number
+  active: boolean
+  target: { id: number | null; name: string } | null
+} | null = null
+const hierarchyDragId = ref<number | null>(null)
+const hierarchyDropTargetKey = ref('')
+let hierarchyClickGuard = false
+let hierarchyMovePending = false
+
+function clearHierarchyDrag() {
+  const current = hierarchyDrag
+  hierarchyDrag = null
+  hierarchyDragId.value = null
+  hierarchyDropTargetKey.value = ''
+  if (current) {
+    try {
+      if (current.row.hasPointerCapture(current.pointerId)) current.row.releasePointerCapture(current.pointerId)
+    } catch (_) {}
+  }
+}
+
+function onHierarchyPointerDown(e: PointerEvent, id: number) {
+  hierarchyClickGuard = false
+  if (e.button !== 0 || e.pointerType === 'touch' || sidebarCollapsed.value || hierarchyMovePending) return
+  if ((e.target as HTMLElement).closest('button, .tree-toggle')) return
+  const node = findCollectionNode(sidebarItems.value, id)
+  if (id <= 0 || !node || node.system_hidden || node.direct_category_id != null) return
+  clearHierarchyDrag()
+  hierarchyDrag = {
+    kind: sidebarTab.value === 'categories' ? 'category' : 'collection',
+    id, row: e.currentTarget as HTMLElement, pointerId: e.pointerId,
+    x: e.clientX, y: e.clientY, active: false, target: null,
+  }
+}
+
+function updateHierarchyDrag(e: PointerEvent) {
+  const current = hierarchyDrag
+  if (!current || e.pointerId !== current.pointerId) return
+  if (!current.active) {
+    if (Math.hypot(e.clientX - current.x, e.clientY - current.y) <= 8) return
+    current.active = true
+    hierarchyDragId.value = current.id
+    hierarchyClickGuard = true
+    clearHoverPreview()
+    try { current.row.setPointerCapture(current.pointerId) } catch (_) {}
+  }
+  e.preventDefault()
+  current.target = null
+  hierarchyDropTargetKey.value = ''
+  const element = document.elementFromPoint(e.clientX, e.clientY)
+  const root = element?.closest<HTMLElement>('[data-hierarchy-root]')
+  const row = element?.closest<HTMLElement>('[data-hierarchy-kind]')
+  const kind = root?.dataset.hierarchyRoot || row?.dataset.hierarchyKind
+  if (kind !== current.kind) return
+  const targetId = root ? null : Number(row?.dataset.hierarchyId)
+  const items = current.kind === 'category' ? state.categories : state.collections
+  const source = findCollectionNode(items, current.id)
+  if (!source) return
+  const parentId = source.parent_id ?? findHierarchyParent(items, current.id)
+  if (targetId == null || current.kind === 'category' && targetId === -1) {
+    if (parentId == null) return
+    current.target = { id: null, name: '顶层' }
+    hierarchyDropTargetKey.value = current.kind + ':root'
+    return
+  }
+  if (!Number.isInteger(targetId) || targetId <= 0 || targetId === parentId) return
+  const target = findCollectionNode(items, targetId)
+  if (!target || target.direct_category_id != null || subtreeIds(items, current.id).has(targetId)) return
+  current.target = { id: targetId, name: target.name }
+  hierarchyDropTargetKey.value = `${current.kind}:${targetId}`
+}
+
+function findHierarchyParent(items: any[], id: number, parent: number | null = null): number | null {
+  for (const node of items) {
+    if (node.id === id) return parent
+    if (findCollectionNode(node.children || [], id)) return findHierarchyParent(node.children, id, node.id)
+  }
+  return null
+}
+
+async function finishHierarchyDrop(e: PointerEvent) {
+  if (!hierarchyDrag || hierarchyDrag.pointerId !== e.pointerId) return
+  updateHierarchyDrag(e)
+  const current = hierarchyDrag
+  clearHierarchyDrag()
+  if (!current.active || !current.target) return
+  const items = current.kind === 'category' ? state.categories : state.collections
+  const source = findCollectionNode(items, current.id)
+  if (!source) return
+  const label = current.kind === 'category' ? '类别' : '分组'
+  const targetLabel = current.target.id == null ? '顶层' : `「${current.target.name}」下`
+  const note = current.kind === 'category'
+    ? '整个子类别树和对应原件目录将一起移动，内容归属不变。'
+    : '整个子分组树将一起移动，成员关系不变，不移动图片文件。'
+  hierarchyMovePending = true
+  try {
+    if (!await confirmAsk(`移动${label}`, `将${label}「${source.name}」移到${targetLabel}？${note}`)) return
+    const result = await api('move_hierarchy_node', current.kind, current.id, current.target.id)
+    if (!result?.ok) { showToast(result?.error || '移动失败'); return }
+    await refreshLibraryView('structure')
+    showToast(`${label}已移动`)
+  } finally {
+    hierarchyMovePending = false
+  }
+}
+
 function beginLibraryDrag(
   itemType: LibraryItemType,
   itemId: number,
@@ -1382,6 +1511,7 @@ async function finishLibraryDrop() {
 }
 
 function onDocPointerMove(e: PointerEvent) {
+  if (hierarchyDrag) { updateHierarchyDrag(e); return }
   if (drag.dragState.memeId) {
     drag.onPointerMove(e)
     return
@@ -1420,6 +1550,7 @@ function onDocPointerMove(e: PointerEvent) {
 }
 
 async function onDocPointerUp(e: PointerEvent) {
+  if (hierarchyDrag) { await finishHierarchyDrop(e); return }
   if (drag.dragState.memeId) {
     const wasActive = await drag.onPointerUp()
     if (wasActive) ignoreClick = true
@@ -1438,6 +1569,7 @@ async function onDocPointerUp(e: PointerEvent) {
 }
 
 function onDocPointerCancel() {
+  clearHierarchyDrag()
   if (drag.dragState.memeId) drag.cancel()
   clearLibraryDrag()
   longPressCopyBlock = null
@@ -1445,7 +1577,32 @@ function onDocPointerCancel() {
   clearCardGesture()
 }
 
+// 子级弹窗打开时暂停全局导入，但保留编辑框原生的文本拖动行为。
+function ignoreImportDrag(e: DragEvent) {
+  const selector = [
+    '[aria-modal="true"]', '.import-overlay', '.imp-overlay', '.upd-overlay',
+    '.ctx-overlay', '#sync-progress-overlay', '#sync-done-overlay',
+    '.sync-warning-overlay', '#startup-anim',
+  ].join(',')
+  const blocked = Array.from(document.querySelectorAll<HTMLElement>(selector))
+    .some(overlay => overlay.getClientRects().length > 0
+      && getComputedStyle(overlay).visibility !== 'hidden')
+  if (!blocked) return false
+  dragCounter = 0
+  dragOver.value = false
+  const target = e.target instanceof Element ? e.target : null
+  const editor = target?.closest<HTMLElement>('input, textarea, [contenteditable]')
+  const textInput = editor instanceof HTMLInputElement
+    && ['text', 'search', 'url', 'tel', 'email', 'password', 'number'].includes(editor.type)
+  const editable = editor && !editor.matches(':disabled, [readonly]')
+    && (textInput || editor.tagName === 'TEXTAREA' || editor.isContentEditable)
+  const files = Array.from(e.dataTransfer?.types || []).includes('Files')
+  if (!editable || files) e.preventDefault()
+  return true
+}
+
 function onDragEnter(e: DragEvent) {
+  if (ignoreImportDrag(e)) return
   e.preventDefault()
   if (nativeDragActive) return
   dragCounter++
@@ -1453,11 +1610,13 @@ function onDragEnter(e: DragEvent) {
 }
 
 function onDragOver(e: DragEvent) {
+  if (ignoreImportDrag(e)) return
   e.preventDefault()
   if (nativeDragActive) return
 }
 
 function onDragLeave(e: DragEvent) {
+  if (ignoreImportDrag(e)) return
   e.preventDefault()
   if (nativeDragActive) return
   dragCounter--
@@ -1493,7 +1652,6 @@ async function revealExistingImports(ids: number[]) {
     return
   }
   sidebarTab.value = 'collections'
-  state.activeGenres = [...ALL_GENRES]
   state.activeTags = new Set()
   state.searchQuery = ''
   state.activeCategory = null
@@ -1546,6 +1704,7 @@ async function handleLargeMemeImport(result: any) {
 }
 
 async function onDrop(e: DragEvent) {
+  if (ignoreImportDrag(e)) return
   e.preventDefault()
   if (nativeDragActive) { dragCounter = 0; dragOver.value = false; return }
   dragCounter = 0
@@ -1656,10 +1815,21 @@ async function onDrop(e: DragEvent) {
   showToast('未识别到可导入的内容')
 }
 
-// ESC：右键菜单 → 多选 → 整理模式 → 隐藏窗口
+// ESC 先关闭当前子层；详情返回后须再次按下才会隐藏主窗口。
 function onDocKeydown(e: KeyboardEvent) {
-  if (e.key !== 'Escape') return
+  if (e.key !== 'Escape' || e.defaultPrevented || e.isComposing || e.keyCode === 229) return
+  if (e.repeat) { e.preventDefault(); return }
+  if (hierarchyDrag) { e.preventDefault(); clearHierarchyDrag(); return }
   if (ctx.visible.value) { ctx.hide(); return }
+  const details = chatRecordDetails.value?.isOpen()
+    ? chatRecordDetails.value
+    : memeDetails.value?.isOpen() ? memeDetails.value : null
+  if (details) {
+    e.preventDefault()
+    e.stopPropagation()
+    details.close()
+    return
+  }
   if (hoverPreview.value) { clearHoverPreview(); return }
   if (selectMode.value) { toggleSelect(); return }
   if (sortEnabled.value) { toggleSort(); return }
@@ -1671,9 +1841,11 @@ let swipeStart: { x: number; y: number; collapsed: boolean } | null = null
 let swipeClickGuard = false
 
 function onSidebarSwipeDown(e: PointerEvent) {
+  hierarchyClickGuard = false
   swipeClickGuard = false
   swipeStart = null
   if (e.button !== 0) return
+  if (hierarchyDrag) return
   if (!(e.target as HTMLElement).closest?.('#sidebar')) return
   swipeStart = { x: e.clientX, y: e.clientY, collapsed: sidebarCollapsed.value }
 }
@@ -1693,6 +1865,12 @@ function onSidebarSwipeMove(e: PointerEvent) {
 function onSidebarSwipeEnd() { swipeStart = null }
 
 function onSwipeClickCapture(e: MouseEvent) {
+  if (hierarchyClickGuard && e.detail !== 0) {
+    hierarchyClickGuard = false
+    e.stopPropagation()
+    e.preventDefault()
+    return
+  }
   if (!swipeClickGuard || e.detail === 0) return
   swipeClickGuard = false
   e.stopPropagation()
@@ -1719,6 +1897,7 @@ onMounted(() => {
 })
 
 onUnmounted(() => {
+  clearHierarchyDrag()
   document.removeEventListener('dragenter', onDragEnter)
   document.removeEventListener('dragover', onDragOver)
   document.removeEventListener('dragleave', onDragLeave)
@@ -1807,7 +1986,11 @@ onUnmounted(() => {
 
     <div id="content">
       <aside id="sidebar" :class="{ collapsed: sidebarCollapsed }">
-        <div id="sidebar-header">
+        <div id="sidebar-header"
+          :data-hierarchy-root="sidebarTab === 'categories' ? 'category' : 'collection'"
+          :class="{ 'hierarchy-root-target': hierarchyDropTargetKey.endsWith(':root') }"
+          :title="hierarchyDragId != null ? '松手后确认移至顶层' : undefined"
+        >
           <div v-if="!sidebarCollapsed" class="sidebar-tabs" role="tablist" aria-label="浏览方式">
             <button
               class="sidebar-tab"
@@ -1841,10 +2024,12 @@ onUnmounted(() => {
             :depth="0"
             :collapsed="sidebarCollapsed"
             :drop-kind="sidebarTab === 'categories' ? 'category' : 'collection'"
-            :drop-target-key="libraryDropTargetKey"
+            :drop-target-key="hierarchyDropTargetKey || libraryDropTargetKey"
+            :hierarchy-drag-id="hierarchyDragId"
             @select="onSidebarSelect"
             @node-hover="onSidebarNodeHover"
             @folder-context="onFolderRightClick"
+            @node-pointerdown="onHierarchyPointerDown"
           />
         </div>
       </aside>
@@ -1916,6 +2101,7 @@ onUnmounted(() => {
           <button class="btn btn-sm" :disabled="state.memes.length === 0" @click="selectAllVisible">全选当前页</button>
           <button class="btn btn-sm btn-secondary" :disabled="state.selectedIds.size === 0" @click="clearSelection">取消选择</button>
           <button class="btn btn-sm" :disabled="state.selectedIds.size === 0" @click="batchAddToCollection">加入分组</button>
+          <button class="btn btn-sm" :disabled="state.selectedIds.size === 0" @click="batchSetCategory">设置类别</button>
           <button class="btn btn-sm" :disabled="state.selectedIds.size === 0" @click="batchTag">打标签</button>
           <button v-if="state.activeCollection && state.activeCollection > 0" class="btn btn-sm" :disabled="state.selectedIds.size === 0" @click="batchMoveToCollection">移动到分组</button>
           <button class="btn btn-sm btn-danger" :disabled="state.selectedIds.size === 0" @click="batchDelete">批量删除</button>
@@ -1930,7 +2116,7 @@ onUnmounted(() => {
               :data-folder-id="child.id"
               role="button"
               tabindex="0"
-              :aria-label="'打开' + (sidebarTab === 'categories' ? '类别 ' : '分组 ') + child.name"
+              :aria-label="'打开' + (contentTab === 'categories' ? '类别 ' : '分组 ') + child.name"
               @click="onFolderCardClick(child.id)"
               @contextmenu="onFolderCardContext($event, child.id, child.name)"
               @keydown.enter.prevent="onFolderCardClick(child.id)"

@@ -1055,6 +1055,96 @@ def _copy_image_linux(image_path: str, ext: str) -> bool:
     return False
 
 
+def copy_text_with_history(text, owner_handle):
+    """Windows 普通文本复制：允许本地历史，禁止云同步。"""
+    if (
+        not isinstance(text, str)
+        or not text
+        or len(text) >= 2 * 1024 * 1024
+        or "\x00" in text
+        or not owner_handle
+    ):
+        return False
+    try:
+        encoded = text.encode("utf-16-le") + b"\x00\x00"
+    except UnicodeEncodeError:
+        return False
+    if len(encoded) > 4 * 1024 * 1024:
+        return False
+
+    handles = []
+    opened = False
+    user32 = kernel32 = None
+    try:
+        import ctypes
+        import time
+        from ctypes import wintypes
+
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        user32.RegisterClipboardFormatW.argtypes = [wintypes.LPCWSTR]
+        user32.RegisterClipboardFormatW.restype = wintypes.UINT
+        user32.OpenClipboard.argtypes = [wintypes.HWND]
+        user32.OpenClipboard.restype = wintypes.BOOL
+        user32.EmptyClipboard.restype = wintypes.BOOL
+        user32.CloseClipboard.restype = wintypes.BOOL
+        user32.SetClipboardData.argtypes = [wintypes.UINT, wintypes.HANDLE]
+        user32.SetClipboardData.restype = wintypes.HANDLE
+        kernel32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
+        kernel32.GlobalAlloc.restype = wintypes.HGLOBAL
+        kernel32.GlobalLock.argtypes = [wintypes.HGLOBAL]
+        kernel32.GlobalLock.restype = wintypes.LPVOID
+        kernel32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
+        kernel32.GlobalFree.argtypes = [wintypes.HGLOBAL]
+        kernel32.GlobalFree.restype = wintypes.HGLOBAL
+
+        cloud_format = user32.RegisterClipboardFormatW("CanUploadToCloudClipboard")
+        history_format = user32.RegisterClipboardFormatW("CanIncludeInClipboardHistory")
+        if not cloud_format or not history_format:
+            return False
+        for fmt, payload in (
+            (cloud_format, struct.pack("<I", 0)),
+            (history_format, struct.pack("<I", 1)),
+            (13, encoded),  # CF_UNICODETEXT
+        ):
+            handle = kernel32.GlobalAlloc(0x0002, len(payload))
+            if not handle:
+                return False
+            handles.append([fmt, handle, False])
+            pointer = kernel32.GlobalLock(handle)
+            if not pointer:
+                return False
+            try:
+                ctypes.memmove(pointer, payload, len(payload))
+            finally:
+                kernel32.GlobalUnlock(handle)
+
+        for attempt in range(3):
+            if user32.OpenClipboard(owner_handle):
+                opened = True
+                break
+            if attempt < 2:
+                time.sleep(0.01)
+        if not opened:
+            return False
+        if not user32.EmptyClipboard():
+            return False
+        for entry in handles:
+            if not user32.SetClipboardData(entry[0], entry[1]):
+                return False
+            entry[2] = True
+        return True
+    except Exception:
+        logger.warning("本地文本剪贴板写入失败")
+        return False
+    finally:
+        if opened:
+            user32.CloseClipboard()
+        for _fmt, handle, transferred in handles:
+            if not transferred:
+                kernel32.GlobalFree(handle)
+
+
 def copy_text(text: str) -> bool:
     """复制文本到剪贴板"""
     if HAS_PYPERCLIP:

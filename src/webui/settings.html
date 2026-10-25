@@ -59,6 +59,10 @@
     <div class="section" data-group="base">
       <div class="section-title">侧边栏与层级</div>
       <label class="check-row">
+        <input id="s-show-category-uncategorized" type="checkbox">为有子类别的类别显示“未分类”入口
+      </label>
+      <p style="font-size:11px;color:var(--muted);margin:-4px 0 10px 24px;line-height:1.5">只显示直接属于当前类别、未归入子类别的图片、GIF 和聊天记录；不创建真实类别或移动文件。</p>
+      <label class="check-row">
         <input id="s-hidden-collection-enabled" type="checkbox">启用「隐藏」分组的内容隐藏效果
       </label>
       <p style="font-size:11px;color:var(--muted);margin:-4px 0 10px 24px;line-height:1.5">启用后，放入“隐藏”或其子分组的内容只会在该分组子树中显示；关闭后仍保留分组，但内容可在其他页面正常出现。</p>
@@ -198,6 +202,15 @@
         <div class="form-hint">仅影响表情包等普通媒体；聊天记录中的媒体始终按原件归档。</div>
       </div>
 
+      <div class="form-group">
+        <label class="check-row">
+          <input id="s-import-resolution-limit-enabled" type="checkbox" onchange="toggleImportResolutionLimit()">限制导入图片的最长边
+        </label>
+        <label for="s-import-resolution-limit-px">最长边上限（像素）</label>
+        <input id="s-import-resolution-limit-px" type="number" min="1" max="65535" step="1" value="2560" disabled>
+        <div class="form-hint">默认关闭。开启后按此阈值检查新入库的图片，适用于普通导入、缓存扫描、云端下载、同步拉取和局域网导入，不影响已有记录或聊天记录内媒体。关闭不会取消文件大小、总像素和解码安全检查，也不改变日用副本、缩略图尺寸。保存后生效。</div>
+      </div>
+
       <button class="import-row" onclick="startQQImport()">
         <span class="import-ico">
           <svg viewBox="0 0 1024 1024" fill="currentColor"><path d="M824.8 613.2c-16-51.4-34.4-94.6-62.7-165.3C766.5 262.2 689.3 112 511.5 112 331.7 112 256.2 265.2 261 447.9c-28.4 70.8-46.7 113.7-62.7 165.3-34 109.5-23 154.8-14.6 155.8 18 2.2 70.1-82.4 70.1-82.4 0 49 25.2 112.9 79.8 159-26.4 8.1-85.7 29.9-71.6 53.8 11.4 19.3 196.2 12.3 249.5 6.3 53.3 6 238.1 13 249.5-6.3 14.1-23.8-45.3-45.7-71.6-53.8 54.6-46.2 79.8-110.1 79.8-159 0 0 52.1 84.6 70.1 82.4 8.5-1.1 19.5-46.4-14.5-155.8z"/></svg>
@@ -288,6 +301,10 @@
         <button id="btn-napcat-listen" class="btn btn-secondary btn-sm btn-flex" onclick="applyNapCatListener()">应用并监听</button>
       </div>
       <div id="napcat-status" role="status" aria-live="polite" style="font-size:11.5px;color:var(--muted);margin-top:6px;line-height:1.8"></div>
+      <label class="check-row" style="margin-top:12px">
+        <input id="s-qq-drag-cleanup-on-start" type="checkbox">启动时清理超过一天的 QQ 拖拽凭证和占位图
+      </label>
+      <div class="form-hint">保存后从下次 OhMyMeme 启动起生效。只检查系统临时目录，按最后修改时间清理超过 24 小时的凭证和占位图，不影响正式归档或其他临时文件。</div>
       <div style="height:1px;background:var(--border);margin:16px 0 13px"></div>
       <div style="font-size:12px;font-weight:600;color:var(--fg);margin-bottom:6px">使用方法</div>
       <ol style="font-size:11.5px;color:var(--muted);padding-left:18px;line-height:1.8;margin-bottom:8px">

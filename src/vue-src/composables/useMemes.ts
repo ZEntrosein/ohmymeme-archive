@@ -1,4 +1,4 @@
-import { reactive, ref, readonly } from 'vue'
+import { reactive, ref, readonly, watch } from 'vue'
 import { api } from '../utils/api'
 import type { ChatRecordSummary, Genre, Meme, TagRecord } from '../types'
 
@@ -29,6 +29,14 @@ const state = reactive({
 })
 
 let searchGen = 0
+let genresRestored = false
+let genreSave = Promise.resolve<unknown>(null)
+
+watch(() => state.activeGenres.join(','), () => {
+  if (!genresRestored) return
+  const genres = [...state.activeGenres]
+  genreSave = genreSave.then(() => api('set_library_genres', genres))
+}, { flush: 'sync' })
 
 export function tagKey(tag: TagRecord): string {
   return `${tag.category || ''}\u001f${tag.name}`.toLocaleLowerCase()
@@ -58,7 +66,7 @@ export function useMemes() {
   }
 
   async function waitForPywebview(): Promise<void> {
-    while (typeof window.pywebview === 'undefined' || !window.pywebview.api) {
+    while (typeof window.pywebview?.api?.get_init_data !== 'function') {
       await new Promise(r => setTimeout(r, 100))
     }
   }
@@ -67,6 +75,12 @@ export function useMemes() {
     await waitForPywebview()
     const data = await api('get_init_data')
     if (data) {
+      if (!genresRestored) {
+        state.activeGenres = Array.isArray(data.library_genres)
+          ? ALL_GENRES.filter(genre => data.library_genres.includes(genre))
+          : [...ALL_GENRES]
+        genresRestored = true
+      }
       state.memes = data.memes || []
       state.allTags = Array.isArray(data.tag_records) ? data.tag_records : legacyTags(data.tags)
       state.collections = data.collections || []
@@ -206,8 +220,9 @@ export function useMemes() {
     if (!Array.isArray(items)) return
     state.categories = items
     const ac = state.activeCategory
-    if (ac && ac > 0 && !_collectionExists(state.categories, ac)) {
-      state.activeCategory = null
+    if (ac != null && (ac > 0 || ac < -4) && !_collectionExists(state.categories, ac)) {
+      const parentId = ac < -4 ? -ac - 4 : null
+      state.activeCategory = parentId != null && _collectionExists(state.categories, parentId) ? parentId : null
       await search()
     }
   }

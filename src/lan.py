@@ -26,10 +26,10 @@ from . import __version__
 from .bulk_read import guarded_read
 from .config import (
     _IMPORT_MAX_BYTES,
-    _IMPORT_MAX_PX,
     _SECRET_KEYS,
     CHAT_RECORD_MEDIA_DIRNAME,
     get_config,
+    get_import_max_px,
 )
 from .database import get_db
 from .manifest import build as build_manifest
@@ -638,7 +638,8 @@ def _find_meme_file(filename: str):
 def _import_bytes(data: bytes, filename: str) -> dict:
     """把收到的文件字节校验合法性后按哈希去重入库（不合法不落盘，杜绝孤儿文件）"""
     db = get_db()
-    cache_dir = get_config().cache_dir
+    cfg = get_config()
+    cache_dir = cfg.cache_dir
     ext = _detect_ext(data[:16]) or os.path.splitext(filename)[1] or ".png"
     if not ext:
         return {"ok": False, "error": "无法识别的图片格式"}
@@ -658,8 +659,9 @@ def _import_bytes(data: bytes, filename: str) -> dict:
             "ok": False,
             "error": "文件超过 %dMB 限制" % (allowed_bytes // (1024 * 1024)),
         }
-    if max(w, h) > _IMPORT_MAX_PX:
-        return {"ok": False, "error": "分辨率超过 %dK 限制" % (_IMPORT_MAX_PX // 1000)}
+    max_px = get_import_max_px(cfg)
+    if max_px and max(w, h) > max_px:
+        return {"ok": False, "error": f"图片最长边超过设置的 {max_px} 像素上限"}
     fhash = hashlib.sha256(data).hexdigest()
     if db.get_by_hash(fhash):
         return {"ok": True, "dedup": True}

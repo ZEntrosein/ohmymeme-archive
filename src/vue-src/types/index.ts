@@ -45,6 +45,7 @@ export interface Collection {
   count: number
   parent_id: number | null
   system_hidden?: boolean
+  direct_category_id?: number
   children?: Collection[]
 }
 

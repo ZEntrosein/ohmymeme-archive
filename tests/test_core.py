@@ -80,6 +80,57 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(cfg.get("napcat_command"), "/omm")
         self.assertEqual(cfg.get("napcat_send_mode"), "original_native")
         self.assertEqual(cfg.get("napcat_image_send_mode"), "sticker")
+        self.assertIs(cfg.get("qq_drag_cleanup_on_start"), True)
+        self.assertIs(cfg.get("import_resolution_limit_enabled"), False)
+        self.assertEqual(cfg.get("import_resolution_limit_px"), 2560)
+
+    def test_import_resolution_limit_persists_and_resets(self):
+        from src.config import get_import_max_px
+
+        self.config_path.write_text('{"hotkey": "Ctrl+Shift+X"}', encoding="utf-8")
+        cfg = Config(self.config_path)
+        self.assertEqual(get_import_max_px(cfg), 0)
+        cfg.update_from_dict(
+            {"import_resolution_limit_enabled": True, "import_resolution_limit_px": 4096}
+        )
+        cfg.save()
+        reloaded = Config(self.config_path)
+        self.assertEqual(get_import_max_px(reloaded), 4096)
+        reloaded.set("import_resolution_limit_enabled", False)
+        self.assertEqual(get_import_max_px(reloaded), 0)
+        self.assertEqual(reloaded.get("import_resolution_limit_px"), 4096)
+        reloaded.reset()
+        self.assertEqual(get_import_max_px(reloaded), 0)
+        self.assertEqual(reloaded.get("import_resolution_limit_px"), 2560)
+
+    def test_import_resolution_limit_normalizes_invalid_thresholds(self):
+        from src.config import get_import_max_px
+
+        cfg = Config(self.config_path)
+        cfg.set("import_resolution_limit_enabled", True)
+        for value, expected in (
+            ("4096", 4096),
+            (0, 1),
+            (-1, 1),
+            (100000, 65535),
+            (None, 2560),
+            ("invalid", 2560),
+            (True, 2560),
+            (float("inf"), 2560),
+        ):
+            with self.subTest(value=value):
+                cfg.set("import_resolution_limit_px", value)
+                self.assertEqual(cfg.get("import_resolution_limit_px"), expected)
+                self.assertEqual(get_import_max_px(cfg), expected)
+
+    def test_qq_drag_cleanup_setting_persists_and_resets(self):
+        cfg = Config(self.config_path)
+        cfg.update_from_dict({"qq_drag_cleanup_on_start": False})
+        cfg.save()
+        reloaded = Config(self.config_path)
+        self.assertIs(reloaded.get("qq_drag_cleanup_on_start"), False)
+        reloaded.reset()
+        self.assertIs(reloaded.get("qq_drag_cleanup_on_start"), True)
 
     def test_set_get(self):
         cfg = Config(self.config_path)
@@ -247,6 +298,121 @@ class TestConfig(unittest.TestCase):
 
 
 class TestOneBot(unittest.TestCase):
+    def test_qq_drag_cleanup_only_removes_old_owned_credentials_and_icons(self):
+        now = 2000000000
+        prefix = "ohmymeme-market-face-"
+        uuid = "d33dc498-b7c1-4b65-ad36-b21d4197ae37"
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            expired = [
+                root / f"{prefix}{uuid}.ommchat",
+                root / f"{prefix}{uuid}-drag-icon.png",
+            ]
+            retained = [
+                root / f"{prefix}{uuid}.png",
+                root / f"{prefix}{uuid}.gif",
+                root / f"{prefix}not-a-uuid.ommchat",
+                root / f"{prefix}{uuid}.ommchat.bak",
+                root / "other.ommchat",
+                root / "ohmymeme-native-forward-test.json",
+            ]
+            for path in expired + retained:
+                path.write_bytes(b"test")
+                os.utime(path, (now - 86401, now - 86401))
+            nested = root / "nested"
+            nested.mkdir()
+            nested_file = nested / f"{prefix}{uuid}.ommchat"
+            nested_file.write_bytes(b"nested")
+            os.utime(nested_file, (now - 86401, now - 86401))
+            matching_directory = root / (
+                f"{prefix}40f1227d-7897-4e1c-85b8-1c3f15b1c4a2.ommchat"
+            )
+            matching_directory.mkdir()
+            with (
+                mock.patch("src.onebot.tempfile.gettempdir", return_value=folder),
+                mock.patch("src.onebot.time.time", return_value=now),
+            ):
+                result = onebot.cleanup_qq_drag_temp_files()
+            self.assertEqual(result, {"removed": 2, "bytes": 8, "failed": 0})
+            self.assertTrue(all(not path.exists() for path in expired))
+            self.assertTrue(all(path.exists() for path in retained))
+            self.assertTrue(nested_file.exists())
+            self.assertTrue(matching_directory.is_dir())
+
+    def test_qq_drag_cleanup_retains_recent_and_exactly_one_day_old_files(self):
+        now = 2000000000
+        names = [
+            "d33dc498-b7c1-4b65-ad36-b21d4197ae37",
+            "40f1227d-7897-4e1c-85b8-1c3f15b1c4a2",
+            "96b1802e-3645-4e8d-bb6a-c00d0cc35400",
+        ]
+        with tempfile.TemporaryDirectory() as folder:
+            for uuid, age in zip(names, [86400, 86399, -60]):
+                path = Path(folder) / f"ohmymeme-market-face-{uuid}.ommchat"
+                path.write_bytes(b"test")
+                os.utime(path, (now - age, now - age))
+            with (
+                mock.patch("src.onebot.tempfile.gettempdir", return_value=folder),
+                mock.patch("src.onebot.time.time", return_value=now),
+            ):
+                result = onebot.cleanup_qq_drag_temp_files()
+            self.assertEqual(result, {"removed": 0, "bytes": 0, "failed": 0})
+            self.assertEqual(len(list(Path(folder).iterdir())), 3)
+
+    def test_qq_drag_cleanup_continues_after_a_locked_file(self):
+        now = 2000000000
+        unlink = Path.unlink
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            locked = (
+                root
+                / "ohmymeme-market-face-d33dc498-b7c1-4b65-ad36-b21d4197ae37.ommchat"
+            )
+            removable = (
+                root
+                / "ohmymeme-market-face-40f1227d-7897-4e1c-85b8-1c3f15b1c4a2-drag-icon.png"
+            )
+            for path in [locked, removable]:
+                path.write_bytes(b"test")
+                os.utime(path, (now - 86401, now - 86401))
+
+            def delete(path, *args, **kwargs):
+                if path.name == locked.name:
+                    raise PermissionError("locked")
+                return unlink(path, *args, **kwargs)
+
+            with (
+                mock.patch("src.onebot.tempfile.gettempdir", return_value=folder),
+                mock.patch("src.onebot.time.time", return_value=now),
+                mock.patch("src.onebot.Path.unlink", autospec=True, side_effect=delete),
+            ):
+                result = onebot.cleanup_qq_drag_temp_files()
+            self.assertEqual(result, {"removed": 1, "bytes": 4, "failed": 1})
+            self.assertTrue(locked.exists())
+            self.assertFalse(removable.exists())
+
+    def test_qq_drag_cleanup_skips_reparse_points(self):
+        entry = mock.Mock()
+        entry.name = "ohmymeme-market-face-d33dc498-b7c1-4b65-ad36-b21d4197ae37.ommchat"
+        entry.is_file.return_value = True
+        entry.stat.return_value.st_file_attributes = 0x400
+        with tempfile.TemporaryDirectory() as folder:
+            with (
+                mock.patch("src.onebot.tempfile.gettempdir", return_value=folder),
+                mock.patch("src.onebot.os.scandir") as scan,
+                mock.patch("src.onebot.Path.unlink") as delete,
+            ):
+                scan.return_value.__enter__.return_value = [entry]
+                result = onebot.cleanup_qq_drag_temp_files()
+            delete.assert_not_called()
+            entry.stat.assert_called_once_with(follow_symlinks=False)
+            self.assertEqual(result["removed"], 0)
+
+    def test_qq_drag_cleanup_handles_unreadable_temp_directory(self):
+        with mock.patch("src.onebot.os.scandir", side_effect=PermissionError("denied")):
+            result = onebot.cleanup_qq_drag_temp_files()
+        self.assertEqual(result, {"removed": 0, "bytes": 0, "failed": 1})
+
     def test_send_meme_image_marks_image_as_sticker(self):
         with tempfile.TemporaryDirectory() as tmp:
             image = Path(tmp) / "meme.gif"
@@ -3759,6 +3925,7 @@ class TestBulkRead(unittest.TestCase):
         self.assertTrue(normalized["bulk_read_prefetch_pages"])
         self.assertEqual(normalized["theme"], "dark")
 
+
 class TestManifest(unittest.TestCase):
     def setUp(self):
         self.tmp_dir = Path(tempfile.mkdtemp())
@@ -4232,6 +4399,317 @@ class TestDatabase(unittest.TestCase):
                 "summary": {"node_count": 1, "record_count": 1},
             }
         )
+
+    def test_hierarchy_move_preserves_subtrees_members_and_ids(self):
+        for kind in ("category", "collection"):
+            create = getattr(self.db, f"create_{kind}")
+            parent, destination = create("原父级"), create("目标父级")
+            node = create("待移动", parent)
+            child = create("子级", node)
+            meme = self.db.add_meme(f"{kind}.png")
+            chat = self._save_test_chat(410 if kind == "category" else 411)["id"]
+            if kind == "category":
+                self.db.set_meme_category(meme, child)
+                self.db.set_chat_category(chat, node)
+            else:
+                self.db.add_to_collection(meme, child)
+                self.db.add_to_chat_collection(chat, node)
+            result = self.db.move_hierarchy_node(kind, node, destination)
+            self.assertTrue(result["changed"])
+            get_nodes = (
+                self.db.get_categories
+                if kind == "category"
+                else self.db.get_collections
+            )
+            rows = {item[0]: item for item in get_nodes()}
+            self.assertEqual(rows[node][2], destination)
+            self.assertEqual(rows[child][2], node)
+            self.assertEqual(rows[parent][2], None)
+            self.assertEqual(
+                self.db.move_hierarchy_node(kind, node, destination),
+                {"changed": False, "parent_id": destination},
+            )
+            self.assertTrue(self.db.move_hierarchy_node(kind, node)["changed"])
+            if kind == "category":
+                self.assertEqual(self.db.get_meme_category(meme)["id"], child)
+                self.assertEqual(self.db.get_chat_category(chat)["id"], node)
+                self.assertEqual(
+                    self.db.get_category_path_names(child), ["待移动", "子级"]
+                )
+            else:
+                self.assertEqual(self.db.get_meme_collections(meme)[0]["id"], child)
+                self.assertEqual(self.db.get_chat_collections(chat)[0]["id"], node)
+
+    def test_hierarchy_move_rejects_cycles_conflicts_and_virtual_nodes(self):
+        for kind in ("category", "collection"):
+            create = getattr(self.db, f"create_{kind}")
+            source, destination = create("source"), create("destination")
+            child = create("child", source)
+            create("SOURCE", destination)
+            get_nodes = (
+                self.db.get_categories
+                if kind == "category"
+                else self.db.get_collections
+            )
+            before = get_nodes()
+            for node, target in (
+                (source, source),
+                (source, child),
+                (source, destination),
+                (source, -4),
+                (source, -1),
+                (source, 999999),
+                (-4, source),
+                (-source - 4, source),
+                (999999, None),
+                (True, source),
+                (source, False),
+                (source, "2"),
+            ):
+                with self.subTest(kind=kind, node=node, target=target):
+                    with self.assertRaises(ValueError):
+                        self.db.move_hierarchy_node(kind, node, target)
+                    self.assertEqual(get_nodes(), before)
+            duplicate = create("source", child)
+            with self.assertRaises(ValueError):
+                self.db.move_hierarchy_node(kind, duplicate, None)
+        with self.assertRaises(ValueError):
+            self.db.move_hierarchy_node("invalid", 1, 2)
+        hidden = self.db.ensure_hidden_collection()
+        with self.assertRaises(ValueError):
+            self.db.move_hierarchy_node("collection", hidden, destination)
+        normal = self.db.create_collection("允许放入隐藏")
+        self.assertTrue(
+            self.db.move_hierarchy_node("collection", normal, hidden)["changed"]
+        )
+        self.assertTrue(self.db.move_hierarchy_node("collection", normal)["changed"])
+        reserved = self.db.create_category("chat-record-media", source)
+        with self.assertRaises(ValueError):
+            self.db.move_hierarchy_node("category", reserved)
+
+    def test_hierarchy_opposite_concurrent_moves_cannot_create_cycle(self):
+        from concurrent.futures import ThreadPoolExecutor
+
+        for kind in ("category", "collection"):
+            create = getattr(self.db, f"create_{kind}")
+            first, second = create("first"), create("second")
+            barrier = threading.Barrier(2)
+
+            def move(source, target):
+                barrier.wait(timeout=5)
+                try:
+                    self.db.move_hierarchy_node(kind, source, target)
+                    return True
+                except ValueError:
+                    return False
+                finally:
+                    self.db.close()
+
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                a = pool.submit(move, first, second)
+                b = pool.submit(move, second, first)
+                self.assertEqual(
+                    sorted([a.result(timeout=10), b.result(timeout=10)]), [False, True]
+                )
+
+    def _hierarchy_move_api(self):
+        from types import SimpleNamespace
+
+        from src.webui import JsApi
+
+        cache = self.tmp_dir / "hierarchy-move-cache"
+        cache.mkdir(exist_ok=True)
+        cfg = Config(self.tmp_dir / "hierarchy-move-config.json")
+        cfg.set("cache_dir", str(cache))
+        api = JsApi.__new__(JsApi)
+        api._db, api._cfg = self.db, cfg
+        api._webui = SimpleNamespace(_file_cache={})
+        return api, cache
+
+    def test_hierarchy_category_api_moves_whole_directory_without_reading_images(self):
+        from contextlib import nullcontext
+
+        api, cache = self._hierarchy_move_api()
+        source = self.db.create_category("source")
+        child = self.db.create_category("child", source)
+        target = self.db.create_category("target")
+        path = cache / "source" / "child" / "original.gif"
+        path.parent.mkdir(parents=True)
+        path.write_bytes(b"GIF89a-test")
+        (cache / "source" / "untracked.txt").write_text("keep", encoding="utf-8")
+        media = cache / "chat-record-media" / "archive" / "image.png"
+        media.parent.mkdir(parents=True)
+        media.write_bytes(b"chat-media")
+        mid = self.db.add_meme(path.name, category_id=child)
+        chat = self._save_test_chat(412)["id"]
+        self.db.set_chat_category(chat, child)
+        api._webui._file_cache.update({path.name: str(path), "other.png": "unrelated"})
+
+        with (
+            mock.patch("src.webui.guarded_read", return_value=nullcontext()) as gate,
+            mock.patch("src.webui.request_manifest_rebuild") as rebuild,
+            mock.patch(
+                "src.webui.build_manifest",
+                side_effect=AssertionError("no foreground rebuild"),
+            ),
+            mock.patch("src.webui.os.walk", side_effect=AssertionError("no scanning")),
+            mock.patch(
+                "src.webui._file_sha256", side_effect=AssertionError("no hashing")
+            ),
+            mock.patch(
+                "builtins.open", side_effect=AssertionError("no file content reads")
+            ),
+        ):
+            result = api.move_hierarchy_node("category", source, target)
+        self.assertTrue(result["ok"], result)
+        gate.assert_called_once_with(priority="critical")
+        rebuild.assert_called_once_with()
+        moved = cache / "target" / "source" / "child" / path.name
+        self.assertFalse(path.exists())
+        self.assertEqual(moved.read_bytes(), b"GIF89a-test")
+        self.assertEqual(
+            (cache / "target" / "source" / "untracked.txt").read_text(), "keep"
+        )
+        self.assertEqual(media.read_bytes(), b"chat-media")
+        self.assertEqual(self.db.get_by_id(mid)["category_id"], child)
+        self.assertEqual(self.db.get_chat_category(chat)["id"], child)
+        self.assertEqual(api._webui._file_cache[path.name], str(moved))
+        self.assertEqual(api._webui._file_cache["other.png"], "unrelated")
+        api._cfg.set("virtual_drive_compat", True)
+        with (
+            mock.patch.object(Path, "resolve", side_effect=OSError("WinError 1005")),
+            mock.patch("src.webui.request_manifest_rebuild"),
+        ):
+            result = api.move_hierarchy_node("category", source)
+        self.assertTrue(result["ok"], result)
+        self.assertTrue(path.exists())
+
+    def test_hierarchy_category_move_rolls_back_if_database_update_fails(self):
+        api, cache = self._hierarchy_move_api()
+        source = self.db.create_category("source")
+        target = self.db.create_category("target")
+        path = cache / "source" / "original.png"
+        path.parent.mkdir(parents=True)
+        path.write_bytes(b"keep")
+        self.db.add_meme(path.name, category_id=source)
+        api._webui._file_cache[path.name] = str(path)
+        conn = self.db._get_conn()
+        conn.execute(
+            "CREATE TEMP TRIGGER reject_hierarchy BEFORE UPDATE OF parent_id ON categories "
+            "BEGIN SELECT RAISE(ABORT, 'test update failure'); END"
+        )
+        with mock.patch("src.webui.request_manifest_rebuild") as rebuild:
+            result = api.move_hierarchy_node("category", source, target)
+        self.assertFalse(result["ok"])
+        self.assertIsNone(self.db.get_category(source)["parent_id"])
+        self.assertEqual(path.read_bytes(), b"keep")
+        self.assertFalse((cache / "target" / "source").exists())
+        self.assertEqual(api._webui._file_cache[path.name], str(path))
+        rebuild.assert_not_called()
+        conn.execute("DROP TRIGGER reject_hierarchy")
+
+    def test_hierarchy_category_move_rejects_directory_conflict_and_missing_drive(self):
+        api, cache = self._hierarchy_move_api()
+        source = self.db.create_category("source")
+        target = self.db.create_category("target")
+        path = cache / "source" / "original.png"
+        path.parent.mkdir(parents=True)
+        path.write_bytes(b"original")
+        self.db.add_meme(path.name, category_id=source)
+        conflict = cache / "target" / "source" / "occupied.png"
+        conflict.parent.mkdir(parents=True)
+        conflict.write_bytes(b"occupied")
+        with mock.patch("src.webui.request_manifest_rebuild") as rebuild:
+            result = api.move_hierarchy_node("category", source, target)
+            self.assertFalse(result["ok"])
+            self.assertEqual(path.read_bytes(), b"original")
+            self.assertEqual(conflict.read_bytes(), b"occupied")
+            self.assertIsNone(self.db.get_category(source)["parent_id"])
+            with mock.patch("src.webui.os.replace", side_effect=OSError("move failed")):
+                result = api.move_hierarchy_node("category", target, source)
+            self.assertFalse(result["ok"])
+            self.assertIsNone(self.db.get_category(target)["parent_id"])
+            missing = self.db.create_category("missing")
+            self.db.add_meme("unavailable.png", category_id=missing)
+            result = api.move_hierarchy_node("category", missing, target)
+            self.assertFalse(result["ok"])
+            self.assertIn("目录不可用", result["error"])
+            self.assertIsNone(self.db.get_category(missing)["parent_id"])
+            rebuild.assert_not_called()
+
+    def test_hierarchy_category_move_allows_empty_but_rejects_linked_paths(self):
+        api, cache = self._hierarchy_move_api()
+        source = self.db.create_category("empty")
+        target = self.db.create_category("target")
+        with mock.patch("src.webui.request_manifest_rebuild"):
+            result = api.move_hierarchy_node("category", source, target)
+            self.assertTrue(result["ok"], result)
+            self.assertEqual(self.db.get_category(source)["parent_id"], target)
+        path = cache / "linked"
+        path.mkdir()
+        linked = self.db.create_category("linked")
+        with (
+            mock.patch.object(Path, "is_symlink", return_value=True),
+            mock.patch("src.webui.os.replace") as replace,
+            mock.patch("src.webui.request_manifest_rebuild") as rebuild,
+        ):
+            result = api.move_hierarchy_node("category", linked, target)
+        self.assertFalse(result["ok"])
+        self.assertIn("链接目录", result["error"])
+        self.assertIsNone(self.db.get_category(linked)["parent_id"])
+        replace.assert_not_called()
+        rebuild.assert_not_called()
+
+    def test_hierarchy_category_failed_rollback_reports_actual_file_location(self):
+        api, cache = self._hierarchy_move_api()
+        source = self.db.create_category("source")
+        target = self.db.create_category("target")
+        path = cache / "source" / "original.png"
+        path.parent.mkdir(parents=True)
+        path.write_bytes(b"preserved")
+        api._webui._file_cache[path.name] = str(path)
+        self.db._get_conn().execute(
+            "CREATE TEMP TRIGGER reject_hierarchy BEFORE UPDATE OF parent_id ON categories "
+            "BEGIN SELECT RAISE(ABORT, 'test update failure'); END"
+        )
+        original_replace = os.replace
+        calls = []
+
+        def replace(source_path, target_path):
+            calls.append((source_path, target_path))
+            if len(calls) > 1:
+                raise OSError("rollback denied")
+            original_replace(source_path, target_path)
+
+        with mock.patch("src.webui.os.replace", side_effect=replace):
+            result = api.move_hierarchy_node("category", source, target)
+        moved = cache / "target" / "source" / path.name
+        self.assertFalse(result["ok"])
+        self.assertIn("回滚失败", result["error"])
+        self.assertIn(str(moved.parent), result["error"])
+        self.assertEqual(moved.read_bytes(), b"preserved")
+        self.assertIsNone(self.db.get_category(source)["parent_id"])
+        self.assertEqual(api._webui._file_cache[path.name], str(moved))
+
+    def test_hierarchy_collection_move_never_touches_original_files(self):
+        api, cache = self._hierarchy_move_api()
+        source = self.db.create_collection("source")
+        target = self.db.create_collection("target")
+        with (
+            mock.patch(
+                "src.webui.guarded_read", side_effect=AssertionError("no throttle")
+            ),
+            mock.patch(
+                "src.webui.os.replace", side_effect=AssertionError("no file moves")
+            ),
+            mock.patch("src.webui.request_manifest_rebuild") as rebuild,
+        ):
+            result = api.move_hierarchy_node("collection", source, target)
+            self.assertTrue(result["ok"], result)
+            same = api.move_hierarchy_node("collection", source, target)
+            self.assertTrue(same["ok"])
+            self.assertFalse(same["changed"])
+            rebuild.assert_called_once_with()
 
     def test_category_delete_modes_promote_or_remove_subtree(self):
         parent = self.db.create_category("父类别")
@@ -5590,6 +6068,157 @@ class TestDatabase(unittest.TestCase):
         self.assertEqual(api._webui._file_cache["drag-category.png"], str(new_path))
         rebuild.assert_called_once_with()
 
+    def _batch_category_api(self):
+        from src.webui import JsApi, WebUI
+
+        cfg = Config(self.tmp_dir / "batch-category-config.json")
+        cfg.set("cache_dir", str(self.tmp_dir / "batch-category-cache"))
+        cfg.cache_dir.mkdir(parents=True, exist_ok=True)
+        ui = WebUI.__new__(WebUI)
+        ui._db = self.db
+        ui._cfg = cfg
+        ui._file_cache = {}
+        api = JsApi.__new__(JsApi)
+        api._db = self.db
+        api._cfg = cfg
+        api._webui = ui
+        db_patch = mock.patch("src.webui.get_db", return_value=self.db)
+        db_patch.start()
+        self.addCleanup(db_patch.stop)
+        return api, cfg.cache_dir
+
+    def test_batch_category_moves_files_and_preserves_groups_and_tags(self):
+        api, cache = self._batch_category_api()
+        parent = self.db.create_category("角色")
+        category = self.db.create_category("爱丽丝", parent)
+        group = self.db.create_collection("保留分组")
+        ids = []
+        for name in ("batch-first.png", "batch-second.gif", "batch-unselected.png"):
+            (cache / name).write_bytes(name.encode())
+            mid = self.db.add_meme(name, tags=["保留标签"])
+            self.db.add_to_collection(mid, group)
+            ids.append(mid)
+        with (
+            mock.patch("src.webui.request_manifest_rebuild") as rebuild,
+            mock.patch("src.webui.build_manifest") as build,
+        ):
+            result = api.batch_set_meme_category([ids[0], ids[1], ids[0]], category)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["count"], 2)
+        for mid in ids[:2]:
+            row = self.db.get_by_id(mid)
+            target = cache / "角色" / "爱丽丝" / row["filename"]
+            self.assertTrue(target.is_file())
+            self.assertFalse((cache / row["filename"]).exists())
+            self.assertEqual(row["category_id"], category)
+            self.assertEqual(self.db.get_meme_tags(mid), ["保留标签"])
+            self.assertEqual(self.db.get_meme_collections(mid)[0]["id"], group)
+            self.assertEqual(api._webui._file_cache[row["filename"]], str(target))
+        self.assertIsNone(self.db.get_by_id(ids[2])["category_id"])
+        self.assertTrue((cache / "batch-unselected.png").is_file())
+        rebuild.assert_called_once_with()
+        build.assert_not_called()
+        with mock.patch("src.webui.request_manifest_rebuild"):
+            cleared = api.batch_set_meme_category(ids[:2], 0)
+        self.assertTrue(cleared["ok"])
+        for mid in ids[:2]:
+            row = self.db.get_by_id(mid)
+            self.assertIsNone(row["category_id"])
+            self.assertTrue((cache / row["filename"]).is_file())
+
+    def test_batch_category_creates_path_and_reuses_existing_category(self):
+        api, cache = self._batch_category_api()
+        mid = self.db.add_meme("batch-new.png")
+        (cache / "batch-new.png").write_bytes(b"image")
+        with mock.patch("src.webui.request_manifest_rebuild"):
+            created = api.batch_set_meme_category([mid], None, "新父级/新子级")
+            reused = api.batch_set_meme_category([mid], None, "新父级/新子级")
+        self.assertTrue(created["ok"])
+        self.assertEqual(created["category_id"], reused["category_id"])
+        self.assertEqual(len(self.db.get_categories()), 2)
+        self.assertTrue((cache / "新父级" / "新子级" / "batch-new.png").is_file())
+
+    def test_batch_category_rolls_back_files_on_move_or_commit_failure(self):
+        api, cache = self._batch_category_api()
+        category = self.db.create_category("目标")
+        first = self.db.add_meme("batch-rollback-first.png")
+        second = self.db.add_meme("batch-rollback-second.png")
+        first_path = cache / "batch-rollback-first.png"
+        second_path = cache / "batch-rollback-second.png"
+        first_path.write_bytes(b"first")
+        with mock.patch("src.webui.request_manifest_rebuild") as rebuild:
+            missing = api.batch_set_meme_category([first, second], category)
+        self.assertFalse(missing["ok"])
+        self.assertEqual(first_path.read_bytes(), b"first")
+        self.assertIsNone(self.db.get_by_id(first)["category_id"])
+        self.assertIsNone(self.db.get_by_id(second)["category_id"])
+        rebuild.assert_not_called()
+        second_path.write_bytes(b"second")
+        with (
+            mock.patch.object(
+                self.db, "set_memes_category", side_effect=RuntimeError("提交失败")
+            ),
+            mock.patch("src.webui.request_manifest_rebuild") as rebuild,
+        ):
+            failed = api.batch_set_meme_category([first, second], category)
+        self.assertFalse(failed["ok"])
+        self.assertEqual(first_path.read_bytes(), b"first")
+        self.assertEqual(second_path.read_bytes(), b"second")
+        self.assertIsNone(self.db.get_by_id(first)["category_id"])
+        self.assertIsNone(self.db.get_by_id(second)["category_id"])
+        rebuild.assert_not_called()
+
+    def test_batch_category_collision_preserves_existing_file(self):
+        api, cache = self._batch_category_api()
+        category = self.db.create_category("目标")
+        mid = self.db.add_meme("batch-collision.png")
+        source = cache / "batch-collision.png"
+        source.write_bytes(b"source")
+        target = cache / "目标" / "batch-collision.png"
+        target.parent.mkdir()
+        target.write_bytes(b"existing")
+        with mock.patch("src.webui.request_manifest_rebuild"):
+            result = api.batch_set_meme_category([mid], category)
+        self.assertFalse(result["ok"])
+        self.assertEqual(source.read_bytes(), b"source")
+        self.assertEqual(target.read_bytes(), b"existing")
+        self.assertIsNone(self.db.get_by_id(mid)["category_id"])
+
+    def test_batch_category_database_failure_rolls_back_entire_transaction(self):
+        first = self.db.add_meme("batch-sql-first.png")
+        second = self.db.add_meme("batch-sql-second.png")
+        category = self.db.create_category("目标")
+        conn = self.db._get_conn()
+        conn.execute(
+            f"CREATE TEMP TRIGGER fail_batch_category BEFORE UPDATE OF category_id "
+            f"ON memes WHEN NEW.id={second} "
+            "BEGIN SELECT RAISE(ABORT, 'test commit failure'); END"
+        )
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.db.set_memes_category([first, second], category)
+        self.assertIsNone(self.db.get_by_id(first)["category_id"])
+        self.assertIsNone(self.db.get_by_id(second)["category_id"])
+        conn.execute("DROP TRIGGER fail_batch_category")
+
+    def test_batch_category_rejects_missing_items_and_invalid_targets(self):
+        api, cache = self._batch_category_api()
+        mid = self.db.add_meme("batch-invalid.png")
+        source = cache / "batch-invalid.png"
+        source.write_bytes(b"image")
+        with mock.patch("src.webui.request_manifest_rebuild") as rebuild:
+            for target in (-4, -1, 99999, "invalid"):
+                self.assertFalse(api.batch_set_meme_category([mid], target)["ok"])
+            self.assertFalse(
+                api.batch_set_meme_category([mid, 99999], None, "不应创建")["ok"]
+            )
+            self.assertFalse(api.batch_set_meme_category([], None, "不应创建")["ok"])
+        self.assertTrue(source.is_file())
+        self.assertEqual(self.db.get_categories(), [])
+        rebuild.assert_not_called()
+        with self.assertRaises(ValueError):
+            self.db.set_memes_category([mid, 99999], None)
+        self.assertIsNone(self.db.get_by_id(mid)["category_id"])
+
     def test_create_collection_api_does_not_assign_meme_until_details_save(self):
         from src.webui import JsApi
 
@@ -6660,6 +7289,142 @@ class TestDatabase(unittest.TestCase):
 
 class TestHotkeyWatchdog(unittest.TestCase):
     """GlobalHotkey 键盘监听线程守护：自动重注册逻辑（mock keyboard 模块）"""
+
+    def test_windows_message_loop_uses_real_buffer_and_exits_on_quit(self):
+        import ctypes
+        from ctypes.wintypes import MSG
+        from types import SimpleNamespace
+
+        from src.hotkey import _patch_windows_keyboard_message_loop
+
+        received = []
+        results = iter([1, 2, 0])
+
+        def get_message(pointer, *args):
+            self.assertTrue(ctypes.cast(pointer, ctypes.c_void_p).value)
+            message = ctypes.cast(pointer, ctypes.POINTER(MSG)).contents
+            result = next(results)
+            message.message = 0x0012 if result == 0 else 0x0400
+            received.append(message.message)
+            return result
+
+        backend = SimpleNamespace(
+            listen=lambda callback: self.fail("不应调用旧消息循环"),
+            prepare_intercept=mock.Mock(),
+            GetMessage=get_message,
+            TranslateMessage=mock.Mock(),
+            DispatchMessage=mock.Mock(),
+        )
+        keyboard = SimpleNamespace(_os_keyboard=backend)
+        callback = mock.Mock()
+        with mock.patch("src.hotkey.sys.platform", "win32"):
+            _patch_windows_keyboard_message_loop(keyboard)
+            patched_listen = backend.listen
+            _patch_windows_keyboard_message_loop(keyboard)
+            self.assertIs(backend.listen, patched_listen)
+            backend.listen(callback)
+        backend.prepare_intercept.assert_called_once_with(callback)
+        self.assertEqual(received, [0x0400, 0x0400, 0x0012])
+        self.assertEqual(backend.TranslateMessage.call_count, 2)
+        self.assertEqual(backend.DispatchMessage.call_count, 2)
+
+    def test_windows_message_loop_reports_api_failure_without_dispatching(self):
+        import ctypes
+        from types import SimpleNamespace
+
+        from src.hotkey import _patch_windows_keyboard_message_loop
+
+        backend = SimpleNamespace(
+            listen=lambda callback: None,
+            prepare_intercept=mock.Mock(),
+            GetMessage=mock.Mock(return_value=-1),
+            TranslateMessage=mock.Mock(),
+            DispatchMessage=mock.Mock(),
+        )
+        with (
+            mock.patch("src.hotkey.sys.platform", "win32"),
+            mock.patch.object(ctypes, "get_last_error", return_value=87, create=True),
+            mock.patch.object(ctypes, "WinError", return_value=OSError("invalid message"), create=True) as error,
+        ):
+            _patch_windows_keyboard_message_loop(SimpleNamespace(_os_keyboard=backend))
+            with self.assertRaisesRegex(OSError, "invalid message"):
+                backend.listen(mock.Mock())
+        error.assert_called_once_with(87)
+        backend.TranslateMessage.assert_not_called()
+        backend.DispatchMessage.assert_not_called()
+
+    @unittest.skipUnless(sys.platform == "win32", "需要 Windows 消息队列")
+    def test_windows_message_loop_native_quit_without_installing_hooks(self):
+        import ctypes
+        from ctypes import wintypes
+        from types import SimpleNamespace
+
+        from src.hotkey import _patch_windows_keyboard_message_loop
+
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        pointer = ctypes.POINTER(wintypes.MSG)
+        get_message = user32.GetMessageW
+        get_message.argtypes = [pointer, wintypes.HWND, wintypes.UINT, wintypes.UINT]
+        get_message.restype = wintypes.BOOL
+        peek_message = user32.PeekMessageW
+        peek_message.argtypes = [pointer, wintypes.HWND, wintypes.UINT, wintypes.UINT, wintypes.UINT]
+        peek_message.restype = wintypes.BOOL
+        post_message = user32.PostThreadMessageW
+        post_message.argtypes = [wintypes.DWORD, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+        post_message.restype = wintypes.BOOL
+        ready = threading.Event()
+        errors = []
+
+        def prepare(_callback):
+            peek_message(ctypes.byref(wintypes.MSG()), None, 0, 0, 0)
+            ready.set()
+
+        backend = SimpleNamespace(
+            listen=lambda callback: None,
+            prepare_intercept=prepare,
+            GetMessage=get_message,
+            TranslateMessage=mock.Mock(),
+            DispatchMessage=mock.Mock(),
+        )
+        _patch_windows_keyboard_message_loop(SimpleNamespace(_os_keyboard=backend))
+
+        def run():
+            try:
+                backend.listen(lambda event: None)
+            except Exception as error:
+                errors.append(error)
+
+        worker = threading.Thread(target=run, daemon=True)
+        worker.start()
+        try:
+            self.assertTrue(ready.wait(3))
+            self.assertTrue(post_message(worker.native_id, 0x8000, 0, 0))
+            self.assertTrue(post_message(worker.native_id, 0x0012, 0, 0))
+            worker.join(3)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(errors, [])
+            backend.TranslateMessage.assert_called_once()
+            backend.DispatchMessage.assert_called_once()
+        finally:
+            if worker.is_alive():
+                post_message(worker.native_id, 0x0012, 0, 0)
+                worker.join(3)
+
+    def test_windows_message_loop_leaves_other_backends_untouched(self):
+        from types import SimpleNamespace
+
+        from src.hotkey import _patch_windows_keyboard_message_loop
+
+        original = mock.Mock()
+        backend = SimpleNamespace(listen=original)
+        keyboard = SimpleNamespace(_os_keyboard=backend)
+        with mock.patch("src.hotkey.sys.platform", "linux"):
+            _patch_windows_keyboard_message_loop(keyboard)
+        self.assertIs(backend.listen, original)
+        with mock.patch("src.hotkey.sys.platform", "win32"):
+            _patch_windows_keyboard_message_loop(keyboard)
+            _patch_windows_keyboard_message_loop(SimpleNamespace())
+        self.assertIs(backend.listen, original)
 
     def _fake_keyboard_module(self, should_raise=False, hook_raises=False):
         class FakeModule(object):

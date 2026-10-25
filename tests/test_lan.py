@@ -158,6 +158,24 @@ def _reset_transfer_state():
 # --- 测试 ---
 
 
+def test_import_bytes_respects_optional_resolution_limit(lan_env, monkeypatch):
+    cfg, db, tmp = lan_env
+    data = _valid_png(3000, 40)
+    cfg.set("import_resolution_limit_enabled", True)
+    cfg.set("import_resolution_limit_px", 2999)
+    rejected = lan._import_bytes(data, "wide.png")
+    assert rejected["ok"] is False
+    assert "2999" in rejected["error"]
+    assert db.get_by_hash(hashlib.sha256(data).hexdigest()) is None
+    cfg.set("import_resolution_limit_enabled", False)
+    with monkeypatch.context() as size_patch:
+        size_patch.setattr(lan, "MAX_FILE_SIZE", 1)
+        assert lan._import_bytes(data, "wide.png")["ok"] is False
+    accepted = lan._import_bytes(data, "wide.png")
+    assert accepted["ok"] is True
+    assert db.get_by_hash(hashlib.sha256(data).hexdigest())["width"] == 3000
+
+
 def test_udp_discovery(lan_env):
     cfg, db, tmp = lan_env
     udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)

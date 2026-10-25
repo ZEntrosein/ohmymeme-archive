@@ -80,6 +80,43 @@ def _log_hotkey_event(level, msg):
     getattr(logger, level)(msg)
 
 
+def _patch_windows_keyboard_message_loop(keyboard):
+    """为 keyboard 的 Windows 后端提供有效的消息缓冲区和退出判断。"""
+    if sys.platform != "win32":
+        return
+    backend = getattr(keyboard, "_os_keyboard", None)
+    required = (
+        "listen",
+        "prepare_intercept",
+        "GetMessage",
+        "TranslateMessage",
+        "DispatchMessage",
+    )
+    if backend is None or not all(hasattr(backend, name) for name in required):
+        return
+    if getattr(backend.listen, "_ohmymeme_safe_message_loop", False):
+        return
+
+    def listen(callback):
+        import ctypes
+        from ctypes.wintypes import MSG
+
+        backend.prepare_intercept(callback)
+        message = MSG()
+        message_pointer = ctypes.byref(message)
+        while True:
+            result = backend.GetMessage(message_pointer, 0, 0, 0)
+            if result == 0:
+                return
+            if result == -1:
+                raise ctypes.WinError(ctypes.get_last_error())
+            backend.TranslateMessage(message_pointer)
+            backend.DispatchMessage(message_pointer)
+
+    listen._ohmymeme_safe_message_loop = True
+    backend.listen = listen
+
+
 class GlobalHotkey:
     """全局快捷键管理器，自动尝试多种后端"""
 
@@ -129,6 +166,8 @@ class GlobalHotkey:
             return False
         try:
             import keyboard
+
+            _patch_windows_keyboard_message_loop(keyboard)
 
             def make_safe(fn):
                 def _safe_callback():

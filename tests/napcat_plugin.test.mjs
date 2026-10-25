@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { spawnSync } from 'node:child_process'
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -2928,6 +2929,156 @@ test('QQ drag bridge installs, reports status, and removes renderer listeners', 
   } finally {
     await __test.applyQQDragBridgeToWindows('stop', [window])
   }
+})
+
+test('an unresponsive drag window does not delay healthy windows', async () => {
+  let release
+  let healthyCalls = 0
+  const blocked = new Promise((resolve) => { release = resolve })
+  const windows = [
+    { webContents: { executeJavaScript() { return blocked } } },
+    { webContents: { async executeJavaScript() { healthyCalls += 1; return { enabled: true } } } },
+  ]
+  try {
+    const operation = __test.applyQQDragBridgeToWindows('start', windows, 40)
+    await new Promise(setImmediate)
+    assert.equal(healthyCalls, 1)
+    const results = await operation
+    assert.deepEqual(results[0], { index: 0, ok: false, timed_out: true })
+    assert.equal(results[1].status.enabled, true)
+  } finally {
+    release({ enabled: true })
+  }
+})
+
+test('timed-out drag operations are not enqueued again and late failure allows retry', async () => {
+  let reject
+  let calls = 0
+  const blocked = new Promise((_, fail) => { reject = fail })
+  const window = { webContents: { executeJavaScript() {
+    calls += 1
+    return calls === 1 ? blocked : Promise.resolve({ enabled: true })
+  } } }
+  try {
+    assert.equal((await __test.applyQQDragBridgeToWindows('start', [window], 20))[0].timed_out, true)
+    assert.equal((await __test.applyQQDragBridgeToWindows('start', [window], 20))[0].timed_out, true)
+    assert.equal(calls, 1)
+    reject(new Error('synthetic late renderer rejection'))
+    await new Promise(setImmediate)
+    assert.equal((await __test.applyQQDragBridgeToWindows('start', [window], 20))[0].ok, true)
+    assert.equal(calls, 2)
+  } finally {
+    reject(new Error('synthetic cleanup'))
+  }
+})
+
+test('destroyed windows and stale drag generations cannot inject', async () => {
+  let calls = 0
+  const window = { webContents: {
+    isDestroyed() { return true },
+    executeJavaScript() { calls += 1 },
+  } }
+  assert.deepEqual(await __test.applyQQDragBridgeToWindows('start', [window], 20), [])
+  assert.deepEqual(await __test.applyQQDragBridgeToWindows('start', [window], 20, () => false), [])
+  let current = true
+  window.webContents.isDestroyed = () => false
+  const operation = __test.applyQQDragBridgeToWindows('start', [window], 20, () => current)
+  current = false
+  assert.deepEqual(await operation, [])
+  assert.equal(calls, 0)
+})
+
+test('drag shutdown removes host listeners before waiting for an unresponsive renderer', async () => {
+  let release
+  let removed = 0
+  const blocked = new Promise((resolve) => { release = resolve })
+  const webContents = {
+    on() {},
+    removeListener() { removed += 1 },
+    executeJavaScript(script) {
+      return script.includes('const action = "stop"') ? blocked : Promise.resolve({ enabled: true })
+    },
+  }
+  try {
+    await __test.applyQQDragBridgeToWindows('start', [{ webContents }], 30)
+    assert.equal(__test.state.marketFaceConsoleHandlers.has(webContents), true)
+    const operation = __test.applyQQDragBridgeToWindows('stop', [{ webContents }], 30)
+    assert.equal(removed, 1)
+    assert.equal(__test.state.marketFaceConsoleHandlers.size, 0)
+    assert.equal((await operation)[0].timed_out, true)
+  } finally {
+    release({ enabled: false })
+  }
+})
+
+test('old drag refresh completion cannot release a new lifecycle busy flag', async () => {
+  const previous = {
+    active: __test.state.active,
+    qqDragBridgeEnabled: __test.state.qqDragBridgeEnabled,
+    qqDragBridgeBusy: __test.state.qqDragBridgeBusy,
+  }
+  let release
+  const blocked = new Promise((resolve) => { release = resolve })
+  try {
+    __test.state.active = true
+    __test.state.qqDragBridgeEnabled = true
+    __test.state.qqDragBridgeBusy = false
+    const generation = __test.state.qqDragBridgeGeneration
+    const operation = __test.refreshQQDragBridge(generation, [{ webContents: {
+      executeJavaScript() { return blocked },
+    } }], 30)
+    await new Promise(setImmediate)
+    assert.equal(__test.state.qqDragBridgeBusy, true)
+    __test.stopQQDragBridgeTimer()
+    __test.state.qqDragBridgeBusy = true
+    release({ enabled: true })
+    await operation
+    assert.equal(__test.state.qqDragBridgeBusy, true)
+    assert.deepEqual(await __test.refreshQQDragBridge(generation, [], 20), [])
+  } finally {
+    release({ enabled: true })
+    Object.assign(__test.state, previous)
+  }
+})
+
+test('plugin startup and shutdown finish even when a mocked Electron window never responds', () => {
+  const electron = 'export const BrowserWindow={getAllWindows(){return globalThis.__ohmymemeTestWindows}}'
+  const loader = `export async function resolve(specifier, context, next) {
+    if (specifier === 'electron') return {url: ${JSON.stringify(`data:text/javascript,${encodeURIComponent(electron)}`)}, shortCircuit: true}
+    return next(specifier, context)
+  }`
+  const pluginUrl = new URL('../napcat-plugin-ohmymeme-current-peer/index.mjs', import.meta.url).href
+  const child = spawnSync(process.execPath, [
+    '--no-warnings', '--loader', `data:text/javascript,${encodeURIComponent(loader)}`,
+    '--input-type=module', '-e', `
+      import assert from 'node:assert/strict'
+      const calls=[]
+      globalThis.__ohmymemeTestWindows=[
+        {webContents:{on(){},removeListener(){},executeJavaScript(script){calls.push('blocked');return new Promise(()=>{})}}},
+        {webContents:{on(){},removeListener(){},async executeJavaScript(script){calls.push('healthy');return {enabled:true}}}},
+      ]
+      const {plugin_init,plugin_cleanup,__test}=await import(${JSON.stringify(pluginUrl)})
+      const ctx={logger:{info(){},warn(){},error(){}},router:{get(){}},core:{eventWrapper:{createListenerFunction(){return {}}},apis:{}}}
+      const start=Date.now()
+      await plugin_init(ctx)
+      const startupMs=Date.now()-start
+      assert.equal(__test.state.active,true)
+      await new Promise(setImmediate)
+      assert.equal(calls.includes('healthy'),true)
+      const stop=Date.now()
+      await plugin_cleanup()
+      assert.equal(__test.state.active,false)
+      assert.equal(__test.state.qqDragBridgeTimer,null)
+      assert.equal(__test.state.marketFaceConsoleHandlers.size,0)
+      console.log(JSON.stringify({startupMs,shutdownMs:Date.now()-stop,realQQAccess:false}))
+    `,
+  ], { encoding: 'utf8', timeout: 12000 })
+  assert.equal(child.error, undefined)
+  assert.equal(child.status, 0, child.stderr)
+  const result = JSON.parse(child.stdout.trim())
+  assert.equal(result.realQQAccess, false)
+  assert.ok(result.startupMs < 1000)
+  assert.ok(result.shutdownMs < 5000)
 })
 
 test('production QQ drag bridge does not collect renderer diagnostics or visible content', () => {

@@ -141,6 +141,12 @@ function toggleSilentStart() {
   if (row) row.style.display = autoStart ? '' : 'none';
 }
 
+function toggleImportResolutionLimit() {
+  const enabled = document.getElementById('s-import-resolution-limit-enabled')?.checked === true;
+  const pixels = document.getElementById('s-import-resolution-limit-px');
+  if (pixels) pixels.disabled = !enabled;
+}
+
 async function exportLogs() {
   const status = document.getElementById('log-export-status');
   status.textContent = '正在导出...';
@@ -204,6 +210,7 @@ function collectNapCatSettings() {
     napcat_command: document.getElementById('s-napcat-command')?.value.trim() || '/omm',
     napcat_send_mode: document.getElementById('s-napcat-send-mode')?.value || 'original_native',
     napcat_image_send_mode: document.getElementById('s-napcat-image-send-mode')?.value || 'sticker',
+    qq_drag_cleanup_on_start: document.getElementById('s-qq-drag-cleanup-on-start')?.checked !== false,
   };
 }
 
@@ -556,10 +563,17 @@ async function getSettings() {
   if (ss) ss.checked = s.silent_start === true;
   const hiddenCollection = document.getElementById('s-hidden-collection-enabled');
   if (hiddenCollection) hiddenCollection.checked = s.hidden_collection_enabled !== false;
+  const categoryUncategorized = document.getElementById('s-show-category-uncategorized');
+  if (categoryUncategorized) categoryUncategorized.checked = s.show_category_uncategorized === true;
   const hierarchyDeleteMode = document.getElementById('s-hierarchy-delete-mode');
   if (hierarchyDeleteMode) hierarchyDeleteMode.value = ['promote', 'cascade'].includes(s.hierarchy_delete_mode) ? s.hierarchy_delete_mode : 'ask';
   const largeMemeImportMode = document.getElementById('s-large-meme-import-mode');
   if (largeMemeImportMode) largeMemeImportMode.value = ['keep_original', 'compressed_only'].includes(s.large_meme_import_mode) ? s.large_meme_import_mode : 'ask';
+  const importResolutionLimit = document.getElementById('s-import-resolution-limit-enabled');
+  if (importResolutionLimit) importResolutionLimit.checked = s.import_resolution_limit_enabled === true;
+  const importResolutionPixels = document.getElementById('s-import-resolution-limit-px');
+  if (importResolutionPixels) importResolutionPixels.value = String(s.import_resolution_limit_px ?? 2560);
+  toggleImportResolutionLimit();
   const rec = document.getElementById('s-record-recent');
   if (rec) rec.checked = s.record_recent_use !== false;
   const searchDescription = document.getElementById('s-search-description');
@@ -655,6 +669,8 @@ async function getSettings() {
   if (napcatSendMode) napcatSendMode.value = s.napcat_send_mode || 'original_native';
   const napcatImageSendMode = document.getElementById('s-napcat-image-send-mode');
   if (napcatImageSendMode) napcatImageSendMode.value = s.napcat_image_send_mode || 'sticker';
+  const qqDragCleanup = document.getElementById('s-qq-drag-cleanup-on-start');
+  if (qqDragCleanup) qqDragCleanup.checked = s.qq_drag_cleanup_on_start !== false;
   const tgtd = document.getElementById('s-tg-tdata');
   if (tgtd && s.tg_tdata_path) tgtd.value = s.tg_tdata_path;
   checkConnectivity();  // DeepSeek V4 Flash
@@ -934,8 +950,12 @@ async function saveSettings() {
   const auto_start = document.getElementById('s-auto-start')?.checked === true;
   const silent_start = document.getElementById('s-silent-start')?.checked === true;
   const hidden_collection_enabled = document.getElementById('s-hidden-collection-enabled')?.checked !== false;
+  const show_category_uncategorized = document.getElementById('s-show-category-uncategorized')?.checked === true;
   const hierarchy_delete_mode = document.getElementById('s-hierarchy-delete-mode')?.value || 'ask';
   const large_meme_import_mode = document.getElementById('s-large-meme-import-mode')?.value || 'ask';
+  const import_resolution_limit_enabled = document.getElementById('s-import-resolution-limit-enabled')?.checked === true;
+  const importPixelValue = parseInt(document.getElementById('s-import-resolution-limit-px')?.value || '2560', 10);
+  const import_resolution_limit_px = Math.max(1, Math.min(Number.isFinite(importPixelValue) ? importPixelValue : 2560, 65535));
   const record_recent_use = document.getElementById('s-record-recent')?.checked !== false;
   const search_description = document.getElementById('s-search-description')?.checked !== false;
   const search_image_text = document.getElementById('s-search-image-text')?.checked !== false;
@@ -963,6 +983,8 @@ async function saveSettings() {
     try_original_image: try_original,  // DeepSeek V4 Flash
     copy_resize_mode: copy_mode,
     auto_start, silent_start, hidden_collection_enabled, hierarchy_delete_mode, large_meme_import_mode, record_recent_use,
+    show_category_uncategorized,
+    import_resolution_limit_enabled, import_resolution_limit_px,
     search_description, search_image_text,
     show_startup_animation, virtual_drive_compat, bulk_read_protection,
     bulk_read_batch_size, bulk_read_pause_seconds, bulk_read_prefetch_pages,
@@ -1055,8 +1077,15 @@ async function resetSettings() {
     if (hierarchyDeleteMode) hierarchyDeleteMode.value = s.hierarchy_delete_mode || 'ask';
     const hiddenCollection = document.getElementById('s-hidden-collection-enabled');
     if (hiddenCollection) hiddenCollection.checked = s.hidden_collection_enabled !== false;
+    const categoryUncategorized = document.getElementById('s-show-category-uncategorized');
+    if (categoryUncategorized) categoryUncategorized.checked = s.show_category_uncategorized === true;
     const largeMemeImportMode = document.getElementById('s-large-meme-import-mode');
     if (largeMemeImportMode) largeMemeImportMode.value = s.large_meme_import_mode || 'ask';
+    const importResolutionLimit = document.getElementById('s-import-resolution-limit-enabled');
+    if (importResolutionLimit) importResolutionLimit.checked = s.import_resolution_limit_enabled === true;
+    const importResolutionPixels = document.getElementById('s-import-resolution-limit-px');
+    if (importResolutionPixels) importResolutionPixels.value = String(s.import_resolution_limit_px ?? 2560);
+    toggleImportResolutionLimit();
     toggleSilentStart();
     checkConnectivity();  // DeepSeek V4 Flash
     const ff = document.getElementById('s-sync-fetch');
@@ -1149,6 +1178,8 @@ async function resetSettings() {
     if (napcatSendMode) napcatSendMode.value = s.napcat_send_mode || 'original_native';
     const napcatImageSendMode = document.getElementById('s-napcat-image-send-mode');
     if (napcatImageSendMode) napcatImageSendMode.value = s.napcat_image_send_mode || 'sticker';
+    const qqDragCleanup = document.getElementById('s-qq-drag-cleanup-on-start');
+    if (qqDragCleanup) qqDragCleanup.checked = s.qq_drag_cleanup_on_start !== false;
     const napcatStatus = document.getElementById('napcat-status');
     if (napcatStatus) { napcatStatus.textContent = ''; setStatusColor(napcatStatus, ''); }
     refreshNapCatListenerStatus();

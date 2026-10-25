@@ -46,8 +46,36 @@ _SECRET_KEYS = {
 }
 
 # ~~~ 导入限制 ~~~（原件保留；日常使用副本另行压缩）
-_IMPORT_MAX_PX = 2560  # 最长边像素上限（超过 2K）
+_IMPORT_MAX_PX = 2560  # 可选最长边限制的默认阈值
 _IMPORT_MAX_BYTES = 200 * 1024 * 1024  # 原件硬上限（200 MiB）
+
+
+def normalize_import_max_px(value):
+    """规范化可选的导入最长边阈值。"""
+    try:
+        if isinstance(value, bool):
+            return _IMPORT_MAX_PX
+        return max(1, min(65535, int(value)))
+    except (TypeError, ValueError, OverflowError):
+        return _IMPORT_MAX_PX
+
+
+def get_import_max_px(cfg=None):
+    """返回当前导入最长边上限，0 表示不限制。"""
+    cfg = cfg if cfg is not None else get_config()
+    if cfg.get("import_resolution_limit_enabled", False) is not True:
+        return 0
+    return normalize_import_max_px(
+        cfg.get("import_resolution_limit_px", _IMPORT_MAX_PX)
+    )
+
+
+def normalize_library_genres(value):
+    """规范化主窗口体裁选择，保留全部取消的空列表。"""
+    genres = ["image", "gif", "chat_record"]
+    if not isinstance(value, list):
+        return genres
+    return [genre for genre in genres if genre in value]
 
 
 def _get_config_dir() -> Path:
@@ -101,6 +129,8 @@ class Config:
         # 超过 20 MiB 的普通媒体：ask 每次询问；keep_original 保留原件；
         # compressed_only 仅归档日常压缩版。聊天记录媒体不经过此设置。
         "large_meme_import_mode": "ask",
+        "import_resolution_limit_enabled": False,
+        "import_resolution_limit_px": _IMPORT_MAX_PX,
         # 本地备份
         "backup_dir": "",  # 自定义备份输出目录（空=默认 data_dir/backups）
         # 云端同步
@@ -164,6 +194,7 @@ class Config:
         "napcat_command": "/omm",
         "napcat_send_mode": "original_native",
         "napcat_image_send_mode": "sticker",
+        "qq_drag_cleanup_on_start": True,  # 启动时清理超过一天的拖拽凭证和占位图
         # Telegram 导入
         "tg_tdata_path": "",  # 手动指定的 Telegram tdata 目录
         # Notion 只读导入
@@ -178,6 +209,7 @@ class Config:
         "notion_version": "2026-03-11",
         # UI
         "theme": "dark",
+        "library_genres": ["image", "gif", "chat_record"],
         "window_x": -1,
         "window_y": -1,
         "auto_play_gif": True,
@@ -187,6 +219,7 @@ class Config:
         "search_description": True,
         "search_image_text": True,
         "show_uncategorized": True,  # 显示「未分组」分组
+        "show_category_uncategorized": False,
         # “隐藏”系统分组及其子级内容只在该子树中显示
         "hidden_collection_enabled": True,
         # 删除分组/类别层级：ask 每次询问；promote 提升子级；cascade 删除子树
@@ -212,6 +245,12 @@ class Config:
         return val
 
     def set(self, key: str, value):
+        if key == "import_resolution_limit_px":
+            value = normalize_import_max_px(value)
+        elif key in ("import_resolution_limit_enabled", "show_category_uncategorized"):
+            value = value is True
+        elif key == "library_genres":
+            value = normalize_library_genres(value)
         if key in _SECRET_KEYS and value:
             value = encrypt_data(str(value))
         self._data[key] = value

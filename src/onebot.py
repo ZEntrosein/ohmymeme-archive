@@ -64,6 +64,50 @@ _CHAT_RECORD_SEND_MODES = {
 _IMAGE_SEND_MODES = {"sticker", "image"}
 
 
+def cleanup_qq_drag_temp_files():
+    """只清理系统临时目录内超过 24 小时的 QQ 拖拽凭证和占位图。"""
+    pattern = re.compile(
+        r"ohmymeme-market-face-"
+        r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}"
+        r"(?:\.ommchat|-drag-icon\.png)",
+        re.IGNORECASE,
+    )
+    cutoff = time.time() - 24 * 60 * 60
+    result = {"removed": 0, "bytes": 0, "failed": 0}
+    try:
+        root = Path(tempfile.gettempdir()).resolve(strict=True)
+        with os.scandir(root) as entries:
+            for entry in entries:
+                if not pattern.fullmatch(entry.name):
+                    continue
+                try:
+                    if not entry.is_file(follow_symlinks=False):
+                        continue
+                    info = entry.stat(follow_symlinks=False)
+                    if getattr(info, "st_file_attributes", 0) & 0x400:
+                        continue
+                    if info.st_mtime >= cutoff:
+                        continue
+                    Path(entry.path).unlink()
+                    result["removed"] += 1
+                    result["bytes"] += info.st_size
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    result["failed"] += 1
+    except OSError as exc:
+        result["failed"] += 1
+        logger.warning("QQ 拖拽临时目录清理失败: %s", exc)
+    if result["removed"] or result["failed"]:
+        logger.info(
+            "QQ 拖拽临时文件清理: 删除 %s 个（%s 字节），失败 %s 个",
+            result["removed"],
+            result["bytes"],
+            result["failed"],
+        )
+    return result
+
+
 def _open_request(request, timeout):
     """使用禁止重定向的 opener 发起请求。"""
     return _HTTP_OPENER.open(request, timeout=timeout)

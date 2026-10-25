@@ -853,6 +853,37 @@ def test_cloud_download_success(js, monkeypatch):
     assert js.db.is_favorite(row["id"]) is True
 
 
+def test_cloud_download_respects_optional_resolution_limit(js, monkeypatch):
+    import io
+    from PIL import Image
+    from src import webui as webui_module
+
+    output = io.BytesIO()
+    Image.new("RGB", (3000, 40), (30, 90, 150)).save(output, "PNG")
+    data = output.getvalue()
+    sha = hashlib.sha256(data).hexdigest()
+    _set_cloud(js, {"memes": [{"filename": "wide.png", "sha256": sha}]})
+    monkeypatch.setattr(
+        sync, "download_single", lambda remote, local: Path(local).write_bytes(data)
+    )
+    monkeypatch.setattr(js.api, "copy_meme", lambda mid: {"ok": True})
+    notified = []
+    monkeypatch.setattr(webui_module, "_notify_cloud_ready", lambda: notified.append(1))
+    js.cfg.set("import_resolution_limit_enabled", True)
+    js.cfg.set("import_resolution_limit_px", 2999)
+    rejected = js.api.cloud_download("wide.png")
+    assert rejected["status"] == "too_large"
+    assert js.db.get_by_hash(sha) is None
+    js.cfg.set("import_resolution_limit_enabled", False)
+    assert js.api.cloud_download("wide.png")["ok"] is True
+    assert js.db.get_by_hash(sha)["width"] == 3000
+    for _ in range(200):
+        if notified:
+            break
+        time.sleep(0.01)
+    assert notified == [1]
+
+
 def test_cloud_download_sha_mismatch(js, monkeypatch):
     from src import webui as webui_module
 
@@ -1036,6 +1067,177 @@ def test_cloud_cold_cache_loads_empty_local_library_and_hierarchy(js, monkeypatc
     assert _names(js.api.search_memes(collection_id=group["id"])) == ["c.png"]
     with webui_module._cloud_lock:
         assert webui_module._cloud_state["loaded"] is True
+
+
+def test_category_direct_entries_only_appear_for_parents_when_enabled(js):
+    parent = js.db.create_category("动物")
+    child = js.db.create_category("猫", parent_id=parent)
+    grandchild = js.db.create_category("幼猫", parent_id=child)
+    empty = js.db.create_category("空类别")
+    js.db.create_category("空子类别", parent_id=empty)
+    meme = js.db.add_meme("parent.png", category_id=parent)
+    js.db.add_meme("child.png", category_id=child)
+    chat = js.db.save_chat_record(
+        {"title": "直接归属", "source": {"self_id": 1, "message_id": 1}, "summary": {}}
+    )["id"]
+    js.db.set_chat_category(chat, parent)
+    _set_cloud(js, {"memes": []})
+    original_categories = js.db.get_categories()
+
+    def walk(items):
+        for item in items:
+            yield item
+            yield from walk(item.get("children", []))
+
+    assert js.cfg.get("show_category_uncategorized") is False
+    assert not any(
+        "direct_category_id" in item for item in walk(js.api.get_categories())
+    )
+    js.cfg.set("show_category_uncategorized", True)
+    tree = js.api.get_categories()
+    nodes = {item["id"]: item for item in walk(tree)}
+    assert nodes[-parent - 4]["count"] == 2
+    assert nodes[-child - 4]["count"] == 1
+    assert nodes[-empty - 4]["count"] == 0
+    assert nodes[-parent - 4]["direct_category_id"] == parent
+    assert nodes[-parent - 4]["path"] == "动物/未分类"
+    assert nodes[parent]["children"][0]["id"] == -parent - 4
+    assert "children" not in nodes[grandchild]
+    assert len([item for item in nodes.values() if "direct_category_id" in item]) == 3
+    assert js.db.get_categories() == original_categories
+    assert js.db.get_by_id(meme)["category_id"] == parent
+    for options in (
+        js.api._build_category_options(),
+        js.api.search_categories(),
+        js.api.get_meme_details(meme)["all_categories"],
+        js.api.get_chat_record_details(chat)["all_categories"],
+    ):
+        assert not any("direct_category_id" in item for item in walk(options))
+    init = js.api.get_init_data()
+    assert any("direct_category_id" in item for item in walk(init["categories"]))
+    js.cfg.set("show_category_uncategorized", False)
+    assert not any(
+        "direct_category_id" in item for item in walk(js.api.get_categories())
+    )
+
+
+def test_category_direct_filter_covers_chat_images_cloud_and_hidden(js):
+    parent = js.db.create_category("动物")
+    child = js.db.create_category("猫", parent_id=parent)
+    grandchild = js.db.create_category("幼猫", parent_id=child)
+    picture = js.db.add_meme("match.png", category_id=parent, tags=["match"])
+    gif = js.db.add_meme("match.gif", category_id=parent, tags=["match"])
+    nested = js.db.add_meme("nested.png", category_id=grandchild)
+    js.db.add_meme("root.png")
+    hidden_meme = js.db.add_meme("hidden.png", category_id=parent)
+    hidden_collection = js.db.ensure_hidden_collection()
+    js.db.add_to_collection(hidden_meme, hidden_collection)
+    direct_chat = js.db.save_chat_record(
+        {
+            "title": "match chat",
+            "source": {"self_id": 1, "message_id": 1},
+            "summary": {},
+        }
+    )["id"]
+    nested_chat = js.db.save_chat_record(
+        {
+            "title": "nested chat",
+            "source": {"self_id": 1, "message_id": 2},
+            "summary": {},
+        }
+    )["id"]
+    hidden_chat = js.db.save_chat_record(
+        {
+            "title": "hidden chat",
+            "source": {"self_id": 1, "message_id": 3},
+            "summary": {},
+        }
+    )["id"]
+    js.db.update_chat_record_details(direct_chat, ["match"], category_id=parent)
+    js.db.set_chat_category(nested_chat, grandchild)
+    js.db.update_chat_record_details(
+        hidden_chat, [], category_id=parent, collection_ids=[hidden_collection]
+    )
+    _set_cloud(
+        js,
+        {
+            "memes": [
+                {
+                    "filename": "cloud.png",
+                    "name": "match cloud",
+                    "sha256": SHA_A,
+                    "category_path": ["动物"],
+                    "tags": ["match"],
+                },
+                {
+                    "filename": "nested-cloud.png",
+                    "sha256": SHA_B,
+                    "category_path": ["动物", "猫"],
+                },
+                {"filename": "root-cloud.png", "sha256": SHA_C},
+            ]
+        },
+    )
+    js.cfg.set("show_category_uncategorized", True)
+    direct_id = -parent - 4
+    result = js.api.search_library(category_id=direct_id)
+    assert result["total"] == 4
+    assert {row["id"] for row in result["chat_records"]} == {direct_chat}
+    assert set(_names(result["memes"])) == {"match.png", "match.gif", "cloud.png"}
+    assert js.api.count_memes(category_id=direct_id) == 3
+    assert js.api.count_library(category_id=direct_id) == 4
+    assert js.api.count_library(category_id=parent) == 7
+    assert js.api.count_library(category_id=-child - 4) == 1
+    assert js.api.count_library(category_id=-4) == 2
+    for genre, expected in (("image", 2), ("gif", 1), ("chat_record", 1)):
+        assert js.api.count_library(category_id=direct_id, genre=[genre]) == expected
+    assert js.api.count_library(category_id=direct_id, genre=[]) == 0
+    assert (
+        js.api.count_library(keyword="match", tags=["match"], category_id=direct_id)
+        == 4
+    )
+    assert js.api.count_library(keyword="nested", category_id=direct_id) == 0
+    page = js.api.search_library(category_id=direct_id, offset=1, limit=2)
+    assert page["total"] == 4
+    assert len(page["memes"]) == 2
+    assert page["chat_records"] == []
+    tail = js.api.search_library(category_id=direct_id, offset=3, limit=2)
+    assert _names(tail["memes"]) == ["cloud.png"]
+    parent_node = next(item for item in js.api.get_categories() if item["id"] == parent)
+    assert parent_node["children"][0]["count"] == 4
+    assert {row["id"] for row in js.api._search_meme_rows(category_id=direct_id)} == {
+        picture,
+        gif,
+    }
+    assert nested not in {row["id"] for row in result["memes"] if "id" in row}
+
+
+def test_category_direct_warmup_stays_in_current_category(js, monkeypatch):
+    from src import webui as webui_module
+
+    parent = js.db.create_category("父级")
+    child = js.db.create_category("子级", parent_id=parent)
+    direct = js.db.add_meme("direct.png", category_id=parent)
+    js.db.add_meme("nested.png", category_id=child)
+    chat = js.db.save_chat_record(
+        {
+            "title": "direct chat",
+            "source": {"self_id": 1, "message_id": 1},
+            "summary": {},
+        }
+    )["id"]
+    js.db.set_chat_category(chat, parent)
+    _set_cloud(js, {"memes": []})
+    warmed = []
+    monkeypatch.setattr(webui_module.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(js.api, "_page_cache_is_current", lambda generation: True)
+    js.api._webui._get_thumbnail_path = lambda mid, filename, **kwargs: warmed.append(
+        mid
+    )
+    js.api._run_page_cache_warmup(
+        1, "", [], None, 1, 1, 2, -parent - 4, ["image", "gif", "chat_record"]
+    )
+    assert warmed == [direct]
 
 
 def test_cloud_download_keeps_category_path_and_compressed_source(js, monkeypatch):

@@ -52,7 +52,7 @@ class _FakeWindow:
         self.events = type(
             "FakeEvents",
             (),
-            {"shown": _FakeEvent()},
+            {"shown": _FakeEvent(), "loaded": _FakeEvent()},
         )()
 
     def move(self, x, y):
@@ -251,15 +251,220 @@ def test_crypto():
         assert dec == s
 
 
-def test_clipboard():
-    result = copy_text("test")
-    assert isinstance(result, bool)
-    icon_path = (
-        Path(__file__).resolve().parent.parent / "src" / "resources" / "icon.png"
+def test_clipboard(tmp_path, monkeypatch):
+    """验证复制分发，不触碰真实剪贴板或把应用图标写入历史。"""
+    from src import clipboard_util
+
+    clipboard = mock.Mock()
+    monkeypatch.setattr(clipboard_util, "HAS_PYPERCLIP", True)
+    monkeypatch.setattr(clipboard_util, "pyperclip", clipboard, raising=False)
+    assert copy_text("test") is True
+    clipboard.copy.assert_called_once_with("test")
+    for name in ("_copy_image_windows", "_copy_image_macos", "_copy_image_linux"):
+        monkeypatch.setattr(clipboard_util, name, mock.Mock(return_value=True))
+    image_path = tmp_path / "test-image.png"
+    image_path.write_bytes(b"mock image")
+    assert copy_image_to_clipboard(str(image_path)) is True
+
+
+def test_native_text_clipboard_formats_and_failure_cleanup(monkeypatch):
+    """原生格式和内存所有权全部用假 Win32 API 验证。"""
+    import ctypes
+
+    from src.clipboard_util import copy_text_with_history
+
+    for failure in (
+        None,
+        "register",
+        "allocate",
+        "lock",
+        "open",
+        "empty",
+        49153,
+        49154,
+        13,
+    ):
+        user32 = mock.Mock()
+        kernel32 = mock.Mock()
+        buffers = {}
+        transferred = []
+        formats = {
+            "CanUploadToCloudClipboard": 49153,
+            "CanIncludeInClipboardHistory": 49154,
+        }
+        user32.RegisterClipboardFormatW.side_effect = lambda name: (
+            0 if failure == "register" else formats[name]
+        )
+        user32.OpenClipboard.return_value = failure != "open"
+        user32.EmptyClipboard.return_value = failure != "empty"
+
+        def allocate(flags, size):
+            handle = len(buffers) + 1
+            if failure == "allocate" and handle == 2:
+                return 0
+            buffers[handle] = ctypes.create_string_buffer(size)
+            return handle
+
+        def lock(handle):
+            if failure == "lock" and handle == 2:
+                return 0
+            return ctypes.addressof(buffers[handle])
+
+        def set_data(fmt, handle):
+            if failure == fmt:
+                return 0
+            transferred.append(handle)
+            return handle
+
+        kernel32.GlobalAlloc.side_effect = allocate
+        kernel32.GlobalLock.side_effect = lock
+        user32.SetClipboardData.side_effect = set_data
+        with monkeypatch.context() as patcher:
+            patcher.setattr(
+                ctypes,
+                "WinDLL",
+                lambda name, **kwargs: user32 if name == "user32" else kernel32,
+                raising=False,
+            )
+            result = copy_text_with_history("灰头土脸", 0x123456789)
+        assert result is (failure is None)
+        freed = {call.args[0] for call in kernel32.GlobalFree.call_args_list}
+        assert freed == set(buffers) - set(transferred)
+        if user32.OpenClipboard.called and failure != "open":
+            user32.CloseClipboard.assert_called_once_with()
+        else:
+            user32.CloseClipboard.assert_not_called()
+        if failure is None:
+            user32.OpenClipboard.assert_called_once_with(0x123456789)
+            assert [
+                call.args[0] for call in user32.SetClipboardData.call_args_list
+            ] == [
+                49153,
+                49154,
+                13,
+            ]
+            assert int.from_bytes(bytes(buffers[1]), "little") == 0
+            assert int.from_bytes(bytes(buffers[2]), "little") == 1
+            assert bytes(buffers[3]).decode("utf-16-le") == "灰头土脸\x00"
+
+
+def test_native_text_clipboard_invalid_input_never_opens_clipboard(monkeypatch):
+    import ctypes
+
+    from src.clipboard_util import copy_text_with_history
+
+    load = mock.Mock(side_effect=AssertionError("不得访问真实 Win32 API"))
+    monkeypatch.setattr(ctypes, "WinDLL", load, raising=False)
+    for value in (None, "", "a\x00b", "\ud800", "x" * (2 * 1024 * 1024)):
+        assert copy_text_with_history(value, 123) is False
+    assert copy_text_with_history("text", None) is False
+    load.assert_not_called()
+
+
+def test_editor_text_copy_uses_the_correct_window(monkeypatch):
+    import inspect
+    from types import SimpleNamespace
+
+    from src import webui
+
+    monkeypatch.setattr(webui.platform, "system", lambda: "Windows")
+    write = mock.Mock(return_value=True)
+    monkeypatch.setattr(webui, "copy_text_with_history", write)
+    ui = SimpleNamespace(
+        _window=SimpleNamespace(native=SimpleNamespace(Handle=101)),
+        _settings_window=SimpleNamespace(
+            native=SimpleNamespace(Handle=SimpleNamespace(ToInt64=lambda: 202))
+        ),
     )
-    if icon_path.exists():
-        result = copy_image_to_clipboard(str(icon_path))
-        assert isinstance(result, bool)
+    for api_class, owner in ((webui.JsApi, 101), (webui.SettingsApi, 202)):
+        api = api_class.__new__(api_class)
+        api._webui = ui
+        assert api.copy_editor_text("灰头土脸") is True
+        write.assert_called_with("灰头土脸", owner)
+    monkeypatch.setattr(webui.platform, "system", lambda: "Linux")
+    assert webui._copy_editor_text("text", ui._window) is False
+    assert write.call_count == 2
+    assert "events.loaded" in inspect.getsource(webui.WebUI.start)
+    assert "events.loaded" in inspect.getsource(webui.WebUI._create_settings_window)
+
+
+def test_editor_text_copy_bridge_preserves_private_fields_and_fallback():
+    import shutil
+
+    import pytest
+
+    from src.webui import _TEXT_CLIPBOARD_SCRIPT
+
+    root = Path(__file__).resolve().parent.parent
+    node = shutil.which("node")
+    if not node or not (root / "node_modules" / "jsdom").is_dir():
+        pytest.skip("编辑框复制测试需要 Node 和 jsdom")
+    script = r"""
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const { JSDOM } = require('jsdom');
+const dom = new JSDOM(`<input id="text" value="前缀灰头土脸后缀">
+  <textarea id="textarea">多行\n文本</textarea>
+  <input id="password" type="password" value="private">
+  <input id="revealed" autocomplete="section-login current-password" value="private">
+  <input id="readonly" readonly value="readonly"><div id="body">页面文字</div>`,
+  {runScripts:'outside-only'});
+const win = dom.window, doc = win.document, calls = [], fallback = [];
+let success = true;
+win.pywebview = {api:{copy_editor_text:async text => {calls.push(text);return success;}}};
+const source = fs.readFileSync(0,'utf8');
+win.eval(source); win.eval(source);
+const copy = (id,start,end) => {
+  const input = doc.getElementById(id); input.focus();
+  if(input.setSelectionRange) input.setSelectionRange(start,end);
+  const e = new win.Event('copy',{bubbles:true,cancelable:true});
+  input.dispatchEvent(e); return e;
+};
+doc.execCommand = name => {
+  fallback.push(name);
+  assert.equal(copy('text',2,6).defaultPrevented,false);
+  return true;
+};
+const flush = async () => {
+  for (let i=0;i<4;i++) await new Promise(resolve=>setTimeout(resolve,0));
+};
+(async()=>{
+  assert.equal(copy('text',2,6).defaultPrevented,true);
+  await flush(); assert.deepEqual(calls,['灰头土脸']);
+  assert.equal(doc.getElementById('text').selectionStart,2);
+  assert.equal(copy('body',0,1).defaultPrevented,false);
+  assert.equal(copy('password',0,7).defaultPrevented,false);
+  assert.equal(copy('revealed',0,7).defaultPrevented,false);
+  assert.equal(copy('text',2,2).defaultPrevented,false);
+  assert.equal(copy('body',0,1).defaultPrevented,false);
+  await flush(); assert.equal(calls.length,1);
+  assert.equal(copy('textarea',0,5).defaultPrevented,true);
+  assert.equal(copy('readonly',0,8).defaultPrevented,true);
+  await flush(); assert.deepEqual(calls,['灰头土脸','多行\n文本','readonly']);
+  const input=doc.getElementById('text');
+  input.value='first'; copy('text',0,5);
+  input.value='second'; copy('text',0,6); await flush();
+  assert.deepEqual(calls.slice(-2),['first','second']);
+  input.value='前缀灰头土脸后缀';
+  success=false; copy('text',2,6); await flush();
+  assert.deepEqual(fallback,['copy']);
+  copy('text',2,6); doc.getElementById('text').value='new edit'; await flush();
+  assert.deepEqual(fallback,['copy']);
+  win.pywebview=null;
+  assert.equal(copy('text',0,3).defaultPrevented,false);
+  dom.window.close();
+})().catch(error=>{console.error(error);process.exitCode=1;});
+"""
+    result = subprocess.run(
+        [node, "-e", script],
+        input=_TEXT_CLIPBOARD_SCRIPT,
+        cwd=root,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_webui_import():
@@ -804,6 +1009,141 @@ def test_manifest_include_favorites_settings_contract():
     assert '"manifest_include_favorites": True' in reset_src
 
 
+def test_import_resolution_limit_settings_contract(tmp_path):
+    import inspect
+
+    from src.config import get_import_max_px
+    from src.webui import HTML_DIR, JsApi, SettingsApi
+
+    settings_html = (HTML_DIR / "settings.html").read_text(encoding="utf-8")
+    settings_js = (HTML_DIR / "settings.js").read_text(encoding="utf-8")
+    assert 'id="s-import-resolution-limit-enabled"' in settings_html
+    assert 'id="s-import-resolution-limit-px"' in settings_html
+    assert settings_js.count("s.import_resolution_limit_enabled === true") == 2
+    assert "import_resolution_limit_enabled, import_resolution_limit_px," in settings_js
+    assert "pixels.disabled = !enabled" in settings_js
+    for api_class in (JsApi, SettingsApi):
+        get_source = inspect.getsource(api_class.get_settings)
+        assert '"import_resolution_limit_enabled"' in get_source
+        assert '"import_resolution_limit_px"' in get_source
+        assert '"import_resolution_limit_enabled": False' in inspect.getsource(
+            api_class.reset_settings
+        )
+
+    cfg = Config(tmp_path / "config.json")
+    api = SettingsApi.__new__(SettingsApi)
+    api._cfg = cfg
+    assert api.save_settings(
+        {"import_resolution_limit_enabled": True, "import_resolution_limit_px": "4096"}
+    ) == {"ok": True}
+    assert get_import_max_px(Config(tmp_path / "config.json")) == 4096
+    assert api.save_settings({"import_resolution_limit_enabled": False}) == {"ok": True}
+    assert get_import_max_px(Config(tmp_path / "config.json")) == 0
+
+
+def test_category_direct_settings_contract_and_refresh(tmp_path, monkeypatch):
+    import inspect
+    from types import SimpleNamespace
+
+    from src import webui as webui_module
+    from src.webui import HTML_DIR, JsApi, SettingsApi
+
+    cfg = Config(tmp_path / "config.json")
+    assert cfg.get("show_category_uncategorized") is False
+    html = (HTML_DIR / "settings.html").read_text(encoding="utf-8")
+    javascript = (HTML_DIR / "settings.js").read_text(encoding="utf-8")
+    assert 'id="s-show-category-uncategorized"' in html
+    assert javascript.count("s.show_category_uncategorized === true") == 2
+    assert "show_category_uncategorized," in javascript
+    window = mock.Mock()
+    monkeypatch.setattr(webui_module, "webview", SimpleNamespace(windows=[window]))
+    monkeypatch.setattr(webui_module, "_cloud_reset", lambda: None)
+    monkeypatch.setattr(webui_module.onebot, "stop_command_listener", lambda: None)
+    monkeypatch.setattr("src.platform_util.set_auto_start", lambda enabled: None)
+    for api_class in (JsApi, SettingsApi):
+        api = api_class.__new__(api_class)
+        api._cfg = cfg
+        api._webui = SimpleNamespace(_on_hotkey_change=lambda key: None)
+        assert api.get_settings()["show_category_uncategorized"] is False
+        assert '"show_category_uncategorized": False' in inspect.getsource(
+            api_class.reset_settings
+        )
+        api.save_settings({"show_category_uncategorized": True})
+        assert (
+            Config(tmp_path / "config.json").get("show_category_uncategorized") is True
+        )
+        assert api.get_settings()["show_category_uncategorized"] is True
+        if api_class is SettingsApi:
+            assert "refreshLibrary('structure')" in window.evaluate_js.call_args.args[0]
+        reset = api.reset_settings()
+        assert reset["show_category_uncategorized"] is False
+        assert (
+            Config(tmp_path / "config.json").get("show_category_uncategorized") is False
+        )
+        if api_class is SettingsApi:
+            assert "refreshLibrary('structure')" in window.evaluate_js.call_args.args[0]
+
+
+def test_qq_drag_cleanup_settings_contract():
+    """启动清理开关能回显、保存及恢复默认，且仅在应用启动时触发。"""
+    import inspect
+
+    from src.main import OhMyMemeApp
+    from src.webui import HTML_DIR, JsApi, SettingsApi
+
+    assert Config.DEFAULTS["qq_drag_cleanup_on_start"] is True
+    settings_html = (HTML_DIR / "settings.html").read_text(encoding="utf-8")
+    settings_js = (HTML_DIR / "settings.js").read_text(encoding="utf-8")
+    assert 'id="s-qq-drag-cleanup-on-start"' in settings_html
+    assert settings_js.count("s.qq_drag_cleanup_on_start !== false") == 2
+    assert "qq_drag_cleanup_on_start:" in settings_js
+    for api_class in (JsApi, SettingsApi):
+        assert '"qq_drag_cleanup_on_start"' in inspect.getsource(api_class.get_settings)
+        assert '"qq_drag_cleanup_on_start": True' in inspect.getsource(
+            api_class.reset_settings
+        )
+    assert "_start_qq_drag_temp_cleanup(self._cfg)" in inspect.getsource(
+        OhMyMemeApp.run
+    )
+
+
+def test_qq_drag_cleanup_startup_gate_and_background_thread():
+    from src.main import _start_qq_drag_temp_cleanup
+    from src.onebot import cleanup_qq_drag_temp_files
+
+    cfg = mock.Mock()
+    with mock.patch("src.main.threading.Thread") as thread:
+        cfg.get.return_value = False
+        _start_qq_drag_temp_cleanup(cfg)
+        thread.assert_not_called()
+        cfg.get.return_value = True
+        _start_qq_drag_temp_cleanup(cfg)
+        thread.assert_called_once_with(
+            target=cleanup_qq_drag_temp_files,
+            name="qq-drag-temp-cleanup",
+            daemon=True,
+        )
+        thread.return_value.start.assert_called_once_with()
+    with mock.patch(
+        "src.main.threading.Thread", side_effect=RuntimeError("unavailable")
+    ):
+        _start_qq_drag_temp_cleanup(cfg)
+
+
+def test_qq_drag_cleanup_setting_saved_without_running_cleanup(tmp_path, monkeypatch):
+    from src import onebot
+    from src.webui import SettingsApi
+
+    cfg = Config(tmp_path / "config.json")
+    api = SettingsApi.__new__(SettingsApi)
+    api._cfg = cfg
+    cleanup = mock.Mock()
+    monkeypatch.setattr(onebot, "cleanup_qq_drag_temp_files", cleanup)
+    assert api.save_settings({"qq_drag_cleanup_on_start": False}) == {"ok": True}
+    assert Config(tmp_path / "config.json").get("qq_drag_cleanup_on_start") is False
+    cleanup.assert_not_called()
+
+
 def test_cloud_thumb_auto_push_settings_contract():
     """设置页「启动时自动补传缺失的云端缩略图」开关（HTML 复选框 + JS 读写 + 后端配置键）"""
     import inspect
@@ -1327,6 +1667,373 @@ def test_virtual_drive_compat_settings_contract():
     assert "pendingStorageDir, move, compat" in settings_js
 
 
+def test_library_genres_persist_and_restore_from_config(tmp_path):
+    from src.webui import JsApi
+
+    config_path = tmp_path / "genres.json"
+    api = JsApi.__new__(JsApi)
+    api._cfg = Config(config_path)
+    api.search_memes = mock.Mock(return_value=[])
+    api.get_collections = mock.Mock(return_value=[])
+    api._build_category_options = mock.Mock(return_value=[])
+    api.get_tags = mock.Mock(return_value=[])
+    api.get_tag_records = mock.Mock(return_value=[])
+    all_genres = ["image", "gif", "chat_record"]
+
+    with mock.patch("src.webui.guide_ok", return_value=True):
+        assert api.get_init_data()["library_genres"] == all_genres
+        assert not config_path.exists()
+        for selected, expected in (
+            (["gif"], ["gif"]),
+            (["chat_record", "image", "image"], ["image", "chat_record"]),
+            ([], []),
+            (all_genres, all_genres),
+        ):
+            assert api.set_library_genres(selected) == {"ok": True}
+            api._cfg = Config(config_path)
+            assert api._cfg.get("library_genres") == expected
+            assert api.get_init_data()["library_genres"] == expected
+
+        for invalid in (None, "gif", {}, [None], ["video"], [{}]):
+            assert api.set_library_genres(invalid)["ok"] is False
+            assert Config(config_path).get("library_genres") == all_genres
+
+        with mock.patch.object(Config, "save", side_effect=OSError("read-only")):
+            assert api.set_library_genres([])["ok"] is False
+        assert Config(config_path).get("library_genres") == all_genres
+        assert api.set_library_genres(["image"])["ok"] is True
+        api._cfg.reset()
+        api._cfg.save()
+        assert Config(config_path).get("library_genres") == all_genres
+
+
+def test_library_genres_normalize_old_or_invalid_config(tmp_path):
+    import json
+
+    from src.config import normalize_library_genres
+
+    config_path = tmp_path / "genres.json"
+    for saved, expected in (
+        ({}, ["image", "gif", "chat_record"]),
+        ({"library_genres": None}, ["image", "gif", "chat_record"]),
+        ({"library_genres": "gif"}, ["image", "gif", "chat_record"]),
+        ({"library_genres": []}, []),
+        ({"library_genres": ["gif", "gif", "video"]}, ["gif"]),
+    ):
+        config_path.write_text(json.dumps(saved), encoding="utf-8")
+        cfg = Config(config_path)
+        assert normalize_library_genres(cfg.get("library_genres")) == expected
+    cfg.set("library_genres", ["chat_record", "image", "unknown"])
+    cfg.save()
+    assert Config(config_path).get("library_genres") == ["image", "chat_record"]
+
+
+def test_library_genres_frontend_restore_and_ordered_saves():
+    import shutil
+
+    import pytest
+
+    root = Path(__file__).resolve().parent.parent
+    node = shutil.which("node")
+    if not node or not (root / "node_modules" / "esbuild").is_dir():
+        pytest.skip("体裁偏好测试需要 Node 和已安装的前端依赖")
+    script = r"""
+const assert = require('node:assert/strict');
+const path = require('node:path');
+const Module = require('node:module');
+const esbuild = require('esbuild');
+const queries = [];
+const warmups = [];
+const saves = [];
+let persisted;
+let blockSave;
+let rejectNext = false;
+global.pywebview = { api: {
+  get_init_data: async () => ({ memes: [], library_genres: persisted }),
+  search_library: async (...args) => {
+    queries.push(args);
+    return { memes: [], chat_records: [], chat_total: 0, total: 0 };
+  },
+  start_page_cache_warmup: async (...args) => { warmups.push(args); },
+  set_library_genres: async genres => {
+    saves.push([...genres]);
+    if (blockSave) await blockSave;
+    if (rejectNext) { rejectNext = false; return { ok: false }; }
+    persisted = [...genres];
+    return { ok: true };
+  },
+} };
+global.window = { pywebview: global.pywebview };
+const filename = path.resolve('src/vue-src/composables/useMemes.ts');
+const compiled = esbuild.buildSync({
+  entryPoints: [filename], bundle: true, platform: 'node', format: 'cjs',
+  external: ['vue'], write: false,
+}).outputFiles[0].text;
+function newSession() {
+  const instance = new Module(filename, module);
+  instance.filename = filename;
+  instance.paths = Module._nodeModulePaths(path.dirname(filename));
+  instance._compile(compiled, filename);
+  return instance.exports.useMemes();
+}
+const settle = () => new Promise(resolve => setImmediate(resolve));
+const all = ['image', 'gif', 'chat_record'];
+(async () => {
+  for (const saved of [undefined, null, 'gif', [], ['gif'], ['chat_record', 'image']]) {
+    persisted = saved;
+    const session = newSession();
+    const before = saves.length;
+    await session.loadInitData();
+    await settle();
+    const expected = Array.isArray(saved) ? all.filter(genre => saved.includes(genre)) : all;
+    assert.deepEqual([...session.state.activeGenres], expected);
+    assert.deepEqual(queries.at(-1)[6], expected);
+    assert.deepEqual(warmups.at(-1)[7], expected);
+    assert.equal(saves.length, before, 'restoring must not write back defaults');
+  }
+  persisted = all;
+  const session = newSession();
+  await session.loadInitData();
+  let release;
+  blockSave = new Promise(resolve => { release = resolve; });
+  session.toggleGenre('image');
+  session.toggleGenre('gif');
+  session.toggleGenre('chat_record');
+  await settle();
+  assert.equal(saves.length, 1, 'rapid toggles must serialize writes');
+  assert.deepEqual(queries.at(-1)[6], [], 'search must not wait for preference writes');
+  release();
+  blockSave = null;
+  await settle();
+  assert.deepEqual(saves, [['gif', 'chat_record'], ['chat_record'], []]);
+  assert.deepEqual(persisted, []);
+  const restarted = newSession();
+  await restarted.loadInitData();
+  assert.deepEqual([...restarted.state.activeGenres], []);
+  assert.deepEqual(queries.at(-1)[6], []);
+  assert.equal(saves.length, 3);
+  restarted.setActiveCollection(-5);
+  await settle();
+  assert.deepEqual(persisted, all, 'existing reset behavior is saved too');
+  const afterReset = newSession();
+  await afterReset.loadInitData();
+  assert.deepEqual([...afterReset.state.activeGenres], all);
+  rejectNext = true;
+  afterReset.toggleGenre('image');
+  afterReset.toggleGenre('gif');
+  await settle();
+  assert.deepEqual(persisted, ['chat_record'], 'a failed save must not block later saves');
+  afterReset.state.page = 2;
+  afterReset.state.searchQuery = 'temporary';
+  afterReset.state.activeTags.add('temporary');
+  const before = saves.length;
+  await settle();
+  assert.equal(saves.length, before, 'do not persist transient search or navigation');
+  const finalSession = newSession();
+  await finalSession.loadInitData();
+  assert.deepEqual([...finalSession.state.activeGenres], ['chat_record']);
+  assert.equal(finalSession.state.page, 1);
+  assert.equal(finalSession.state.searchQuery, '');
+  assert.equal(finalSession.state.activeTags.size, 0);
+})().catch(error => { console.error(error); process.exitCode = 1; });
+"""
+    result = subprocess.run(
+        [node, "-e", script],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_genre_restore_waits_for_registered_bridge_in_actual_app():
+    import shutil
+
+    import pytest
+
+    root = Path(__file__).resolve().parent.parent
+    node = shutil.which("node")
+    if not node or not (root / "node_modules" / "vite").is_dir():
+        pytest.skip("启动恢复集成测试需要 Node 和已安装的前端依赖")
+    script = r"""
+const assert = require('node:assert/strict');
+const { JSDOM } = require('jsdom');
+const { setTimeout: delay } = require('node:timers/promises');
+const failures = [];
+process.on('unhandledRejection', error => failures.push(String(error)));
+(async () => {
+  const { build } = await import('vite');
+  const bundle = await build({ logLevel: 'silent', build: { write: false, minify: false } });
+  const code = bundle.output.find(item => item.type === 'chunk').code;
+  let saved = ['image', 'gif'];
+  for (const initial of ['empty', 'absent', 'partial', 'ready']) {
+    const dom = new JSDOM('<div id="app-mount"></div>', {
+      runScripts: 'outside-only', pretendToBeVisual: true, url: 'http://localhost/',
+    });
+    const win = dom.window;
+    const calls = [], errors = [];
+    win.console.error = (...args) => errors.push(args.map(String));
+    win.console.warn = (...args) => errors.push(args.map(String));
+    win.matchMedia = () => ({ matches: true, addEventListener() {}, removeEventListener() {} });
+    win.fetch = async () => ({ ok: true, json: async () => ({}) });
+    const methods = {
+      get_init_data: async () => {
+        calls.push(['init']);
+        return { library_genres: [...saved], memes: [], tags: [], collections: [],
+          categories: [], guide_ok: true, show_startup_animation: false };
+      },
+      search_library: async (...args) => {
+        calls.push(['search', [...args[6]]]);
+        return { memes: [], chat_records: [], chat_total: 0, total: 0 };
+      },
+      set_library_genres: async genres => { saved = [...genres]; return { ok: true }; },
+      start_page_cache_warmup: async () => ({}), check_update: async () => ({}),
+      rescan_cache: async () => ({}), run_auto_sync: async () => ({}),
+      get_tag_records: async () => [], get_categories: async () => [], get_collections: async () => [],
+    };
+    if (initial !== 'absent') win.pywebview = { api: initial === 'ready' ? methods : {} };
+    if (initial === 'partial') win.pywebview.api.search_library = methods.search_library;
+    try {
+      win.eval(code);
+      await delay(20);
+      if (initial !== 'ready') {
+        assert.equal(calls.length, 0, 'initialization must wait for actual registered methods');
+        win.pywebview ||= { api: {} };
+        Object.assign(win.pywebview.api, methods);
+        win.dispatchEvent(new win.Event('pywebviewready'));
+      }
+      for (let i = 0; i < 100 && !calls.some(call => call[0] === 'search'); i++) await delay(10);
+      await delay(10);
+      assert.equal(calls[0]?.[0], 'init', initial);
+      assert.deepEqual(calls.find(call => call[0] === 'search')?.[1], ['image', 'gif'], initial);
+      const selected = () => [...win.document.querySelectorAll('.genre-tag')]
+        .map(element => element.getAttribute('aria-checked'));
+      assert.deepEqual(selected(), ['true', 'true', 'false'], initial);
+      if (initial === 'empty') {
+        const checkbox = win.document.querySelectorAll('.genre-tag')[2];
+        checkbox.click();
+        await delay(10);
+        assert.deepEqual(saved, ['image', 'gif', 'chat_record']);
+        checkbox.click();
+        await delay(10);
+        assert.deepEqual(saved, ['image', 'gif']);
+      }
+      assert.deepEqual(errors, [], initial);
+      assert.deepEqual(failures, [], initial);
+    } finally {
+      win.document.querySelector('#app-mount').__vue_app__?.unmount();
+      win.close();
+    }
+  }
+})().catch(error => { console.error(error); process.exitCode = 1; });
+"""
+    result = subprocess.run(
+        [node, "-e", script],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=45,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_duplicate_import_keeps_genres_and_saved_preference():
+    import shutil
+
+    import pytest
+
+    root = Path(__file__).resolve().parent.parent
+    node = shutil.which("node")
+    if not node or not (root / "node_modules" / "esbuild").is_dir():
+        pytest.skip("重复导入筛选测试需要 Node 和已安装的前端依赖")
+    script = r"""
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const vm = require('node:vm');
+const Module = require('node:module');
+const { ref } = require('vue');
+const esbuild = require('esbuild');
+const filename = path.resolve('src/vue-src/composables/useMemes.ts');
+const compiled = esbuild.buildSync({ entryPoints: [filename], bundle: true,
+  platform: 'node', format: 'cjs', external: ['vue'], write: false }).outputFiles[0].text;
+const app = fs.readFileSync('src/vue-src/App.vue', 'utf8');
+const handlers = ['duplicateIds', 'revealExistingImports', 'handleSimilarImport', 'handleLargeMemeImport']
+  .map(name => app.match(new RegExp('(?:async )?function ' + name + '\\([^]*?\\n\\}'))[0]).join('\n');
+const settle = () => new Promise(resolve => setImmediate(resolve));
+(async () => {
+  for (const selected of [['image', 'gif'], ['gif'], ['chat_record'], []]) {
+    let persisted = [...selected], recordOk = true;
+    const writes = [], searches = [], records = [];
+    global.pywebview = { api: {
+      get_init_data: async () => ({ memes: [], library_genres: persisted }),
+      set_library_genres: async genres => { writes.push([...genres]); persisted = [...genres]; return { ok: true }; },
+      search_library: async (...args) => {
+        searches.push(args);
+        return { memes: [], chat_records: [], total: 0, chat_total: 0 };
+      },
+      start_page_cache_warmup: async () => ({}),
+      get_tag_records: async () => [], get_collections: async () => [], get_categories: async () => [],
+      record_meme_uses: async ids => { records.push(ids); return { ok: recordOk, ids }; },
+      resolve_similar_import: async () => ({ ok: true, existing_id: 7 }),
+      resolve_large_meme_import: async () => ({ duplicate: true, duplicate_ids: [7] }),
+    } };
+    global.window = { pywebview: global.pywebview };
+    const moduleInstance = new Module(filename, module);
+    moduleInstance.filename = filename;
+    moduleInstance.paths = Module._nodeModulePaths(path.dirname(filename));
+    moduleInstance._compile(compiled, filename);
+    const use = moduleInstance.exports.useMemes();
+    await use.loadInitData();
+    const { state } = use;
+    const context = vm.createContext({ ...use, api: async (method, ...args) => global.pywebview.api[method](...args),
+      ALL_GENRES: ['image', 'gif', 'chat_record'], sidebarTab: ref('categories'), showToast() {},
+      similarImportDialog: { value: { open: async () => 'keep_old' } },
+      largeMemeImportDialog: { value: { open: async () => ({ mode: 'keep_original', remember: false }) } },
+    });
+    vm.runInContext(esbuild.transformSync(handlers, { loader: 'ts' }).code, context);
+    for (const action of ['exact', 'similar', 'large']) {
+      state.activeCategory = 42;
+      state.activeCollection = null;
+      state.searchQuery = 'old search';
+      state.activeTags.add('old tag');
+      if (action === 'exact') await context.revealExistingImports([7, 7, 8]);
+      if (action === 'similar') await context.handleSimilarImport({ token: 'similar', candidates: [] });
+      if (action === 'large') await context.handleLargeMemeImport({ token: 'large' });
+      await settle();
+      assert.deepEqual([...state.activeGenres], selected, action + ': checkbox state must not change');
+      assert.deepEqual(persisted, selected, action + ': stored preference must not change');
+      assert.equal(writes.length, 0, action + ': duplicate navigation must not save a new preference');
+      assert.deepEqual(searches.at(-1)[6], selected);
+      assert.equal(state.activeCollection, -3);
+      assert.equal(state.activeCategory, null);
+      assert.equal(state.searchQuery, '');
+      assert.equal(state.activeTags.size, 0);
+    }
+    assert.deepEqual([...records[0]], [7, 8]);
+    recordOk = false;
+    state.activeCollection = 99;
+    await context.revealExistingImports([7]);
+    assert.equal(state.activeCollection, 99, 'failed recording must not navigate');
+    assert.deepEqual([...state.activeGenres], selected);
+    assert.deepEqual(persisted, selected);
+  }
+})().catch(error => { console.error(error); process.exitCode = 1; });
+"""
+    result = subprocess.run(
+        [node, "-e", script],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_genre_multiselect_and_random_sidebar_interactions():
     import shutil
 
@@ -1451,6 +2158,466 @@ const settle = () => new Promise(resolve => setImmediate(resolve));
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+def test_sidebar_tabs_preserve_content_and_navigation():
+    import shutil
+
+    import pytest
+
+    root = Path(__file__).resolve().parent.parent
+    node = shutil.which("node")
+    if not node or not (root / "node_modules" / "esbuild").is_dir():
+        pytest.skip("侧栏前端交互测试需要 Node 和已安装的前端依赖")
+    script = r"""
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const vm = require('node:vm');
+const Module = require('node:module');
+const { ref, computed } = require('vue');
+const esbuild = require('esbuild');
+const calls = [];
+global.pywebview = { api: {
+  search_library: async (...args) => {
+    calls.push(args);
+    return { memes: [], chat_records: [], chat_total: 0, total: 0 };
+  },
+  start_page_cache_warmup: async () => ({}),
+} };
+const filename = path.resolve('src/vue-src/composables/useMemes.ts');
+const compiled = esbuild.buildSync({
+  entryPoints: [filename], bundle: true, platform: 'node', format: 'cjs',
+  external: ['vue'], write: false,
+}).outputFiles[0].text;
+const moduleInstance = new Module(filename, module);
+moduleInstance.filename = filename;
+moduleInstance.paths = Module._nodeModulePaths(path.dirname(filename));
+moduleInstance._compile(compiled, filename);
+const { state, setActiveCollection, setActiveCategory, search } =
+  moduleInstance.exports.useMemes();
+const app = fs.readFileSync('src/vue-src/App.vue', 'utf8');
+const start = app.indexOf('const sidebarTab =');
+const end = app.indexOf('const tagGroups =', start);
+assert.ok(start >= 0 && end > start);
+const names = ['switchSidebarTab', 'onSidebarSelect', 'onBreadcrumbClick',
+  'onFolderCardClick', 'onFolderCardContext'];
+const handlers = names.map(name => {
+  const match = app.match(new RegExp('function ' + name + '\\([^]*?\\n\\}'));
+  assert.ok(match, name);
+  return match[0];
+}).join('\n');
+const menus = [];
+const context = { ref, computed, state, setActiveCollection, setActiveCategory, search,
+  onCategoryRightClick: (...args) => menus.push(['category', ...args]),
+  ctx: { show: (...args) => menus.push(['collection', ...args]) },
+};
+vm.createContext(context);
+vm.runInContext(esbuild.transformSync(app.slice(start, end) + handlers, {
+  loader: 'ts',
+}).code, context);
+const value = name => vm.runInContext(name + '.value', context);
+const evaluate = source => vm.runInContext(source, context);
+const settle = () => new Promise(resolve => setImmediate(resolve));
+const event = { preventDefault() {}, stopPropagation() {} };
+function populate(kind, id) {
+  state.activeCollection = kind === 'collections' ? id : null;
+  state.activeCategory = kind === 'categories' ? id : null;
+  state.page = 4;
+  state.pageCount = 7;
+  state.total = 1201;
+  state.chatTotal = 1;
+  state.searchQuery = '保留关键词';
+  state.activeTags = new Set(['风格\u001f可爱']);
+  state.activeGenres = ['gif', 'chat_record'];
+  state.selectedIds = new Set([101]);
+  state.memes = [{ id: 101, filename: 'kept.gif' }];
+  state.chatRecords = [{ id: 201, title: '保留聊天记录' }];
+  state.loading = true;
+}
+(async () => {
+  state.collections = [
+    { id: -3, name: '最近使用' }, { id: -5, name: '随机' },
+    { id: 10, name: '分组父级', children: [{ id: 11, name: '子分组' }] },
+  ];
+  state.categories = [
+    { id: -1, name: '全部' }, { id: -4, name: '未分类' },
+    { id: 10, name: '类别父级', children: [{ id: 11, name: '子类别' }] },
+  ];
+  for (const [kind, id] of [
+    ['collections', 10], ['categories', 10], ['collections', -5],
+    ['collections', -3], ['categories', -4], ['collections', null],
+  ]) {
+    populate(kind, id);
+    evaluate('sidebarTab.value = ' + JSON.stringify(kind));
+    evaluate("hoveredSidebarNode.value = { kind: 'collection', id: 10 }");
+    const before = JSON.stringify(state);
+    const memes = state.memes, records = state.chatRecords, selection = state.selectedIds;
+    const folders = value('folderCards'), crumbs = value('breadcrumb');
+    const callCount = calls.length;
+    const other = kind === 'collections' ? 'categories' : 'collections';
+    context.switchSidebarTab(other);
+    await settle();
+    assert.equal(value('sidebarTab'), other);
+    assert.equal(value('hoveredSidebarNode'), null);
+    assert.equal(value('sidebarItems'), other === 'categories' ? state.categories : state.collections);
+    assert.equal(JSON.stringify(state), before);
+    assert.equal(state.memes, memes);
+    assert.equal(state.chatRecords, records);
+    assert.equal(state.selectedIds, selection);
+    assert.equal(value('folderCards'), folders);
+    assert.equal(value('breadcrumb'), crumbs);
+    assert.equal(calls.length, callCount);
+    assert.equal(value('activeSidebarId'), id == null && other === 'categories' ? -1 : null);
+    context.switchSidebarTab(kind);
+    context.switchSidebarTab(kind);
+    await settle();
+    assert.equal(JSON.stringify(state), before);
+    assert.equal(calls.length, callCount);
+  }
+  for (const kind of ['collections', 'categories']) {
+    populate(kind, 10);
+    evaluate('sidebarTab.value = ' + JSON.stringify(kind));
+    context.switchSidebarTab(kind === 'collections' ? 'categories' : 'collections');
+    assert.equal(value('breadcrumb').at(-1).name, kind === 'categories' ? '类别父级' : '分组父级');
+    assert.equal(value('folderCards')[0].name, kind === 'categories' ? '子类别' : '子分组');
+    context.onFolderCardContext(event, 11, 'child');
+    assert.equal(menus.at(-1)[0], kind === 'categories' ? 'category' : 'collection');
+    context.onFolderCardClick(11);
+    await settle();
+    assert.equal(calls.at(-1)[2], kind === 'collections' ? 11 : null);
+    assert.equal(calls.at(-1)[5], kind === 'categories' ? 11 : null);
+    context.onBreadcrumbClick(10);
+    await settle();
+    assert.equal(calls.at(-1)[2], kind === 'collections' ? 10 : null);
+    assert.equal(calls.at(-1)[5], kind === 'categories' ? 10 : null);
+    context.onBreadcrumbClick(null);
+    await settle();
+    assert.equal(state.activeCategory, null);
+    assert.equal(state.activeCollection, null);
+    populate(kind, 10);
+    context.onSidebarSelect(11);
+    await settle();
+    assert.equal(calls.at(-1)[2], kind === 'categories' ? 11 : null);
+    assert.equal(calls.at(-1)[5], kind === 'collections' ? 11 : null);
+    assert.equal(state.page, 1);
+  }
+})().catch(error => { console.error(error); process.exitCode = 1; });
+"""
+    result = subprocess.run(
+        [node, "-e", script], cwd=root, capture_output=True, text=True, timeout=30
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_hierarchy_pointer_drag_confirms_and_preserves_other_interactions():
+    import shutil
+
+    import pytest
+
+    root = Path(__file__).resolve().parent.parent
+    node = shutil.which("node")
+    if not node or not (root / "node_modules" / "esbuild").is_dir():
+        pytest.skip("层级拖动测试需要 Node 和已安装的前端依赖")
+    script = r"""
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const vm = require('node:vm');
+const Module = require('node:module');
+const { JSDOM } = require('jsdom');
+const dom = new JSDOM('<aside id="sidebar"><header id="root" data-hierarchy-root="category"></header><div id="tree"></div></aside>');
+for (const name of ['window', 'document', 'HTMLElement', 'Element', 'SVGElement', 'Node']) global[name] = dom.window[name];
+const { ref, reactive, computed, createApp, h, nextTick } = require('vue');
+const { parse, compileScript } = require('@vue/compiler-sfc');
+const esbuild = require('esbuild');
+const app = fs.readFileSync('src/vue-src/App.vue', 'utf8');
+const state = reactive({ categories: [], collections: [] });
+const sidebarTab = ref('categories'), sidebarCollapsed = ref(false);
+let confirmation;
+let result = { ok: true };
+const prompts = [], calls = [], refreshes = [], toasts = [], clicks = [];
+const context = vm.createContext({
+  ref, state, sidebarTab, sidebarCollapsed, document,
+  sidebarItems: computed(() => sidebarTab.value === 'categories' ? state.categories : state.collections),
+  clearHoverPreview() {},
+  confirmAsk: (title, message) => { prompts.push([title, message]); return new Promise(resolve => { confirmation = resolve; }); },
+  api: async (...args) => { calls.push(args); return result; },
+  refreshLibraryView: async kind => { refreshes.push(kind); },
+  showToast: message => { toasts.push(message); },
+  ctx: { visible: { value: false } }, hoverPreview: { value: null },
+  selectMode: { value: false }, sortEnabled: { value: false },
+});
+const extract = name => app.match(new RegExp('(?:async )?function ' + name + '\\([^]*?\\n\\}'))[0];
+const start = app.indexOf('let hierarchyDrag:');
+const end = app.indexOf('function beginLibraryDrag', start);
+const helpers = ['findCollectionNode', 'subtreeIds', 'onDocPointerMove', 'onDocPointerUp',
+  'onDocPointerCancel', 'onDocKeydown', 'onSidebarSwipeDown', 'onSidebarSwipeMove',
+  'onSidebarSwipeEnd', 'onSwipeClickCapture'].map(extract).join('\n');
+vm.runInContext(esbuild.transformSync(app.slice(start, end) + '\nlet swipeStart = null; let swipeClickGuard = false;\n' + helpers, { loader: 'ts' }).code, context);
+const value = name => vm.runInContext(name, context);
+const descriptor = parse(fs.readFileSync('src/vue-src/components/CollectionTreeNode.vue', 'utf8'), { filename: 'CollectionTreeNode.vue' }).descriptor;
+const componentCode = compileScript(descriptor, { id: 'hierarchy-test', inlineTemplate: true }).content;
+const filename = path.resolve('src/vue-src/components/CollectionTreeNode.vue');
+const compiled = new Module(filename, module);
+compiled.filename = filename;
+compiled.paths = Module._nodeModulePaths(path.dirname(filename));
+compiled._compile(esbuild.transformSync(componentCode, { loader: 'ts', format: 'cjs' }).code, filename);
+const component = compiled.exports.default;
+let hit;
+document.elementFromPoint = () => hit;
+document.addEventListener('pointerdown', context.onSidebarSwipeDown);
+document.addEventListener('click', context.onSwipeClickCapture, true);
+const nodes = [
+  { id: 1, name: 'source', children: [{ id: 2, name: 'child', children: [{ id: 3, name: 'grandchild' }] }] },
+  { id: 4, name: 'target' },
+  { id: -4, name: '未分类' },
+  { id: -5, name: '未分类', direct_category_id: 1 },
+  { id: 5, name: '隐藏', system_hidden: true },
+];
+state.categories = nodes;
+state.collections = nodes;
+const mounted = createApp({ setup() { return () => state.categories.map(item => h(component, {
+  key: item.id, node: item, activeId: null, depth: 0, collapsed: false,
+  dropKind: sidebarTab.value === 'categories' ? 'category' : 'collection',
+  dropTargetKey: value('hierarchyDropTargetKey.value'), hierarchyDragId: value('hierarchyDragId.value'),
+  onNodePointerdown: context.onHierarchyPointerDown,
+  onSelect: id => clicks.push(id),
+})); } });
+mounted.mount('#tree');
+const row = id => document.querySelector(`[data-hierarchy-id="${id}"]`);
+const down = (id, target = row(id).querySelector('.tree-label'), type = 'mouse') => {
+  const event = new dom.window.MouseEvent('pointerdown', { bubbles: true, cancelable: true, button: 0, clientX: 20, clientY: 20 });
+  Object.defineProperties(event, { pointerId: { value: 8 }, pointerType: { value: type } });
+  target.dispatchEvent(event);
+};
+const move = (id, distance = 12) => {
+  hit = id === null ? document.getElementById('root') : row(id);
+  const event = { pointerId: 8, clientX: 20 + distance, clientY: 20, preventDefault() {} };
+  context.onDocPointerMove(event);
+  return event;
+};
+const click = id => row(id).dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true, cancelable: true, detail: 1 }));
+const settle = () => new Promise(resolve => setImmediate(resolve));
+(async () => {
+  down(1); move(4, 4);
+  assert.equal(value('hierarchyDrag.active'), false);
+  await context.onDocPointerUp({ pointerId: 8, clientX: 24, clientY: 20, preventDefault() {} });
+  click(1);
+  assert.deepEqual(clicks, [1]);
+  assert.equal(prompts.length, 0);
+  down(1);
+  const released = move(4);
+  assert.equal(value('hierarchyDropTargetKey.value'), 'category:4');
+  context.onSidebarSwipeMove({ clientX: -80, clientY: 20 });
+  assert.equal(sidebarCollapsed.value, false, 'node drag must not collapse sidebar');
+  const pending = context.onDocPointerUp(released);
+  await settle();
+  click(1);
+  assert.deepEqual(clicks, [1], 'post-drag click is suppressed');
+  assert.equal(prompts.length, 1);
+  assert.ok(prompts[0][1].includes('子类别树'));
+  assert.equal(calls.length, 0, 'cannot write before confirmation');
+  confirmation(false); await pending;
+  assert.equal(calls.length, 0);
+  assert.equal(refreshes.length, 0);
+  down(1); const confirmed = context.onDocPointerUp(move(4));
+  await settle(); confirmation(true); await confirmed;
+  assert.deepEqual(calls[0], ['move_hierarchy_node', 'category', 1, 4]);
+  assert.deepEqual(refreshes, ['structure']);
+  assert.equal(value('hierarchyDrag'), null);
+  down(1); move(2); assert.equal(value('hierarchyDropTargetKey.value'), '');
+  move(3); assert.equal(value('hierarchyDropTargetKey.value'), '');
+  move(1); assert.equal(value('hierarchyDropTargetKey.value'), '');
+  move(-4); assert.equal(value('hierarchyDropTargetKey.value'), '');
+  move(-5); assert.equal(value('hierarchyDropTargetKey.value'), '');
+  move(null); assert.equal(value('hierarchyDropTargetKey.value'), '', 'already at root');
+  const escaped = { key: 'Escape', preventDefault() {} };
+  context.onDocKeydown(escaped);
+  assert.equal(value('hierarchyDrag'), null);
+  down(2); const rootMove = context.onDocPointerUp(move(null));
+  await settle(); confirmation(true); await rootMove;
+  assert.deepEqual(calls.at(-1), ['move_hierarchy_node', 'category', 2, null]);
+  down(2); move(1); assert.equal(value('hierarchyDropTargetKey.value'), '', 'same parent is a no-op');
+  vm.runInContext('clearHierarchyDrag()', context);
+  for (const id of [-4, -5, 5]) {
+    down(id); assert.equal(value('hierarchyDrag'), null);
+  }
+  down(1, row(1).querySelector('.tree-toggle'));
+  assert.equal(value('hierarchyDrag'), null);
+  down(1, row(1).querySelector('button'));
+  assert.equal(value('hierarchyDrag'), null);
+  sidebarCollapsed.value = true;
+  down(1); assert.equal(value('hierarchyDrag'), null);
+  sidebarCollapsed.value = false;
+  down(1, undefined, 'touch'); assert.equal(value('hierarchyDrag'), null);
+  sidebarTab.value = 'collections'; await nextTick();
+  document.getElementById('root').dataset.hierarchyRoot = 'collection';
+  down(1); move(4);
+  assert.equal(value('hierarchyDropTargetKey.value'), 'collection:4');
+  row(4).dataset.hierarchyKind = 'category'; move(4);
+  assert.equal(value('hierarchyDropTargetKey.value'), '', 'cross-kind drop is invalid');
+  row(4).dataset.hierarchyKind = 'collection';
+  result = { ok: false, error: '同名冲突' };
+  const failed = context.onDocPointerUp(move(4));
+  await settle(); confirmation(true); await failed;
+  assert.equal(toasts.at(-1), '同名冲突');
+  assert.deepEqual(calls.at(-1), ['move_hierarchy_node', 'collection', 1, 4]);
+  assert.equal(refreshes.length, 2, 'failed move must not refresh or alter navigation');
+  mounted.unmount();
+  dom.window.close();
+})().catch(error => { console.error(error); process.exitCode = 1; });
+"""
+    result = subprocess.run(
+        [node, "-e", script],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=45,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_category_direct_frontend_navigation_and_controls():
+    import shutil
+
+    import pytest
+
+    root = Path(__file__).resolve().parent.parent
+    node = shutil.which("node")
+    if not node or not (root / "node_modules" / "esbuild").is_dir():
+        pytest.skip("类别未分类入口测试需要 Node 和已安装的前端依赖")
+    script = r"""
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const vm = require('node:vm');
+const Module = require('node:module');
+const vue = require('vue');
+const { ref, computed, createSSRApp } = vue;
+const { renderToString } = require('@vue/server-renderer');
+const { parse, compileScript } = require('@vue/compiler-sfc');
+const esbuild = require('esbuild');
+const queries = [];
+let categories;
+global.pywebview = { api: {
+  search_library: async (...args) => {
+    queries.push(args);
+    return { memes: [], chat_records: [], chat_total: 0, total: 0 };
+  },
+  start_page_cache_warmup: async () => ({}),
+  get_categories: async () => categories,
+} };
+const filename = path.resolve('src/vue-src/composables/useMemes.ts');
+const compiled = esbuild.buildSync({ entryPoints: [filename], bundle: true,
+  platform: 'node', format: 'cjs', external: ['vue'], write: false }).outputFiles[0].text;
+function loadModule(code, file) {
+  const instance = new Module(file, module);
+  instance.filename = file;
+  instance.paths = Module._nodeModulePaths(path.dirname(file));
+  instance._compile(code, file);
+  return instance.exports;
+}
+const { state, setActiveCollection, setActiveCategory, refreshCategories } =
+  loadModule(compiled, filename).useMemes();
+const app = fs.readFileSync('src/vue-src/App.vue', 'utf8');
+const start = app.indexOf('const sidebarTab =');
+const end = app.indexOf('const tagGroups =', start);
+const names = ['onSidebarSelect', 'onBreadcrumbClick', 'onCategoryRightClick'];
+const handlers = names.map(name => app.match(new RegExp('function ' + name + '\\([^]*?\\n\\}'))[0]).join('\n');
+const menus = [];
+const context = { ref, computed, state, setActiveCollection, setActiveCategory,
+  ctx: { show: (...args) => menus.push(args) } };
+vm.createContext(context);
+vm.runInContext(esbuild.transformSync(app.slice(start, end) + handlers, { loader: 'ts' }).code, context);
+const value = name => vm.runInContext(name + '.value', context);
+const evaluate = source => vm.runInContext(source, context);
+const settle = () => new Promise(resolve => setImmediate(resolve));
+(async () => {
+  const direct = { id: -14, name: '未分类', count: 2, direct_category_id: 10 };
+  categories = [{ id: -4, name: '未分类' },
+    { id: 10, name: '父类别', children: [direct, { id: 11, name: '子类别' }] }];
+  state.categories = categories;
+  evaluate("sidebarTab.value = 'categories'");
+  state.searchQuery = 'keep';
+  state.activeTags.add('keep');
+  state.activeGenres = ['gif', 'chat_record'];
+  context.onSidebarSelect(-14);
+  await settle();
+  assert.equal(state.activeCategory, -14);
+  assert.equal(queries.at(-1)[5], -14);
+  assert.equal(state.searchQuery, 'keep');
+  assert.ok(state.activeTags.has('keep'));
+  assert.deepEqual([...state.activeGenres], ['gif', 'chat_record']);
+  assert.equal(value('activeTopLevel'), 10);
+  assert.equal(value('activeSidebarId'), -14);
+  assert.deepEqual(Array.from(value('breadcrumb'), item => item.name), ['全部', '父类别', '未分类']);
+  assert.equal(value('folderCards').length, 0);
+  context.onSidebarNodeHover(-14);
+  assert.ok(context.isMemeInHoveredSidebarNode({ category_id: 10 }));
+  assert.ok(!context.isMemeInHoveredSidebarNode({ category_id: 11 }));
+  assert.ok(!context.isMemeInHoveredSidebarNode({ category_id: null }));
+  const event = { preventDefault() {}, stopPropagation() {} };
+  context.onCategoryRightClick(event, -14, '未分类');
+  assert.equal(menus.length, 0);
+  context.onBreadcrumbClick(10);
+  await settle();
+  assert.equal(state.activeCategory, 10);
+  assert.equal(value('folderCards')[0].id, -14);
+  context.onSidebarSelect(-14);
+  await settle();
+  categories = [{ id: -4, name: '未分类' }, { id: 10, name: '父类别', children: [{ id: 11, name: '子类别' }] }];
+  await refreshCategories();
+  assert.equal(state.activeCategory, 10, 'switch off returns to the real parent');
+  assert.equal(queries.at(-1)[5], 10);
+  state.activeCategory = -14;
+  categories = [];
+  await refreshCategories();
+  assert.equal(state.activeCategory, null, 'deleted parent returns to all');
+  const componentFile = path.resolve('src/vue-src/components/CollectionTreeNode.vue');
+  const descriptor = parse(fs.readFileSync(componentFile, 'utf8'), { filename: componentFile }).descriptor;
+  const componentCode = compileScript(descriptor, { id: 'direct-tree-test', inlineTemplate: true }).content;
+  const component = loadModule(esbuild.transformSync(componentCode, { loader: 'ts', format: 'cjs' }).code, componentFile).default;
+  const render = (node, options = {}) => renderToString(createSSRApp(component, {
+    node, activeId: -14, depth: 1, collapsed: false, dropKind: 'category', dropTargetKey: '',
+    ...options,
+  }));
+  const virtualHtml = await render(direct);
+  assert.ok(!virtualHtml.includes('tree-more'));
+  assert.ok(!virtualHtml.includes('data-library-drop-kind'));
+  assert.ok(virtualHtml.includes('aria-selected="true"'));
+  const realHtml = await render({ id: 10, name: '父类别', count: 3 });
+  assert.ok(realHtml.includes('tree-more'));
+  assert.ok(realHtml.includes('data-library-drop-kind="category"'));
+  const { JSDOM } = require('jsdom');
+  const fullName = '这是一个超出侧栏显示宽度的完整名称 <&" 示例';
+  for (const dropKind of ['category', 'collection']) {
+    for (const collapsed of [false, true]) {
+      const html = await render({ id: 10, name: fullName, count: 3 }, { dropKind, collapsed });
+      const dom = new JSDOM(html);
+      assert.equal(dom.window.document.querySelector('.tree-row').title, fullName);
+      assert.ok(!dom.window.document.querySelector('.tree-icon').hasAttribute('title'), 'icon must not block the row tooltip');
+      dom.window.close();
+    }
+  }
+  const virtualDom = new JSDOM(virtualHtml);
+  assert.ok(virtualDom.window.document.querySelector('.tree-row').title.startsWith('未分类\n'));
+  virtualDom.window.close();
+  const randomDom = new JSDOM(await render({ id: -5, name: '随机' }, { dropKind: 'collection' }));
+  assert.ok(randomDom.window.document.querySelector('.tree-row').title.includes('再次点击可换一批'));
+  randomDom.window.close();
+})().catch(error => { console.error(error); process.exitCode = 1; });
+"""
+    result = subprocess.run(
+        [node, "-e", script],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_later_page_cache_warmup_follows_current_query_contract():
     root = Path(__file__).resolve().parent.parent
     source = (root / "src" / "vue-src" / "composables" / "useMemes.ts").read_text(
@@ -1551,6 +2718,613 @@ def test_meme_details_close_discards_unsaved_changes():
     close_button = actions.index('ref="closeEl" class="btn btn-secondary"')
     save_button = actions.index('class="btn btn-primary"')
     assert close_button < save_button
+
+
+def test_batch_category_picker_and_refresh():
+    import shutil
+
+    import pytest
+
+    root = Path(__file__).resolve().parent.parent
+    node = shutil.which("node")
+    if not node or not (root / "node_modules" / "esbuild").is_dir():
+        pytest.skip("类别多选前端测试需要 Node 和已安装的前端依赖")
+    script = r"""
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const Module = require('node:module');
+const vm = require('node:vm');
+const { JSDOM } = require('jsdom');
+const dom = new JSDOM('<div id="app"></div><input id="cb-name">');
+for (const name of ['window', 'document', 'HTMLElement', 'Element', 'SVGElement', 'Node']) global[name] = dom.window[name];
+const { createApp, nextTick } = require('vue');
+const calls = [];
+global.pywebview = { api: {
+  get_categories: async () => { calls.push('categories'); return [
+    { id: -1, name: '全部' }, { id: -4, name: '未分类' },
+    { id: 10, name: '父类别', children: [
+      { id: -14, name: '未分类', direct_category_id: 10 },
+      { id: 11, name: '子类别' },
+    ] },
+  ]; },
+  get_collections: async () => { calls.push('collections'); return [{ id: 20, name: '分组' }]; },
+  get_collection_members: async () => { throw new Error('Picker must not load members'); },
+  search_memes: async () => { throw new Error('Picker must not load library'); },
+} };
+const filename = path.resolve('src/vue-src/composables/useCollectionBuilder.ts');
+const result = require('esbuild').buildSync({ entryPoints: [filename], bundle: true,
+  platform: 'node', format: 'cjs', external: ['vue'], write: false });
+const compiled = new Module(filename, module);
+compiled.paths = Module._nodeModulePaths(path.dirname(filename));
+compiled._compile(result.outputFiles[0].text, filename);
+let cb;
+const app = createApp({ setup() { cb = compiled.exports.useCollectionBuilder(); return () => null; } });
+app.mount('#app');
+(async () => {
+  const confirmed = [];
+  await cb.openPick(r => confirmed.push(r), 'category', [101, 102]);
+  assert.deepEqual(calls, ['categories']);
+  assert.deepEqual(cb.collectionOptions.value.map(o => o.id), [0, 10, 11]);
+  cb.collectionName.value = '父类别';
+  await nextTick();
+  assert.deepEqual(cb.filteredCollectionOptions.value.map(o => o.id), [10, 11]);
+  cb.selectCollection(cb.collectionOptions.value[2]);
+  await nextTick();
+  cb.confirm();
+  assert.deepEqual(confirmed[0], { name: '父类别/子类别', memeIds: [101, 102], existingId: 11 });
+  await cb.openPick(r => confirmed.push(r), 'category', [101, 102]);
+  cb.selectCollection(cb.collectionOptions.value[0]);
+  await nextTick();
+  cb.confirm();
+  assert.equal(confirmed[1].existingId, 0);
+  await cb.openPick(r => confirmed.push(r), 'category', [101, 102]);
+  cb.collectionName.value = '新父级/新子级';
+  cb.createNew();
+  await nextTick();
+  cb.confirm();
+  assert.equal(confirmed[2].existingId, null);
+  assert.equal(confirmed[2].name, '新父级/新子级');
+  await cb.openPick(r => confirmed.push(r), 'category', [101]);
+  cb.close();
+  assert.equal(confirmed.length, 3);
+  await cb.openPick(r => confirmed.push(r), 'add', [101]);
+  assert.deepEqual(cb.collectionOptions.value.map(o => o.id), [20]);
+  assert.equal(calls.at(-1), 'collections');
+  cb.close();
+  app.unmount();
+  dom.window.close();
+
+  const source = fs.readFileSync('src/vue-src/App.vue', 'utf8');
+  assert.match(source, /@click="batchSetCategory">设置类别/);
+  const block = source.match(/function batchSetCategory\(\) \{[\s\S]*?\n\}/)[0];
+  let picker;
+  const apiCalls = [];
+  const events = [];
+  const context = vm.createContext({ state: { selectedIds: new Set([101, 102]) },
+    cb: { openPick: (callback, mode, ids) => { picker = { callback, mode, ids }; } },
+    api: async (...args) => { apiCalls.push(args); return { ok: true, count: 2 }; },
+    showToast: value => events.push(value),
+    refreshLibraryView: async kind => events.push(`refresh:${kind}`),
+  });
+  vm.runInContext(block, context);
+  context.batchSetCategory();
+  assert.equal(picker.mode, 'category');
+  context.state.selectedIds.clear();
+  await picker.callback({ existingId: 0, name: '未分类' });
+  assert.deepEqual([...apiCalls[0][1]], [101, 102]);
+  assert.equal(apiCalls[0][0], 'batch_set_meme_category');
+  assert.equal(apiCalls[0][2], 0);
+  assert.equal(apiCalls[0][3], '');
+  assert.equal(events.at(-1), 'refresh:structure');
+  context.state.selectedIds.add(101);
+  context.batchSetCategory();
+  await picker.callback({ existingId: null, name: '新父级/新子级' });
+  assert.equal(apiCalls.at(-1)[2], null);
+  assert.equal(apiCalls.at(-1)[3], '新父级/新子级');
+  context.api = async () => ({ ok: false, error: '移动失败' });
+  events.length = 0;
+  await picker.callback({ existingId: 11, name: '父类别/子类别' });
+  assert.deepEqual(events, ['移动失败']);
+  picker = null;
+  context.state.selectedIds.clear();
+  context.batchSetCategory();
+  assert.equal(picker, null);
+})().catch(error => { console.error(error); process.exitCode = 1; });
+"""
+    result = subprocess.run(
+        [node, "-e", script], cwd=root, capture_output=True, text=True, timeout=30
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_escape_closes_details_before_hiding_main_window():
+    import shutil
+
+    import pytest
+
+    root = Path(__file__).resolve().parent.parent
+    node = shutil.which("node")
+    if not node or not (root / "node_modules" / "esbuild").is_dir():
+        pytest.skip("Esc 分层操作测试需要 Node 和已安装的前端依赖")
+    script = r"""
+const assert=require('node:assert/strict');
+const fs=require('node:fs');
+const vm=require('node:vm');
+const {JSDOM}=require('jsdom');
+const {transformSync}=require('esbuild');
+const dom=new JSDOM('<main id="main" tabindex="0"></main><div id="meme"><input></div><div id="chat"><input></div>');
+const document=dom.window.document;
+const read=name=>fs.readFileSync(`src/vue-src/${name}`,'utf8');
+const extract=(source,name)=>source.match(new RegExp(`function ${name}\\([^)]*\\) \\{[\\s\\S]*?\\n\\}`))[0];
+const state={meme:false,chat:false,blocked:false,hidden:0,closed:[]};
+const close=kind=>{state.closed.push(kind);if(!state.blocked)state[kind]=false;};
+const ctx={visible:{value:false},hide(){this.visible.value=false;}};
+const hoverPreview={value:false},selectMode={value:false},sortEnabled={value:false};
+const appContext=vm.createContext({ctx,hoverPreview,selectMode,sortEnabled,hierarchyDrag:null,
+  memeDetails:{value:{isOpen:()=>state.meme,close:()=>close('meme')}},
+  chatRecordDetails:{value:{isOpen:()=>state.chat,close:()=>close('chat')}},
+  hideWindow:()=>state.hidden++,clearHoverPreview:()=>hoverPreview.value=false,
+  toggleSelect:()=>selectMode.value=false,toggleSort:()=>sortEnabled.value=false,
+});
+vm.runInContext(transformSync(extract(read('App.vue'),'onDocKeydown'),{loader:'ts'}).code,appContext);
+document.addEventListener('keydown',appContext.onDocKeydown);
+for(const [name,kind]of[['MemeDetails','meme'],['ChatRecordDetails','chat']]){
+  const source=read(`components/${name}.vue`);
+  assert.match(source,/isOpen: \(\) => visible.value/);
+  const box=document.getElementById(kind);
+  const context=vm.createContext({boxEl:{value:box},close:()=>close(kind),
+    focusNextDetailInput:()=>false,trapTabFocus:()=>{},isTextEditing:()=>true,
+  });
+  vm.runInContext(transformSync(extract(source,'onKeydown'),{loader:'ts'}).code,context);
+  box.addEventListener('keydown',context.onKeydown);
+}
+const key=(target,options={})=>{const e=new dom.window.KeyboardEvent('keydown',
+  {key:'Escape',bubbles:true,cancelable:true,...options});target.dispatchEvent(e);return e;};
+for(const kind of ['meme','chat']){
+  state[kind]=true;
+  const input=document.querySelector(`#${kind} input`);
+  input.focus();assert.equal(key(input).defaultPrevented,true);
+  assert.equal(state[kind],false);assert.equal(state.hidden,0);
+  key(document.body,{repeat:true});assert.equal(state.hidden,0,'Held Esc hid the main window');
+  state[kind]=true;key(document.body);
+  assert.equal(state[kind],false);assert.equal(state.hidden,0,'Unfocused detail leaked Esc to main');
+  state[kind]=true;key(input,{repeat:true});assert.equal(state[kind],true);
+  key(input,{isComposing:true});assert.equal(state[kind],true);
+  key(document.body,{isComposing:true});assert.equal(state[kind],true);
+  state[kind]=false;
+}
+state.meme=true;state.blocked=true;key(document.body);
+assert.equal(state.meme,true);assert.equal(state.hidden,0,'A busy detail caused main to hide');
+state.blocked=false;
+ctx.visible.value=true;key(document.body);
+assert.equal(ctx.visible.value,false);assert.equal(state.meme,true);
+key(document.body);assert.equal(state.meme,false);
+const handled=new dom.window.KeyboardEvent('keydown',{key:'Escape',bubbles:true,cancelable:true});
+handled.preventDefault();document.body.dispatchEvent(handled);assert.equal(state.hidden,0);
+key(document.body,{keyCode:229});assert.equal(state.hidden,0);
+hoverPreview.value=true;key(document.body);assert.equal(hoverPreview.value,false);assert.equal(state.hidden,0);
+selectMode.value=true;key(document.body);assert.equal(selectMode.value,false);assert.equal(state.hidden,0);
+sortEnabled.value=true;key(document.body);assert.equal(sortEnabled.value,false);assert.equal(state.hidden,0);
+key(document.getElementById('main'));assert.equal(state.hidden,1,'Fresh main-page Esc must still hide the window');
+key(document.body,{repeat:true});assert.equal(state.hidden,1);
+dom.window.close();
+"""
+    result = subprocess.run(
+        [node, "-e", script], cwd=root, capture_output=True, text=True, timeout=30
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_subpages_suspend_global_drop_import_without_blocking_text_edits():
+    import shutil
+
+    import pytest
+
+    root = Path(__file__).resolve().parent.parent
+    node = shutil.which("node")
+    if not node or not (root / "node_modules" / "esbuild").is_dir():
+        pytest.skip("子页面拖放测试需要 Node 和已安装的前端依赖")
+    script = r"""
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const vm = require('node:vm');
+const { JSDOM } = require('jsdom');
+const dom = new JSDOM(`<div id="main"></div><div id="modal" role="dialog" aria-modal="true">
+  <textarea id="text"></textarea><input id="input"><input id="readonly" readonly>
+  <input id="disabled" disabled><input id="checkbox" type="checkbox">
+  <div id="editable" contenteditable="true"><span id="nested">文本</span></div>
+  <button id="button">关闭</button></div>`);
+const document = dom.window.document;
+dom.window.HTMLElement.prototype.getClientRects = function() {
+  return this.hidden || this.closest('[hidden]') || dom.window.getComputedStyle(this).display==='none' ? [] : [{}];
+};
+Object.defineProperty(document.getElementById('editable'),'isContentEditable',{value:true});
+const source = fs.readFileSync('src/vue-src/App.vue','utf8');
+const names = ['ignoreImportDrag','onDragEnter','onDragOver','onDragLeave','onDrop'];
+const functions = names.map(name => {
+  const block = source.match(new RegExp(`(?:async )?function ${name}\\([^)]*\\) \\{[\\s\\S]*?\\n\\}`));
+  assert.ok(block,`Missing ${name}`);return block[0];
+}).join('\n');
+const script = require('esbuild').transformSync(functions,{loader:'ts',target:'es2020'}).code;
+const calls = [];
+const dragOver = {value:true};
+const context = vm.createContext({
+  document, Element:dom.window.Element, HTMLInputElement:dom.window.HTMLInputElement,
+  getComputedStyle:dom.window.getComputedStyle.bind(dom.window), dragOver,
+  nativeDragActive:false, dragCounter:3,
+  window:{pywebview:{api:{download_original_image:async uri=>{calls.push(['import',uri]);return {ok:true};}}}},
+  finishMemeImport:async()=>calls.push(['finished']),
+  showToast:message=>calls.push(['toast',message]),
+});
+vm.runInContext(script,context);
+const event = (target,types=['text/plain']) => ({
+  target, defaultPrevented:false,
+  preventDefault(){this.defaultPrevented=true;},
+  dataTransfer:{types,getData(){calls.push(['read']);return 'https://example.test/meme.png';},
+    get files(){throw new Error('Blocked drops must not read files');}},
+});
+(async()=>{
+  for(const name of ['onDragEnter','onDragOver','onDragLeave','onDrop']){
+    for(const id of ['text','input','nested']){
+      const e=event(document.getElementById(id));await context[name](e);
+      assert.equal(e.defaultPrevented,false,`${name} prevented native text editing`);
+      assert.equal(dragOver.value,false);assert.equal(context.dragCounter,0);
+    }
+    for(const id of ['main','modal','readonly','disabled','checkbox','button']){
+      const e=event(document.getElementById(id));await context[name](e);
+      assert.equal(e.defaultPrevented,true,`${name} allowed navigation outside an editor`);
+    }
+  }
+  for(const types of [['Files'],['Files','text/plain'],['text/uri-list','Files']]){
+    const e=event(document.getElementById('text'),types);await context.onDrop(e);
+    assert.equal(e.defaultPrevented,true,'File drops must not navigate or import');
+  }
+  assert.deepEqual(calls,[],'Subpage drag events reached the import pipeline');
+  document.getElementById('modal').remove();
+  for(const props of [
+    {className:'import-overlay'},{className:'imp-overlay'},{className:'upd-overlay'},
+    {className:'ctx-overlay'},{className:'sync-warning-overlay'},
+    {id:'sync-progress-overlay'},{id:'sync-done-overlay'},{id:'startup-anim'},
+  ]){
+    const overlay=Object.assign(document.createElement('div'),props);document.body.append(overlay);
+    await context.onDrop(event(document.getElementById('main')));
+    assert.deepEqual(calls,[]);overlay.remove();
+  }
+  for(const style of ['display:none','visibility:hidden']){
+    const hidden=document.createElement('div');hidden.setAttribute('aria-modal','true');
+    hidden.style.cssText=style;document.body.append(hidden);
+    const e=event(document.getElementById('main'));await context.onDrop(e);
+    assert.equal(e.defaultPrevented,true);assert.equal(calls.filter(call=>call[0]==='import').length,1);
+    calls.length=0;hidden.remove();
+  }
+  const enter=event(document.getElementById('main'));context.onDragEnter(enter);
+  assert.equal(enter.defaultPrevented,true);assert.equal(dragOver.value,true);
+  context.onDragLeave(event(document.getElementById('main')));assert.equal(dragOver.value,false);
+  await context.onDrop(event(document.getElementById('main')));
+  assert.ok(calls.some(call=>call[0]==='import'));
+  assert.ok(calls.some(call=>call[0]==='finished'));
+  assert.equal(dragOver.value,false);assert.equal(context.dragCounter,0);
+})().catch(error=>{console.error(error);process.exitCode=1;}).finally(()=>dom.window.close());
+"""
+    result = subprocess.run(
+        [node, "-e", script], cwd=root, capture_output=True, text=True, timeout=30
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_details_enter_navigation_and_save_shortcuts():
+    import shutil
+
+    import pytest
+
+    root = Path(__file__).resolve().parent.parent
+    node = shutil.which("node")
+    if not node or not (root / "node_modules" / "esbuild").is_dir():
+        pytest.skip("详情键盘测试需要 Node 和已安装的前端依赖")
+    script = r"""
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const Module = require('node:module');
+const { JSDOM } = require('jsdom');
+const dom = new JSDOM(`<div id="box"><input id="first"><input disabled>
+  <input readonly><input hidden><input type="hidden"><input type="checkbox">
+  <fieldset disabled><input></fieldset><div inert><input></div>
+  <textarea id="text"></textarea><input id="combo" role="combobox">
+  <select id="select"><option>父类别</option></select><input id="last">
+  <button id="save">保存</button></div>`);
+global.HTMLElement = dom.window.HTMLElement;
+dom.window.HTMLElement.prototype.getClientRects = function() { return this.hidden ? [] : [{}]; };
+const filename = path.resolve('src/vue-src/utils/api.ts');
+const result = require('esbuild').buildSync({ entryPoints:[filename], bundle:true,
+  platform:'node', format:'cjs', write:false });
+const compiled = new Module(filename, module);
+compiled.paths = Module._nodeModulePaths(path.dirname(filename));
+compiled._compile(result.outputFiles[0].text, filename);
+const { focusNextDetailInput, handleDetailSaveShortcut } = compiled.exports;
+const document = dom.window.document;
+const box = document.getElementById('box');
+let saved = 0, localEnters = 0;
+box.addEventListener('keydown', e => handleDetailSaveShortcut(e, () => saved++), true);
+box.addEventListener('keydown', e => focusNextDetailInput(box, e));
+document.getElementById('combo').addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.isComposing && e.keyCode !== 229) { e.preventDefault(); localEnters++; }
+});
+const key = (id, options = {}) => {
+  const field = document.getElementById(id); field.focus();
+  const event = new dom.window.KeyboardEvent('keydown', {key:'Enter',bubbles:true,cancelable:true,...options});
+  field.dispatchEvent(event); return event;
+};
+assert.equal(key('first').defaultPrevented,true);
+assert.equal(document.activeElement.id,'text');
+assert.equal(key('text',{shiftKey:true}).defaultPrevented,false);
+assert.equal(document.activeElement.id,'text');
+key('text');assert.equal(document.activeElement.id,'combo');
+key('combo');assert.equal(localEnters,1);assert.equal(document.activeElement.id,'combo');
+key('combo',{ctrlKey:true});assert.equal(saved,1);assert.equal(localEnters,1);
+key('text',{ctrlKey:true});assert.equal(saved,2);assert.equal(document.activeElement.id,'text');
+key('text',{metaKey:true});assert.equal(saved,3);
+key('first',{ctrlKey:true,key:'s'});assert.equal(saved,4);
+key('first',{ctrlKey:true,repeat:true});assert.equal(saved,4);
+assert.equal(key('first',{isComposing:true}).defaultPrevented,false);
+assert.equal(document.activeElement.id,'first');
+assert.equal(key('combo',{isComposing:true,ctrlKey:true}).defaultPrevented,false);
+assert.equal(saved,4);assert.equal(localEnters,1);
+assert.equal(key('first',{keyCode:229}).defaultPrevented,false);
+key('last');assert.equal(document.activeElement.id,'last');assert.equal(saved,4);
+assert.equal(key('save').defaultPrevented,false);
+assert.equal(key('select').defaultPrevented,false);
+assert.equal(key('first',{altKey:true}).defaultPrevented,false);
+for (const [name, save] of [['MemeDetails','saveChanges'],['ChatRecordDetails','saveManagement']]) {
+  const source = fs.readFileSync(`src/vue-src/components/${name}.vue`,'utf8');
+  assert.ok(source.includes(`@keydown.capture="handleDetailSaveShortcut($event, ${save})"`));
+  assert.ok(source.includes('focusNextDetailInput(boxEl.value, e)'));
+  assert.ok(source.includes('Ctrl+Enter'));
+}
+dom.window.close();
+"""
+    result = subprocess.run(
+        [node, "-e", script], cwd=root, capture_output=True, text=True, timeout=30
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_chat_record_readonly_text_is_selectable_without_changing_controls():
+    import shutil
+
+    import pytest
+
+    root = Path(__file__).resolve().parent.parent
+    node = shutil.which("node")
+    if not node or not (root / "node_modules" / "esbuild").is_dir():
+        pytest.skip("聊天文字拖选测试需要 Node 和已安装的前端依赖")
+    script = r"""
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const Module = require('node:module');
+const { JSDOM } = require('jsdom');
+const { parse, compileScript, compileStyle } = require('@vue/compiler-sfc');
+const dom = new JSDOM('<div id="app"></div>');
+for (const name of ['window', 'document', 'HTMLElement', 'Element', 'SVGElement', 'Node']) global[name] = dom.window[name];
+const { createApp, nextTick } = require('vue');
+const filename = path.resolve('src/vue-src/components/ChatRecordDetails.vue');
+const { descriptor } = parse(fs.readFileSync(filename, 'utf8'), { filename });
+const id = 'data-v-chat-selection-test';
+const compiledStyle = compileStyle({ filename, id, scoped: true, source: descriptor.styles[0].content });
+assert.deepEqual(compiledStyle.errors, []);
+const style = document.createElement('style');
+style.textContent = 'body { user-select: none; }\n' + compiledStyle.code;
+document.head.appendChild(style);
+const compiled = require('esbuild').buildSync({
+  stdin: { contents: compileScript(descriptor, { id, inlineTemplate: true }).content,
+    sourcefile: filename, resolveDir: path.dirname(filename), loader: 'ts' },
+  bundle: true, platform: 'node', format: 'cjs', external: ['vue'], write: false,
+}).outputFiles[0].text;
+const moduleInstance = new Module(filename, module);
+moduleInstance.paths = Module._nodeModulePaths(path.dirname(filename));
+moduleInstance._compile(compiled, filename);
+const component = moduleInstance.exports.default;
+component.__scopeId = id;
+global.pywebview = { api: { get_chat_record_details: async () => ({
+  ok: true, id: 1, name: '可复制的记录名称', media_folder: 'archive', title: '记录',
+  genre_label: '聊天记录', node_count: 2, max_depth: 2, media_count: 0,
+  peer_label: '来源群聊', peer_id: '123', source_message_id: '456', updated_at: '2026-10-20',
+  source_locations: [{ source_self_id: '1', source_type: 'group', source_peer_id: '123', source_real_seq: '456' }],
+  send_command: '/omm send 1', all_tags: [], all_tag_records: [], tags: [], tag_records: [],
+  all_categories: [], all_collections: [], collections: [], blocked_message_paths: [],
+  messages: [{ path: 'n0', depth: 0, sender: '发言者', time: 1, preview: '第一行消息\n第二行消息',
+    quotes: [{ sender: '原发言者', time: 1, preview: '被引用的文字' }] },
+    { path: 'n1', depth: 1, sender: '另一人', time: 1, preview: '嵌套正文' }],
+}) } };
+const mounted = createApp(component);
+const details = mounted.mount('#app');
+(async () => {
+  try {
+    await details.open(1); await nextTick();
+    const selectable = ['.chat-details-header h2', '.chat-details-meta dt', '.chat-details-meta dd',
+      '.chat-source-location-list span', '.chat-command-help > span', '.chat-command-help code',
+      '.chat-message-identity strong', '.chat-message-identity time', '.chat-quoted-head span',
+      '.chat-quoted-head time', '.chat-message > p', '.chat-quoted-message p', '.nested-label'];
+    for (const selector of selectable) {
+      const elements = [...document.querySelectorAll(selector)];
+      assert.ok(elements.length, selector);
+      for (const element of elements) {
+        assert.equal(window.getComputedStyle(element).userSelect, 'text', selector);
+        assert.equal(window.getComputedStyle(element).cursor, 'text', selector);
+      }
+    }
+    const paragraph = document.querySelector('.chat-message > p');
+    const range = document.createRange(); range.selectNodeContents(paragraph);
+    window.getSelection().removeAllRanges();
+    window.getSelection().addRange(range);
+    assert.equal(window.getSelection().toString(), '第一行消息\n第二行消息');
+    const copy = new window.KeyboardEvent('keydown', { key: 'c', ctrlKey: true, bubbles: true, cancelable: true });
+    paragraph.dispatchEvent(copy);
+    assert.equal(copy.defaultPrevented, false, 'Ctrl+C must retain native copy');
+    const pointer = (type, target) => {
+      const event = new window.MouseEvent(type, { bubbles: true, button: 0 });
+      Object.defineProperties(event, { isPrimary: { value: true }, pointerId: { value: 1 } });
+      target.dispatchEvent(event);
+    };
+    const overlay = document.querySelector('.chat-details-overlay');
+    pointer('pointerdown', paragraph); pointer('pointerup', overlay); overlay.click();
+    assert.ok(details.isOpen(), 'text selection released outside must not dismiss details');
+    const toggle = document.querySelector('.chat-block-toggle');
+    assert.equal(window.getComputedStyle(toggle).userSelect, 'none');
+    const checkbox = toggle.querySelector('input');
+    checkbox.click(); await nextTick();
+    assert.equal(checkbox.checked, true, 'blocking control still works');
+    for (const element of document.querySelectorAll('button, .chat-option, .chat-field')) {
+      assert.notEqual(window.getComputedStyle(element).userSelect, 'text', 'controls must not be opted into text selection');
+    }
+  } finally {
+    mounted.unmount(); dom.window.close();
+  }
+})().catch(error => { console.error(error); process.exitCode = 1; });
+"""
+    result = subprocess.run(
+        [node, "-e", script],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=45,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_details_backdrop_ignores_selection_drags_but_allows_outside_clicks():
+    import shutil
+
+    import pytest
+
+    root = Path(__file__).resolve().parent.parent
+    node = shutil.which("node")
+    if not node or not (root / "node_modules" / "esbuild").is_dir():
+        pytest.skip("详情遮罩交互测试需要 Node 和已安装的前端依赖")
+    script = r"""
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const Module = require('node:module');
+const filename = path.resolve('src/vue-src/utils/api.ts');
+const result = require('esbuild').buildSync({ entryPoints: [filename], bundle: true,
+  platform: 'node', format: 'cjs', write: false });
+const compiled = new Module(filename, module);
+compiled.paths = Module._nodeModulePaths(path.dirname(filename));
+compiled._compile(result.outputFiles[0].text, filename);
+const overlay = {}, inside = {};
+let closed = 0;
+const guard = compiled.exports.createBackdropClickGuard(() => closed++);
+const event = (target, overrides = {}) => ({ target, currentTarget: overlay,
+  pointerId: 1, button: 0, isPrimary: true,
+  preventDefault() { throw new Error('Text selection must not be prevented'); },
+  stopPropagation() { throw new Error('Normal controls must not be intercepted'); },
+  ...overrides });
+const gesture = (start, end, click = overlay) => {
+  guard.onPointerDown(event(start));
+  guard.onPointerUp(event(end));
+  guard.onClick(event(click));
+};
+gesture(inside, overlay);
+assert.equal(closed, 0, 'Selecting inside and releasing outside must not close');
+gesture(overlay, inside);
+assert.equal(closed, 0, 'Releasing inside must not close even if click targets the overlay');
+gesture(inside, inside, inside);
+assert.equal(closed, 0, 'Normal input clicks must not close');
+gesture(overlay, overlay);
+assert.equal(closed, 1, 'Normal outside clicks must still close');
+guard.onClick(event(overlay));
+assert.equal(closed, 1, 'A stale or unmatched click must not close');
+guard.onPointerDown(event(overlay, { button: 2 }));
+guard.onPointerUp(event(overlay, { button: 2 }));
+guard.onClick(event(overlay));
+assert.equal(closed, 1, 'Right-click must not close');
+guard.onPointerDown(event(overlay, { isPrimary: false }));
+guard.onPointerUp(event(overlay));
+guard.onClick(event(overlay));
+assert.equal(closed, 1, 'A secondary pointer must not close');
+guard.onPointerDown(event(overlay));
+guard.onPointerUp(event(overlay, { pointerId: 2 }));
+guard.onClick(event(overlay));
+assert.equal(closed, 1, 'Mismatched pointer IDs must not close');
+guard.onPointerDown(event(overlay));
+guard.reset();
+guard.onPointerUp(event(overlay));
+guard.onClick(event(overlay));
+assert.equal(closed, 1, 'Cancelled or previous-dialog gestures must not close');
+gesture(inside, overlay);
+gesture(overlay, overlay);
+assert.equal(closed, 2, 'A ignored drag must not swallow the following valid click');
+for (const name of ['MemeDetails', 'ChatRecordDetails']) {
+  const source = fs.readFileSync(`src/vue-src/components/${name}.vue`, 'utf8');
+  assert.match(source, /const backdrop = createBackdropClickGuard\(close\)/);
+  assert.match(source, /@pointerdown\.capture="backdrop.onPointerDown"/);
+  assert.match(source, /@pointerup\.capture="backdrop.onPointerUp"/);
+  assert.match(source, /@pointercancel\.capture="backdrop.reset"/);
+  assert.match(source, /@click="backdrop.onClick"/);
+  assert.doesNotMatch(source, /@click\.self="close"/);
+  assert.match(source, /async function open\([^)]*\) \{\s*backdrop.reset\(\)/);
+}
+"""
+    result = subprocess.run(
+        [node, "-e", script], cwd=root, capture_output=True, text=True, timeout=30
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_details_actions_stay_outside_scrolling_content():
+    import shutil
+
+    import pytest
+
+    root = Path(__file__).resolve().parent.parent
+    node = shutil.which("node")
+    if not node or not (root / "node_modules" / "@vue" / "compiler-sfc").is_dir():
+        pytest.skip("详情操作栏结构测试需要 Node 和已安装的前端依赖")
+    script = r"""
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const { parse } = require('@vue/compiler-sfc');
+const { parse: parseTemplate } = require('@vue/compiler-dom');
+for (const [filename, boxClass, contentClass, footerClass, saveHandler] of [
+  ['MemeDetails', 'details-box', 'details-content', 'details-actions', 'saveChanges'],
+  ['ChatRecordDetails', 'chat-details-box', 'chat-details-content', 'chat-management-actions', 'saveManagement'],
+]) {
+  const source = fs.readFileSync(`src/vue-src/components/${filename}.vue`, 'utf8');
+  const { descriptor, errors } = parse(source);
+  assert.deepEqual(errors, []);
+  const ast = parseTemplate(descriptor.template.content);
+  const hasClass = (node, name) => node.props?.some(prop =>
+    prop.type === 6 && prop.name === 'class' && prop.value?.content.split(/\s+/).includes(name));
+  const find = (node, name) => hasClass(node, name) ? node :
+    node.children?.map(child => find(child, name)).find(Boolean);
+  const box = find(ast, boxClass);
+  const footer = find(ast, footerClass);
+  const content = find(ast, contentClass);
+  assert.ok(box.children.includes(footer), `${filename}: footer must be a direct dialog child`);
+  assert.ok(box.children.indexOf(footer) > box.children.indexOf(content));
+  assert.equal(find(content, footerClass), undefined);
+  const buttons = footer.children.filter(node => node.tag === 'button');
+  assert.equal(buttons.length, 2);
+  const handler = node => node.props.find(prop => prop.type === 7 &&
+    prop.name === 'on' && prop.arg?.content === 'click')?.exp?.content;
+  assert.deepEqual(buttons.map(handler), ['close', saveHandler]);
+  assert.ok(buttons.every(node => node.props.some(prop => prop.type === 7 &&
+    prop.name === 'bind' && prop.arg?.content === 'disabled' && prop.exp.content.includes('saving'))));
+  const css = descriptor.styles.map(style => style.content).join('\n');
+  const footerCss = css.match(new RegExp(`\\.${footerClass}\\s*\\{([^}]+)\\}`))[1];
+  assert.match(footerCss, /flex-shrink:\s*0/);
+  assert.match(footerCss, /justify-content:\s*flex-end/);
+  assert.doesNotMatch(css, new RegExp(`\\.${boxClass}\\s*\\{[^}]*overflow-y:\\s*auto`));
+}
+"""
+    result = subprocess.run(
+        [node, "-e", script], cwd=root, capture_output=True, text=True, timeout=30
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_meme_details_can_create_and_select_collections_and_categories():

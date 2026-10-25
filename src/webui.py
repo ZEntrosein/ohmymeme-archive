@@ -12,7 +12,7 @@ import socket
 import tempfile
 import threading
 import time
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 
 # WSL 环境强制软件渲染（必须在导入 webview/GUI 之前设置）
@@ -80,13 +80,17 @@ from .clipboard_util import (
     convert_image_mode_2,
     convert_image_mode_3,
     copy_image_to_clipboard,
+    copy_text_with_history,
 )
 from .config import (
     _IMPORT_MAX_BYTES,
     _IMPORT_MAX_PX,
     CHAT_RECORD_MEDIA_DIRNAME,
     get_config,
+    get_import_max_px,
     guide_ok,
+    normalize_import_max_px,
+    normalize_library_genres,
     resolve_path,
     set_guide_ok,
 )
@@ -188,6 +192,67 @@ _STATIC_MIME_TYPES = {
 }
 
 # ─── 工具函数  ───
+
+
+_TEXT_CLIPBOARD_SCRIPT = r"""(() => {
+  if (window.__ohmymemeTextCopyInstalled) return;
+  window.__ohmymemeTextCopyInstalled = true;
+  let pending = Promise.resolve();
+  let fallback = false;
+  const isTextField = target => target instanceof HTMLInputElement
+    || target instanceof HTMLTextAreaElement;
+  const privateFields = '[type="password"], '
+    + '[autocomplete~="current-password"], [autocomplete~="new-password"]';
+  document.addEventListener('copy', event => {
+    if (fallback || event.defaultPrevented) return;
+    const target = isTextField(event.target)
+      ? event.target : event.target === document ? document.activeElement : null;
+    if (!isTextField(target) || target.disabled
+        || target.matches(privateFields)) return;
+    const start = target.selectionStart;
+    const end = target.selectionEnd;
+    if (typeof start !== 'number' || typeof end !== 'number'
+        || start === end) return;
+    const bridge = window.pywebview?.api;
+    if (typeof bridge?.copy_editor_text !== 'function') return;
+    const value = target.value;
+    const text = value.slice(start, end);
+    if ((text.length + 1) * 2 > 4 * 1024 * 1024
+        || text.includes('\u0000')) return;
+    event.preventDefault();
+    pending = pending.then(() => new Promise(resolve => setTimeout(resolve, 0)));
+    pending = pending.then(async () => {
+      let copied = false;
+      try { copied = await bridge.copy_editor_text(text) === true; } catch (_) {}
+      if (!copied && document.activeElement === target && target.value === value
+          && target.selectionStart === start && target.selectionEnd === end) {
+        fallback = true;
+        try { document.execCommand('copy'); } catch (_) {}
+        finally { fallback = false; }
+      }
+    });
+  });
+})()"""
+
+
+def _install_text_clipboard_bridge(window):
+    """为 Windows 编辑框安装本地剪贴板历史兼容处理。"""
+    try:
+        window.evaluate_js(_TEXT_CLIPBOARD_SCRIPT)
+    except Exception:
+        logger.warning("文本剪贴板兼容处理未能安装")
+
+
+def _copy_editor_text(text, window):
+    """使用当前窗口作为原生剪贴板所有者，不改变浏览器隐私模式。"""
+    if platform.system() != "Windows" or window is None:
+        return False
+    try:
+        handle = window.native.Handle
+        hwnd = handle.ToInt64() if hasattr(handle, "ToInt64") else int(handle)
+        return copy_text_with_history(text, hwnd)
+    except Exception:
+        return False
 
 
 def _strip_url_modifiers(url: str) -> str:
@@ -719,6 +784,10 @@ def _window_drag_update(win_x, win_y, origin, last_move, dx, dy):
 class JsApi:
     """暴露给前端的 JS API"""
 
+    def copy_editor_text(self, text):
+        """复制普通编辑框文本并允许进入本地剪贴板历史。"""
+        return _copy_editor_text(text, self._webui._window)
+
     def __init__(self, webui):
         self._webui = webui
         self._cfg = get_config()
@@ -776,12 +845,20 @@ class JsApi:
             (category.casefold(), name.casefold())
             for category, name in MemeDB._normalize_tags(tags)
         }
+        direct_category_id = (
+            -category_id - 4 if category_id is not None and category_id < -4 else None
+        )
+        target_category_id = direct_category_id or category_id
         category_parts = (
-            self._db.get_category_path_names(category_id)
-            if category_id is not None and category_id > 0
+            self._db.get_category_path_names(target_category_id)
+            if target_category_id is not None and target_category_id > 0
             else None
         )
-        if category_id is not None and category_id > 0 and not category_parts:
+        if (
+            target_category_id is not None
+            and target_category_id > 0
+            and not category_parts
+        ):
             return []
         hidden_id, _hidden_ids, excluded_ids = self._hidden_collection_state(
             collection_id
@@ -806,6 +883,8 @@ class JsApi:
             if category_id == -4 and item_parts:
                 continue
             if category_parts and item_parts[: len(category_parts)] != category_parts:
+                continue
+            if direct_category_id is not None and item_parts != category_parts:
                 continue
             if collection_id == -2 and not it["favorited"]:
                 continue
@@ -1041,7 +1120,7 @@ class JsApi:
             if (fav_only or recent_only or uncategorized or random_only)
             else collection_id
         )
-        catid = None if category_uncategorized else category_id
+        catid = self._category_filter_ids(category_id)
         include_description = self._cfg.get("search_description", True) is not False
         include_ocr_text = self._cfg.get("search_image_text", True) is not False
         _hidden_id, _hidden_ids, excluded_ids = self._hidden_collection_state(
@@ -1058,8 +1137,6 @@ class JsApi:
         else:
             if cid is not None and cid > 0:
                 cid = self._get_collection_ids_recursive(cid)
-            if catid is not None and catid > 0:
-                catid = self._get_category_ids_recursive(catid)
             rows = self._db.search(
                 keyword=keyword,
                 tags=tags,
@@ -1113,13 +1190,11 @@ class JsApi:
                 genre=genre, exclude_collection_ids=excluded_ids
             )
         cid = None if (fav_only or recent_only or uncategorized) else collection_id
-        catid = None if category_uncategorized else category_id
+        catid = self._category_filter_ids(category_id)
         include_description = self._cfg.get("search_description", True) is not False
         include_ocr_text = self._cfg.get("search_image_text", True) is not False
         if cid is not None and cid > 0:
             cid = self._get_collection_ids_recursive(cid)
-        if catid is not None and catid > 0:
-            catid = self._get_category_ids_recursive(catid)
         total = self._db.count(
             keyword=keyword,
             tags=tags,
@@ -1184,10 +1259,10 @@ class JsApi:
         chat_uncategorized = collection_id == -4
         if chat_allowed and collection_id is not None and collection_id > 0:
             chat_collection_id = self._get_collection_ids_recursive(collection_id)
-        chat_category_id = None
+        chat_category_id = (
+            self._category_filter_ids(category_id) if chat_allowed else None
+        )
         chat_category_uncategorized = category_id == -4
-        if chat_allowed and category_id is not None and category_id > 0:
-            chat_category_id = self._get_category_ids_recursive(category_id)
         chat_count = (
             self._db.count_chat_records(
                 keyword,
@@ -1359,10 +1434,10 @@ class JsApi:
             chat_uncategorized = collection_id == -4
             if chat_allowed and collection_id is not None and collection_id > 0:
                 chat_collection_id = self._get_collection_ids_recursive(collection_id)
-            chat_category_id = None
+            chat_category_id = (
+                self._category_filter_ids(category_id) if chat_allowed else None
+            )
             chat_category_uncategorized = category_id == -4
-            if chat_allowed and category_id is not None and category_id > 0:
-                chat_category_id = self._get_category_ids_recursive(category_id)
             chat_count = (
                 self._db.count_chat_records(
                     keyword,
@@ -2020,18 +2095,33 @@ class JsApi:
         """批返回初始化所需数据，减少 JS bridge 往返"""
         memes = self.search_memes("", None, None, 0, MEME_PAGE)
         collections = self.get_collections()
-        categories = self._build_category_options()
+        categories = self.get_categories()
         return {
             "memes": memes,
             "tags": self.get_tags(),
             "tag_records": self.get_tag_records(),
             "collections": collections,
             "categories": categories,
+            "library_genres": normalize_library_genres(self._cfg.get("library_genres")),
             "show_startup_animation": self._cfg.get("show_startup_animation", True),
             "hover_zoom": self._cfg.get("hover_zoom", True),
             "startup_bg_color": _STARTUP_BG_COLOR,
             "guide_ok": guide_ok(),
         }
+
+    def set_library_genres(self, genres):
+        """仅保存体裁选择，不触发扫描、同步或窗口刷新。"""
+        if not isinstance(genres, list) or any(
+            genre not in ("image", "gif", "chat_record") for genre in genres
+        ):
+            return {"ok": False, "error": "无效的体裁选择"}
+        try:
+            self._cfg.set("library_genres", genres)
+            self._cfg.save()
+            return {"ok": True}
+        except OSError:
+            logger.exception("failed to save library genres")
+            return {"ok": False, "error": "体裁选择保存失败"}
 
     def complete_guide(self) -> dict:
         """设置向导完成：写入配置 guide=ok 标记"""
@@ -2427,6 +2517,14 @@ class JsApi:
 
     # --- 单归属类别 ---
 
+    def _category_filter_ids(self, category_id):
+        """解析真实类别子树或仅匹配父类别的虚拟“未分类”入口。"""
+        if category_id is None or category_id == -4:
+            return None
+        if category_id < -4:
+            return [-category_id - 4]
+        return self._get_category_ids_recursive(category_id)
+
     def _get_category_ids_recursive(self, category_id):
         ids = [int(category_id)]
         children = {}
@@ -2438,7 +2536,9 @@ class JsApi:
             cursor += 1
         return ids
 
-    def _build_category_tree(self, parent_id=None, excluded_ids=None):
+    def _build_category_tree(
+        self, parent_id=None, excluded_ids=None, include_direct=False
+    ):
         if excluded_ids is None:
             _hidden_id, _hidden_ids, excluded_ids = self._hidden_collection_state()
         raw = self._db.get_categories()
@@ -2446,7 +2546,9 @@ class JsApi:
         for cid, name, pid, _order in raw:
             if pid != parent_id:
                 continue
-            children = self._build_category_tree(cid, excluded_ids=excluded_ids)
+            children = self._build_category_tree(
+                cid, excluded_ids=excluded_ids, include_direct=include_direct
+            )
             all_ids = self._get_category_ids_recursive(cid)
             item = {
                 "id": cid,
@@ -2458,11 +2560,26 @@ class JsApi:
                 + len(self._cloud_filtered("", None, None, cid)),
             }
             if children:
+                if include_direct:
+                    direct_id = -cid - 4
+                    children.insert(
+                        0,
+                        {
+                            "id": direct_id,
+                            "name": "未分类",
+                            "path": item["path"] + "/未分类",
+                            "direct_category_id": cid,
+                            "count": self._db.count_category_content(
+                                [cid], exclude_collection_ids=excluded_ids
+                            )
+                            + len(self._cloud_filtered("", None, None, direct_id)),
+                        },
+                    )
                 item["children"] = children
             result.append(item)
         return result
 
-    def _build_category_options(self):
+    def _build_category_options(self, include_direct=False):
         _hidden_id, _hidden_ids, excluded_ids = self._hidden_collection_state()
         result = [
             {
@@ -2485,10 +2602,14 @@ class JsApi:
                 + len(self._cloud_filtered("", None, None, -4)),
             }
         )
-        return result + self._build_category_tree(excluded_ids=excluded_ids)
+        return result + self._build_category_tree(
+            excluded_ids=excluded_ids, include_direct=include_direct
+        )
 
     def get_categories(self) -> list:
-        return self._build_category_options()
+        return self._build_category_options(
+            include_direct=self._cfg.get("show_category_uncategorized", False) is True
+        )
 
     def search_categories(self, keyword: str = "") -> list:
         kw = (keyword or "").strip().lower()
@@ -2586,6 +2707,83 @@ class JsApi:
             return {"ok": True, "categories": self._build_category_options()}
         except Exception as e:
             return {"ok": False, "error": str(e)}
+
+    @contextmanager
+    def _move_category_storage(self, category_id, parent_id):
+        """整目录移动类别；提交失败时恢复路径，不遍历或重读图片。"""
+        root = self._cfg.cache_dir
+        old_parts = self._db.get_category_path_names(category_id)
+        parent_parts = self._db.get_category_path_names(parent_id)
+        old_dir = category_dir(root, old_parts)
+        new_dir = category_dir(root, parent_parts + [old_parts[-1]])
+        for parts in (old_parts, parent_parts + [old_parts[-1]]):
+            for length in range(1, len(parts) + 1):
+                path = category_dir(root, parts[:length])
+                if path.is_symlink() or getattr(path, "is_junction", lambda: False)():
+                    raise ValueError("类别路径包含链接目录，不能安全移动")
+        if new_dir.exists():
+            raise ValueError("目标类别目录已存在，不能合并或覆盖")
+        if not old_dir.exists():
+            if self._db.count(
+                category_id=self._get_category_ids_recursive(category_id)
+            ):
+                raise ValueError("类别原件目录不可用，请检查存储盘后重试")
+            yield
+            return
+        new_dir.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(str(old_dir), str(new_dir))
+        storage_dir = new_dir
+        try:
+            yield
+        except Exception:
+            try:
+                os.replace(str(new_dir), str(old_dir))
+                storage_dir = old_dir
+            except OSError as rollback_error:
+                logger.exception("category move directory rollback failed")
+                raise OSError(
+                    f"数据库提交失败且目录回滚失败，原件仍保存在：{new_dir}"
+                ) from rollback_error
+            raise
+        finally:
+            file_cache = getattr(self._webui, "_file_cache", None)
+            if file_cache is not None:
+                for filename, cached_path in list(file_cache.items()):
+                    try:
+                        relative = Path(cached_path).relative_to(old_dir)
+                    except ValueError:
+                        continue
+                    file_cache[filename] = str(storage_dir / relative)
+
+    def move_hierarchy_node(self, kind, node_id, parent_id=None) -> dict:
+        """移动类别或分组的整棵子树，不改变成员归属。"""
+        try:
+            guard = _IMPORT_LOCK if kind == "category" else nullcontext()
+            read_guard = (
+                guarded_read(priority="critical")
+                if kind == "category"
+                else nullcontext()
+            )
+            with guard, read_guard:
+                storage_move = (
+                    self._move_category_storage(node_id, parent_id)
+                    if kind == "category"
+                    else None
+                )
+                result = self._db.move_hierarchy_node(
+                    kind, node_id, parent_id, storage_move=storage_move
+                )
+            if result["changed"]:
+                try:
+                    request_manifest_rebuild()
+                except Exception:
+                    logger.exception("hierarchy moved but manifest request failed")
+            return {"ok": True, **result}
+        except (ValueError, OSError) as exc:
+            return {"ok": False, "error": str(exc)}
+        except Exception:
+            logger.exception("hierarchy move failed")
+            return {"ok": False, "error": "移动失败，未更改层级"}
 
     def get_hierarchy_delete_mode(self) -> str:
         return _normalize_hierarchy_delete_mode(
@@ -2821,6 +3019,64 @@ class JsApi:
             return {"ok": True, "added": added}
         except Exception:
             return {"ok": False}
+
+    def batch_set_meme_category(self, meme_ids, category_id=None, name=""):
+        """批量设置单归属类别并移动原件，提交前失败则回滚所有移动。"""
+        moves = []
+        committed = False
+        try:
+            ids = list(dict.fromkeys(int(value) for value in (meme_ids or [])))
+            rows = [self._db.get_by_id(meme_id) for meme_id in ids]
+            if not ids or any(row is None for row in rows):
+                return {"ok": False, "error": "选中的表情包已不存在，请刷新后重试"}
+            if name and category_id is None:
+                created = self.create_category(name)
+                if not created.get("ok"):
+                    return created
+                category_id = created["id"]
+            else:
+                category_id = (
+                    None if category_id in (None, "", 0, "0") else int(category_id)
+                )
+            if category_id is not None and (
+                category_id <= 0 or not self._db.category_exists(category_id)
+            ):
+                return {"ok": False, "error": "类别不存在"}
+            changed = [row for row in rows if row.get("category_id") != category_id]
+            for row in changed:
+                old_path, new_path = self._webui._move_meme_file(
+                    row, row["filename"], category_id
+                )
+                if old_path != new_path:
+                    moves.append((row["filename"], old_path, new_path))
+            self._db.set_memes_category([row["id"] for row in changed], category_id)
+            committed = True
+            file_cache = getattr(self._webui, "_file_cache", None)
+            if isinstance(file_cache, dict):
+                for filename, _old_path, new_path in moves:
+                    file_cache[filename] = str(new_path)
+            if changed:
+                try:
+                    request_manifest_rebuild()
+                except Exception:
+                    logger.exception("batch category manifest refresh failed")
+            return {"ok": True, "count": len(rows), "category_id": category_id}
+        except Exception as exc:
+            logger.exception("batch category assignment failed")
+            return {"ok": False, "error": str(exc) or "设置类别失败"}
+        finally:
+            if not committed:
+                file_cache = getattr(getattr(self, "_webui", None), "_file_cache", None)
+                for filename, old_path, new_path in reversed(moves):
+                    try:
+                        if old_path.exists():
+                            raise OSError("回滚位置已存在文件")
+                        old_path.parent.mkdir(parents=True, exist_ok=True)
+                        os.replace(new_path, old_path)
+                        if isinstance(file_cache, dict):
+                            file_cache[filename] = str(old_path)
+                    except OSError:
+                        logger.exception("failed to roll back batch category file")
 
     def batch_move_to_collection(
         self, meme_ids: list, from_id: int, to_id: int = 0, name: str = ""
@@ -3471,7 +3727,8 @@ class JsApi:
                         w, hgt = img.size
                 except Exception:
                     return {"ok": False, "status": "invalid_image"}
-                if max(w, hgt) > _IMPORT_MAX_PX:
+                max_px = get_import_max_px(cfg)
+                if max_px and max(w, hgt) > max_px:
                     return {"ok": False, "status": "too_large"}
             src_phash = _perceptual_hash_path(tmp)
             with _IMPORT_LOCK:
@@ -3806,6 +4063,7 @@ class JsApi:
             "show_download_progress": d.get("show_download_progress", True),
             "show_download_done": d.get("show_download_done", True),
             "show_uncategorized": d.get("show_uncategorized", True),
+            "show_category_uncategorized": d.get("show_category_uncategorized") is True,
             "hidden_collection_enabled": d.get("hidden_collection_enabled", True),
             "hierarchy_delete_mode": _normalize_hierarchy_delete_mode(
                 d.get("hierarchy_delete_mode", "ask")
@@ -3813,10 +4071,16 @@ class JsApi:
             "large_meme_import_mode": _normalize_large_meme_import_mode(
                 d.get("large_meme_import_mode", "ask")
             ),
+            "import_resolution_limit_enabled": d.get("import_resolution_limit_enabled")
+            is True,
+            "import_resolution_limit_px": normalize_import_max_px(
+                d.get("import_resolution_limit_px", _IMPORT_MAX_PX)
+            ),
             "record_recent_use": d.get("record_recent_use", True),
             "search_description": d.get("search_description", True),
             "search_image_text": d.get("search_image_text", True),
             "show_startup_animation": d.get("show_startup_animation", True),
+            "qq_drag_cleanup_on_start": d.get("qq_drag_cleanup_on_start", True),
             "virtual_drive_compat": d.get("virtual_drive_compat", False),
             "bulk_read_protection": d.get("bulk_read_protection", False),
             "bulk_read_batch_size": clamp_batch_size(d.get("bulk_read_batch_size", 8)),
@@ -3915,6 +4179,7 @@ class JsApi:
             "copy_resize_mode": self._cfg.get("copy_resize_mode", 1),
             "auto_start": False,
             "silent_start": False,
+            "show_category_uncategorized": False,
             "hidden_collection_enabled": True,
             "sync_auto_fetch_index": False,
             "sync_auto_sync": False,
@@ -3948,9 +4213,12 @@ class JsApi:
             "show_download_done": True,
             "hierarchy_delete_mode": "ask",
             "large_meme_import_mode": "ask",
+            "import_resolution_limit_enabled": False,
+            "import_resolution_limit_px": _IMPORT_MAX_PX,
             "search_description": True,
             "search_image_text": True,
             "show_startup_animation": True,
+            "qq_drag_cleanup_on_start": True,
             "virtual_drive_compat": self._cfg.get("virtual_drive_compat", False),
             "bulk_read_protection": False,
             "bulk_read_batch_size": 8,
@@ -4512,6 +4780,10 @@ def _storage_migrate_worker(old: Path, new: Path, virtual_drive_compat=None):
 class SettingsApi:
     """暴露给设置窗口的 JS API（仅设置相关方法）"""
 
+    def copy_editor_text(self, text):
+        """复制普通编辑框文本并允许进入本地剪贴板历史。"""
+        return _copy_editor_text(text, self._webui._settings_window)
+
     def __init__(self, webui):
         self._webui = webui
         self._cfg = get_config()
@@ -4651,6 +4923,7 @@ class SettingsApi:
             "napcat_command": d.get("napcat_command", "/omm"),
             "napcat_send_mode": d.get("napcat_send_mode", "original_native"),
             "napcat_image_send_mode": d.get("napcat_image_send_mode", "sticker"),
+            "qq_drag_cleanup_on_start": d.get("qq_drag_cleanup_on_start", True),
             "auto_start": is_auto_start_enabled(),
             "silent_start": d.get("silent_start", False),
             "sync_auto_fetch_index": d.get("sync_auto_fetch_index", False),
@@ -4684,12 +4957,18 @@ class SettingsApi:
             "show_download_progress": d.get("show_download_progress", True),
             "show_download_done": d.get("show_download_done", True),
             "show_uncategorized": d.get("show_uncategorized", True),
+            "show_category_uncategorized": d.get("show_category_uncategorized") is True,
             "hidden_collection_enabled": d.get("hidden_collection_enabled", True),
             "hierarchy_delete_mode": _normalize_hierarchy_delete_mode(
                 d.get("hierarchy_delete_mode", "ask")
             ),
             "large_meme_import_mode": _normalize_large_meme_import_mode(
                 d.get("large_meme_import_mode", "ask")
+            ),
+            "import_resolution_limit_enabled": d.get("import_resolution_limit_enabled")
+            is True,
+            "import_resolution_limit_px": normalize_import_max_px(
+                d.get("import_resolution_limit_px", _IMPORT_MAX_PX)
             ),
             "record_recent_use": d.get("record_recent_use", True),
             "search_description": d.get("search_description", True),
@@ -4782,6 +5061,9 @@ class SettingsApi:
             hidden_collection_changed = "hidden_collection_enabled" in settings and (
                 settings["hidden_collection_enabled"] is not False
             ) != (self._cfg.get("hidden_collection_enabled", True) is not False)
+            category_sidebar_changed = "show_category_uncategorized" in settings and (
+                settings["show_category_uncategorized"] is True
+            ) != (self._cfg.get("show_category_uncategorized", False) is True)
             if "hidden_collection_enabled" in settings:
                 settings["hidden_collection_enabled"] = (
                     settings["hidden_collection_enabled"] is not False
@@ -4878,7 +5160,7 @@ class SettingsApi:
                 if len(webview.windows) > 0:
                     refresh_js = (
                         "window.refreshLibrary && window.refreshLibrary('structure')"
-                        if hidden_collection_changed
+                        if hidden_collection_changed or category_sidebar_changed
                         else "refreshMemes()"
                     )
                     webview.windows[0].evaluate_js(f"{refresh_js};")
@@ -4889,6 +5171,9 @@ class SettingsApi:
 
     def reset_settings(self) -> dict:
         prev_cache_dir = self._cfg.get("cache_dir", "")
+        category_sidebar_changed = (
+            self._cfg.get("show_category_uncategorized", False) is True
+        )
         self._cfg.reset()
         if prev_cache_dir:
             self._cfg.set("cache_dir", prev_cache_dir)
@@ -4902,7 +5187,12 @@ class SettingsApi:
         _cloud_reset()
         try:
             if len(webview.windows) > 0:
-                webview.windows[0].evaluate_js("refreshMemes();")
+                refresh_js = (
+                    "window.refreshLibrary && window.refreshLibrary('structure')"
+                    if category_sidebar_changed
+                    else "refreshMemes()"
+                )
+                webview.windows[0].evaluate_js(f"{refresh_js};")
         except Exception:
             pass
         return {
@@ -4912,6 +5202,7 @@ class SettingsApi:
             "copy_resize_mode": self._cfg.get("copy_resize_mode", 1),
             "auto_start": False,
             "silent_start": False,
+            "show_category_uncategorized": False,
             "hidden_collection_enabled": True,
             "sync_auto_fetch_index": False,
             "sync_auto_sync": False,
@@ -4945,6 +5236,8 @@ class SettingsApi:
             "show_download_done": True,
             "hierarchy_delete_mode": "ask",
             "large_meme_import_mode": "ask",
+            "import_resolution_limit_enabled": False,
+            "import_resolution_limit_px": _IMPORT_MAX_PX,
             "record_recent_use": True,
             "search_description": True,
             "search_image_text": True,
@@ -4963,6 +5256,7 @@ class SettingsApi:
             "napcat_command": "/omm",
             "napcat_send_mode": "original_native",
             "napcat_image_send_mode": "sticker",
+            "qq_drag_cleanup_on_start": True,
             "tg_tdata_path": self._cfg.get("tg_tdata_path", ""),
             "hover_to_play": self._cfg.get("hover_to_play", False),
             "hover_zoom": True,
@@ -6301,8 +6595,18 @@ def _prepare_image_import(path, read_priority="critical") -> dict:
                     w, h = img.size
             except Exception:
                 pass
-    if fsize > _IMPORT_MAX_BYTES or max(w, h) > _IMPORT_MAX_PX:
-        return {"status": "rejected", "error": "文件超过大小/分辨率限制，已跳过"}
+    if fsize > _IMPORT_MAX_BYTES:
+        return {
+            "status": "rejected",
+            "error": "图片超过 %d MiB 原件上限，已跳过"
+            % (_IMPORT_MAX_BYTES // (1024 * 1024)),
+        }
+    max_px = get_import_max_px(get_config())
+    if max_px and max(w, h) > max_px:
+        return {
+            "status": "rejected",
+            "error": f"图片最长边 {max(w, h)}px，超过设置的 {max_px}px 上限，已跳过",
+        }
     fhash = _file_sha256(path, read_priority=read_priority)
     row = db.get_by_hash(fhash)
     if row:
@@ -7268,7 +7572,8 @@ class WebUI:
                                     w, h = img.size
                         except Exception:
                             pass
-                    if fsize > _IMPORT_MAX_BYTES or max(w, h) > _IMPORT_MAX_PX:
+                    max_px = get_import_max_px(cfg)
+                    if fsize > _IMPORT_MAX_BYTES or (max_px and max(w, h) > max_px):
                         rejected += 1
                         logger.info(
                             "import rejected (over limit): %s", os.path.basename(path)
@@ -7891,7 +8196,8 @@ class WebUI:
                                     w, h = img.size
                             except Exception:
                                 pass
-                        if fsize > _IMPORT_MAX_BYTES or max(w, h) > _IMPORT_MAX_PX:
+                        max_px = get_import_max_px(self._cfg)
+                        if fsize > _IMPORT_MAX_BYTES or (max_px and max(w, h) > max_px):
                             logger.info("scan_cache skip (over limit): %s", fname)
                             continue
                         sha256 = hashlib.sha256()
@@ -7958,6 +8264,9 @@ class WebUI:
             hidden=self._silent_start,
         )
         if platform.system() == "Windows":
+            self._window.events.loaded += lambda: _install_text_clipboard_bridge(
+                self._window
+            )
             # frameless=True 会让 WinForms 去掉系统最小化样式；窗口显示后补回，
             # 使任务栏按钮在窗口位于前台时可以再次点击并最小化。
             self._window.events.shown += lambda: _enable_windows_taskbar_minimize(
@@ -8008,6 +8317,9 @@ class WebUI:
                 frameless=True,
                 easy_drag=False,
             )
+            if platform.system() == "Windows":
+                window = self._settings_window
+                window.events.loaded += lambda: _install_text_clipboard_bridge(window)
             return True
         except Exception as e:
             logger.warning(f"create settings window error: {e}")

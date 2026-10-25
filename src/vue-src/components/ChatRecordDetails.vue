@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, ref } from 'vue'
-import { api, rememberFocus, restoreFocus, trapTabFocus } from '../utils/api'
+import { api, createBackdropClickGuard, focusNextDetailInput, handleDetailSaveShortcut, rememberFocus, restoreFocus, trapTabFocus } from '../utils/api'
 
 interface ChatMessageView {
   path: string
@@ -97,6 +97,7 @@ const emit = defineEmits<{
   requestDelete: [recordId: number]
 }>()
 const visible = ref(false)
+const backdrop = createBackdropClickGuard(close)
 const loading = ref(false)
 const error = ref('')
 const detail = ref<ChatRecordDetail | null>(null)
@@ -331,6 +332,7 @@ function quotePreview(quote: ChatQuoteView) {
 }
 
 async function open(recordId: number) {
+  backdrop.reset()
   const generation = ++requestGeneration
   currentRecordId = Number(recordId)
   rememberFocus()
@@ -400,6 +402,7 @@ async function saveManagement() {
 }
 
 function close() {
+  backdrop.reset()
   requestGeneration++
   visible.value = false
   loading.value = false
@@ -437,10 +440,20 @@ function formatTime(value: number | string) {
   return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString()
 }
 
+// 标签名称的 Enter 仍用于添加，空输入则交给详情页跳转到下一项。
+function onNewTagKeydown(e: KeyboardEvent) {
+  if (e.isComposing || e.keyCode === 229 || e.key !== 'Enter' || !tagName.value.trim()) return
+  e.preventDefault()
+  addTag()
+}
+
 function onKeydown(e: KeyboardEvent) {
+  if (e.isComposing || e.keyCode === 229) return
+  if (boxEl.value && focusNextDetailInput(boxEl.value, e)) return
   if (e.key === 'Escape') {
     e.preventDefault()
-    close()
+    e.stopPropagation()
+    if (!e.repeat) close()
   } else if (boxEl.value) {
     trapTabFocus(boxEl.value, e)
   }
@@ -450,12 +463,19 @@ function reload() {
   if (currentRecordId != null) return open(currentRecordId)
 }
 
-defineExpose({ open, close, reload })
+defineExpose({ open, close, reload, isOpen: () => visible.value })
 </script>
 
 <template>
-  <div v-if="visible" class="chat-details-overlay" @click.self="close">
-    <div ref="boxEl" class="chat-details-box" role="dialog" aria-modal="true" aria-labelledby="chat-details-title" @keydown="onKeydown">
+  <div
+    v-if="visible"
+    class="chat-details-overlay"
+    @pointerdown.capture="backdrop.onPointerDown"
+    @pointerup.capture="backdrop.onPointerUp"
+    @pointercancel.capture="backdrop.reset"
+    @click="backdrop.onClick"
+  >
+    <div ref="boxEl" class="chat-details-box" role="dialog" aria-modal="true" aria-labelledby="chat-details-title" @keydown.capture="handleDetailSaveShortcut($event, saveManagement)" @keydown="onKeydown">
       <header class="chat-details-header">
         <div>
           <div id="chat-details-title" class="chat-details-kicker">聊天记录详情</div>
@@ -612,8 +632,8 @@ defineExpose({ open, close, reload })
                 </span>
               </div>
               <div class="chat-tag-new">
-                <input v-model="tagCategory" type="text" placeholder="标签种类" @keydown.enter.prevent="addTag">
-                <input v-model="tagName" type="text" placeholder="新标签" @keydown.enter.prevent="addTag">
+                <input v-model="tagCategory" type="text" placeholder="标签种类">
+                <input v-model="tagName" type="text" placeholder="新标签" @keydown="onNewTagKeydown">
                 <button class="btn btn-sm" type="button" @click="addTag">添加</button>
               </div>
             </div>
@@ -623,11 +643,6 @@ defineExpose({ open, close, reload })
             <code>{{ detail.send_command }}</code>
             <button class="btn btn-primary" type="button" @click="copyCommand">复制发送命令</button>
             <button class="btn btn-danger" type="button" @click="requestDelete">删除聊天记录</button>
-          </div>
-          <div class="chat-management-actions">
-            <button class="btn btn-primary" type="button" :disabled="saving" @click="saveManagement">
-              {{ saving ? '保存中…' : '保存更改' }}
-            </button>
           </div>
         </aside>
 
@@ -746,6 +761,13 @@ defineExpose({ open, close, reload })
           <div v-if="detail.messages.length === 0" class="chat-details-state">归档结构完整，但没有可预览的消息节点。</div>
         </section>
       </div>
+      <div class="chat-management-actions">
+        <span class="chat-shortcuts">Enter 下一项 · Ctrl+Enter 保存</span>
+        <button class="btn btn-secondary" type="button" title="关闭详情，返回主页面（Esc）" :disabled="saving" @click="close">关闭</button>
+        <button v-if="detail && !loading" class="btn btn-primary" type="button" title="保存更改（Ctrl+Enter / Ctrl+S）" :disabled="saving" @click="saveManagement">
+          {{ saving ? '保存中…' : '保存更改' }}
+        </button>
+      </div>
     </div>
   </div>
 </template>
@@ -775,6 +797,7 @@ defineExpose({ open, close, reload })
 }
 
 .chat-details-header {
+  flex-shrink: 0;
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
@@ -799,6 +822,7 @@ defineExpose({ open, close, reload })
   flex: 1;
   display: grid;
   grid-template-columns: 250px minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
 }
 
 .chat-details-meta {
@@ -824,6 +848,23 @@ defineExpose({ open, close, reload })
 .chat-details-meta dt { color: var(--muted); font-size: 10px; }
 .chat-details-meta dd { margin: 2px 0 0; color: var(--fg); font-size: 12px; word-break: break-all; }
 
+.chat-details-header h2,
+.chat-details-meta dt,
+.chat-details-meta dd,
+.chat-source-location-list span,
+.chat-command-help > span,
+.chat-command-help code,
+.chat-message-identity strong,
+.chat-message-identity time,
+.chat-quoted-head span,
+.chat-quoted-head time,
+.chat-message p,
+.nested-label {
+  -webkit-user-select: text;
+  user-select: text;
+  cursor: text;
+}
+
 .chat-management {
   display: flex;
   flex-direction: column;
@@ -834,12 +875,16 @@ defineExpose({ open, close, reload })
 }
 
 .chat-management-actions {
+  flex-shrink: 0;
   display: flex;
+  flex-wrap: wrap;
+  align-items: center;
   justify-content: flex-end;
-  margin-top: 14px;
-  padding-top: 14px;
+  gap: 8px;
+  padding: 12px 20px;
   border-top: 1px solid var(--border);
 }
+.chat-shortcuts { margin-right: auto; color: var(--muted); font-size: 11px; }
 .chat-record-identity { display: flex; flex-direction: column; gap: 7px; margin-bottom: 4px; }
 .chat-record-identity p { margin: 0; color: var(--muted); font-size: 9px; line-height: 1.45; }
 .chat-management-error { margin: 0; color: var(--danger); font-size: 10px; }
@@ -995,7 +1040,7 @@ defineExpose({ open, close, reload })
 .chat-details-state.error { color: var(--danger); }
 
 @media (max-width: 720px) {
-  .chat-details-content { grid-template-columns: 1fr; }
+  .chat-details-content { grid-template-columns: 1fr; grid-template-rows: minmax(0, 230px) minmax(0, 1fr); }
   .chat-details-meta { max-height: 230px; border-right: 0; border-bottom: 1px solid var(--border); }
 }
 </style>

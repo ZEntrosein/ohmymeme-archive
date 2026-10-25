@@ -6,6 +6,7 @@ import re
 import sqlite3
 import threading
 import time
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -1940,6 +1941,34 @@ class MemeDB:
             conn.commit()
             return True
 
+    def set_memes_category(self, meme_ids: List[int], category_id: int = None) -> int:
+        """在单事务中设置所选表情的类别，缺失成员时整批回滚。"""
+        ids = list(dict.fromkeys(int(value) for value in meme_ids))
+        if not ids:
+            return 0
+        with self._lock:
+            conn = self._get_conn()
+            try:
+                if len(self._existing_meme_ids(conn, ids)) != len(ids):
+                    raise ValueError("选中的表情包已不存在，请刷新后重试")
+                if (
+                    category_id is not None
+                    and not conn.execute(
+                        "SELECT 1 FROM categories WHERE id=?", (category_id,)
+                    ).fetchone()
+                ):
+                    raise ValueError("类别不存在")
+                conn.executemany(
+                    "UPDATE memes SET category_id=?, "
+                    "updated_at=datetime('now','localtime') WHERE id=?",
+                    [(category_id, meme_id) for meme_id in ids],
+                )
+                conn.commit()
+                return len(ids)
+            except Exception:
+                conn.rollback()
+                raise
+
     def set_chat_category(self, chat_id: int, category_id: int = None) -> bool:
         with self._lock:
             conn = self._get_conn()
@@ -2714,6 +2743,69 @@ class MemeDB:
                 conn.rollback()
                 raise
 
+    def move_hierarchy_node(
+        self, kind: str, node_id: int, parent_id: int = None, storage_move=None
+    ) -> dict:
+        """在写锁内校验并调整父级，可附带失败时回滚的存储上下文。"""
+        if kind not in ("category", "collection"):
+            raise ValueError("层级类型无效")
+        if (
+            isinstance(node_id, bool)
+            or not isinstance(node_id, int)
+            or node_id <= 0
+            or parent_id is not None
+            and (
+                isinstance(parent_id, bool)
+                or not isinstance(parent_id, int)
+                or parent_id <= 0
+            )
+        ):
+            raise ValueError("只能移动真实类别或分组")
+        table = "categories" if kind == "category" else "collections"
+        label = "类别" if kind == "category" else "分组"
+        with self._lock:
+            conn = self._get_conn()
+            rows = conn.execute(f"SELECT id, name, parent_id FROM {table}").fetchall()
+            by_id = {row[0]: row for row in rows}
+            node = by_id.get(node_id)
+            if node is None or parent_id is not None and parent_id not in by_id:
+                raise ValueError(f"{label}不存在")
+            if kind == "collection" and self.is_hidden_collection_root(node_id):
+                raise ValueError("“隐藏”是系统根分组，不能移动")
+            current = parent_id
+            visited = set()
+            while current is not None:
+                if current == node_id or current in visited:
+                    raise ValueError(f"不能移入自身或自己的子{label}")
+                visited.add(current)
+                current = by_id[current][2]
+            if node[2] == parent_id:
+                return {"changed": False, "parent_id": parent_id}
+            if any(
+                row[0] != node_id
+                and row[2] == parent_id
+                and row[1].casefold() == node[1].casefold()
+                for row in rows
+            ):
+                raise ValueError(f"目标下已存在同名{label}，不能合并或覆盖")
+            if (
+                kind == "category"
+                and parent_id is None
+                and node[1].casefold() == CHAT_RECORD_MEDIA_DIRNAME.casefold()
+            ):
+                raise ValueError("该名称由聊天记录媒体目录保留")
+            with storage_move if storage_move is not None else nullcontext():
+                try:
+                    conn.execute(
+                        f"UPDATE {table} SET parent_id=? WHERE id=?",
+                        (parent_id, node_id),
+                    )
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+                    raise
+            return {"changed": True, "parent_id": parent_id}
+
     def rename_collection(self, collection_id: int, new_name: str):
         with self._lock:
             conn = self._get_conn()
@@ -3040,7 +3132,8 @@ class MemeDB:
         with self._lock:
             conn = self._get_conn()
             rows = conn.execute(
-                "SELECT id, filename, original_name, perceptual_hash, stego_of_hash "
+                "SELECT id, filename, original_name, file_hash, "
+                "perceptual_hash, stego_of_hash "
                 "FROM memes WHERE (stego_of_hash IS NULL OR stego_of_hash = '') "
                 "ORDER BY sort_order ASC"
             ).fetchall()

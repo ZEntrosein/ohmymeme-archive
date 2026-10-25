@@ -6,10 +6,16 @@ import { trapTabFocus } from '../utils/api'
 const cb = useCollectionBuilder()
 
 const isPick = computed(() => cb.pickMode.value !== '')
+const isCategory = computed(() => cb.pickMode.value === 'category')
+const targetLabel = computed(() => isCategory.value ? '类别' : '分组')
 const pickTitle = computed(() =>
-  cb.pickMode.value === 'move' ? '移动到分组' : '加入分组'
+  isCategory.value ? '设置类别' : cb.pickMode.value === 'move' ? '移动到分组' : '加入分组'
 )
 const confirmLabel = computed(() => {
+  if (isCategory.value) {
+    if (cb.selectedId.value === 0) return '设为未分类'
+    return cb.selectedId.value !== null ? '设置为该类别' : '创建并设置类别'
+  }
   if (!isPick.value) return cb.selectedId.value !== null ? '保存到该分组' : '创建分组'
   const verb = cb.pickMode.value === 'move' ? '移动到' : '加入'
   const target = cb.selectedId.value !== null ? '该分组' : '新分组'
@@ -30,13 +36,15 @@ function onBoxKeydown(e: KeyboardEvent) {
     <div id="cb-box" :class="{ 'cb-box-pick': isPick }" role="dialog" aria-modal="true" aria-labelledby="cb-title" @keydown="onBoxKeydown">
       <div class="cb-header">
         <h2 id="cb-title">{{ isPick ? pickTitle : '添加分组' }}</h2>
-        <div v-if="isPick" class="cb-pick-hint">将{{ cb.pickMode.value === 'move' ? '移动' : '加入' }}已选的 {{ cb.selectedIds.value.size }} 个表情包</div>
+        <div v-if="isPick" class="cb-pick-hint">
+          {{ isCategory ? '为' : '将' }}已选的 {{ cb.selectedIds.value.size }} 个表情包{{ isCategory ? '设置类别，替换原类别并同步移动原件' : cb.pickMode.value === 'move' ? '移动到分组' : '加入分组' }}
+        </div>
         <div class="cb-name-wrap">
           <input
             id="cb-name"
             v-model="cb.collectionName.value"
             type="text"
-            placeholder="搜索分组或输入新分组名..."
+            :placeholder="`搜索${targetLabel}或输入新${targetLabel}名...`"
             autocomplete="off"
             spellcheck="false"
             @focus="cb.showDropdown.value = true"
@@ -47,12 +55,12 @@ function onBoxKeydown(e: KeyboardEvent) {
             class="cb-dropdown show"
             :class="{ 'cb-dropdown-inline': isPick }"
           >
-            <div class="cb-dd-section" v-if="cb.collectionName.value.trim() || (!isPick && cb.selectedId.value == null)">新建分组</div>
+            <div class="cb-dd-section" v-if="cb.collectionName.value.trim() || (!isPick && cb.selectedId.value == null)">新建{{ targetLabel }}</div>
             <div v-if="cb.collectionName.value.trim()" class="cb-dd-item cb-dd-new-item" @click="cb.createNew()">
               <span class="cb-dd-new">「{{ cb.collectionName.value }}」</span>
-              <span class="cb-dd-hint">创建新分组</span>
+              <span class="cb-dd-hint">创建新{{ targetLabel }}</span>
             </div>
-            <div class="cb-dd-section">加入已有分组</div>
+            <div class="cb-dd-section">{{ isCategory ? '选择类别' : '加入已有分组' }}</div>
             <div
               v-for="opt in cb.filteredCollectionOptions.value"
               :key="opt.id"
@@ -62,7 +70,7 @@ function onBoxKeydown(e: KeyboardEvent) {
             >
               {{ opt.depth || opt.name }}
             </div>
-            <div v-if="!cb.filteredCollectionOptions.value.length" class="cb-dd-item cb-dd-hint">无匹配分组</div>
+            <div v-if="!cb.filteredCollectionOptions.value.length" class="cb-dd-item cb-dd-hint">无匹配{{ targetLabel }}</div>
           </div>
         </div>
       </div>

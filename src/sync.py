@@ -18,7 +18,7 @@ from urllib.parse import quote, unquote, urlparse
 from .bulk_read import enabled as bulk_read_enabled
 from .bulk_read import guarded_read
 from .category_storage import category_dir, validate_category_name
-from .config import _IMPORT_MAX_BYTES, _IMPORT_MAX_PX, get_config
+from .config import _IMPORT_MAX_BYTES, get_config, get_import_max_px
 from .database import get_db
 from .manifest import INDEX_FILENAME
 from .manifest import build as build_manifest
@@ -929,6 +929,7 @@ def _push_worker(entries, remote_root, cache_dir, remote_memes):
 
 def _pull_worker(entries, remote_root, cache_dir, db):
     """单线程批量下载一批文件"""
+    cfg = get_config()
     bk = _get_backend()
     bk.connect()
     local_results = {
@@ -1019,7 +1020,8 @@ def _pull_worker(entries, remote_root, cache_dir, db):
                         except Exception:
                             pass
                         fsize = local_path.stat().st_size
-                        if fsize > _IMPORT_MAX_BYTES or max(w, h) > _IMPORT_MAX_PX:
+                        max_px = get_import_max_px(cfg)
+                        if fsize > _IMPORT_MAX_BYTES or (max_px and max(w, h) > max_px):
                             # 超限文件不接收：删除本地文件并跳过（不写入 manifest）
                             logger.info(f"pull skip (over limit): {fname}")
                             local_results["skipped"] += 1

@@ -37,8 +37,8 @@ const preselectIds = ref<number[]>([])
 const memberLoading = ref(false)
 // 分组成员加载失败：保留现有选择、禁用确认，提供重试
 const memberLoadError = ref(false)
-// 选择模式：'' = 构建模式（双栏），'add'/'move' = 批量加入/移动（仅选分组）
-const pickMode = ref<'' | 'add' | 'move'>('')
+// 选择模式：构建分组、批量加组/移组或设置单归属类别。
+const pickMode = ref<'' | 'add' | 'move' | 'category'>('')
 const pickFromId = ref(0)
 
 let onConfirmCallback: ((result: CollectionConfirm) => void) | null = null
@@ -109,8 +109,8 @@ export function useCollectionBuilder() {
     nameInput?.select()
   }
 
-  // 选择模式打开：不加载表情库，仅选分组后确认（批量加入/移动）
-  async function openPick(onConfirm: (result: CollectionConfirm) => void, mode: 'add' | 'move', preselect: number[] = [], fromId = 0) {
+  // 选择模式打开：仅加载分组/类别选项，不加载表情库。
+  async function openPick(onConfirm: (result: CollectionConfirm) => void, mode: 'add' | 'move' | 'category', preselect: number[] = [], fromId = 0) {
     onConfirmCallback = onConfirm
     preselectIds.value = preselect
     pickMode.value = mode
@@ -128,8 +128,9 @@ export function useCollectionBuilder() {
     selectedName.value = ''
     showDropdown.value = false
 
-    const collections = await api('get_collections')
+    const collections = await api(mode === 'category' ? 'get_categories' : 'get_collections')
     const opts: CollectionOption[] = []
+    if (mode === 'category') opts.push({ id: 0, name: '未分类', depth: '未分类' })
     flattenCollections(collections || [], '', opts)
     // move 模式排除源分组及其整棵子树（移入后代等于移出后又加回递归视图，后端同样拒绝）
     const excluded =
@@ -187,7 +188,7 @@ export function useCollectionBuilder() {
     selectedName.value = opt.depth || opt.name
     collectionName.value = opt.depth || opt.name
     showDropdown.value = false
-    // 选择模式不加载成员（批量操作为追加/移动语义，非覆盖）
+    // 选择模式只选择目标归属，不加载或覆盖分组成员。
     if (pickMode.value) return
     // 已有分组：加载其现有成员，并保留预选的表情（右键带入的新增项）
     loadMembers(opt.id)

@@ -359,6 +359,12 @@ body {
   height: 16px;
 }
 
+#sidebar-header.hierarchy-root-target {
+  background: var(--primary-light);
+  outline: 2px solid var(--primary);
+  outline-offset: -2px;
+}
+
 #sidebar.collapsed .tree-row {
   justify-content: center;
   padding: 8px 0;
@@ -977,6 +983,7 @@ body {
 /* 底部批量操作栏（flow 布局，不与 toast/弹层重叠） */
 #batch-bar {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 8px;
   padding: 8px 12px;
