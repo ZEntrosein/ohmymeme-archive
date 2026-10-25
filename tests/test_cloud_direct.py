@@ -393,6 +393,7 @@ def _reset_cloud_state():
             )
         with webui_module._cloud_inflight_lock:
             webui_module._cloud_inflight.clear()
+        webui_module._sync_status_reset()
 
     _reset()
     yield
@@ -1317,3 +1318,220 @@ def test_manifest_roundtrip_keeps_classified_tags_and_category_paths(js):
 def test_cloud_missing_rejects_invalid_category_paths(parts):
     data = {"memes": [{"filename": "c.png", "sha256": SHA_C, "category_path": parts}]}
     assert cloud_missing(data, []) == []
+
+def test_manifest_collection_toggle_survives_incremental_custom_updates(js):
+    from src import manifest
+
+    category = js.db.create_category("角色")
+    group = js.db.create_collection("喜欢")
+    mid = js.db.add_meme("c.png", file_hash=SHA_C, category_id=category)
+    js.db.add_to_collection(mid, group)
+    manifest.build()
+    assert manifest.load()["collections"]
+    js.cfg.set("manifest_include_collections", False)
+    assert manifest.update_meme_name("c.png", "新标题")
+    assert "collections" not in manifest.load()
+    assert manifest.update_meme_structure(mid)
+    assert "collections" not in manifest.load()
+    assert manifest.load()["memes"][0]["category_path"] == ["角色"]
+    second = js.db.add_meme("extra.png", file_hash=SHA_A)
+    assert manifest.add_memes([second])
+    assert "collections" not in manifest.load()
+    js.db.delete_meme(second)
+    assert manifest.remove_memes(["extra.png"])
+    assert "collections" not in manifest.load()
+    js.cfg.set("manifest_include_collections", True)
+    manifest.build()
+    assert manifest.load()["collections"][0]["name"] == "喜欢"
+
+
+# ─── 主窗口顶栏同步状态 ───
+
+
+def test_sync_status_unconfigured_hidden(js):
+    js.cfg.set("sync_type", "")
+    assert js.api.get_sync_status() == {"configured": False}
+
+
+def test_sync_status_diff_counts(js, monkeypatch):
+    """本地缺失 = 云端有本机没有；云端缺失 = 本机有云端没有"""
+    from src import webui as webui_module
+
+    js.db.add_meme(filename="local.png", file_hash=SHA_A)
+    js.db.add_meme(filename="new.png", file_hash=SHA_B)
+    manifest = {
+        "memes": [
+            {"filename": "local.png", "sha256": SHA_A},
+            {"filename": "remote.png", "sha256": SHA_C},
+        ]
+    }
+    with webui_module._sync_status_lock:
+        webui_module._sync_status_state.update(
+            manifest=manifest,
+            cache_loaded=True,
+            checked=True,
+            refreshing=False,
+            error="",
+        )
+    refreshed = []
+    monkeypatch.setattr(
+        webui_module,
+        "_start_sync_status_refresh",
+        lambda force=False: refreshed.append(force) or False,
+    )
+
+    r = js.api.get_sync_status()
+
+    assert r["configured"] is True
+    assert r["manifest_state"] == "ok"
+    assert r["local_missing"] == 1
+    assert r["cloud_missing"] == 1
+    assert r["local_count"] == 2
+    assert r["remote_count"] == 2
+    assert r["synced"] is False
+    assert refreshed == []  # 已检查过，轮询不重复拉清单
+
+    js.api.get_sync_status(True)
+    assert refreshed == [True]  # 手动重新检查强制拉取
+
+
+def test_sync_status_synced_and_missing_manifest(js):
+    from src import webui as webui_module
+
+    js.db.add_meme(filename="a.png", file_hash=SHA_A)
+    with webui_module._sync_status_lock:
+        webui_module._sync_status_state.update(
+            manifest={"memes": [{"filename": "a.png", "sha256": SHA_A}]},
+            cache_loaded=True,
+            checked=True,
+            refreshing=False,
+            error="",
+        )
+    r = js.api.get_sync_status()
+    assert r["synced"] is True
+    assert r["local_missing"] == 0 and r["cloud_missing"] == 0
+
+    with webui_module._sync_status_lock:
+        webui_module._sync_status_state.update(
+            manifest=None, checked=True, refreshing=False, error=""
+        )
+    r = js.api.get_sync_status()
+    assert r["manifest_state"] == "missing"
+    assert r["synced"] is False
+
+
+def test_sync_status_transfer_progress(js, monkeypatch):
+    from src import webui as webui_module
+
+    with webui_module._sync_status_lock:
+        webui_module._sync_status_state.update(
+            manifest={"memes": []},
+            cache_loaded=True,
+            checked=True,
+            refreshing=False,
+            error="",
+        )
+    monkeypatch.setattr(
+        sync,
+        "get_sync_progress",
+        lambda: {
+            "status": "uploading",
+            "direction": "upload",
+            "files_done": 2,
+            "files_total": 7,
+            "bytes_done": 2048,
+            "bytes_total": 8192,
+            "progress": 25,
+            "speed": 1024,
+            "current_file": "a.png",
+        },
+    )
+    r = js.api.get_sync_status()
+    t = r["transfer"]
+    assert t["active"] is True
+    assert t["status"] == "uploading"
+    assert t["files_done"] == 2 and t["files_total"] == 7
+    assert t["remaining"] == 5
+    assert t["speed"] == 1024
+    assert t["current_file"] == "a.png"
+
+
+def test_sync_status_reset_on_cloud_change(js):
+    from src import webui as webui_module
+
+    with webui_module._sync_status_lock:
+        webui_module._sync_status_state.update(
+            manifest={"memes": []}, cache_loaded=True, checked=True
+        )
+    webui_module._cloud_reset()
+    with webui_module._sync_status_lock:
+        assert webui_module._sync_status_state["manifest"] is None
+        assert webui_module._sync_status_state["checked"] is False
+        assert webui_module._sync_status_state["cache_loaded"] is False
+
+
+def test_sync_status_invalidate_keeps_manifest(js):
+    from src import webui as webui_module
+
+    cached = {"memes": [{"filename": "a.png", "sha256": SHA_A}]}
+    with webui_module._sync_status_lock:
+        webui_module._sync_status_state.update(
+            manifest=cached, cache_loaded=True, checked=True, refreshing=False
+        )
+    webui_module._sync_status_invalidate()
+    with webui_module._sync_status_lock:
+        assert webui_module._sync_status_state["manifest"] == cached
+        assert webui_module._sync_status_state["checked"] is False
+        assert webui_module._sync_status_state["refreshing"] is False
+
+
+def test_sync_status_refresh_worker(js, monkeypatch):
+    from src import webui as webui_module
+
+    manifest = {"memes": [{"filename": "a.png", "sha256": SHA_A}]}
+    monkeypatch.setattr(sync, "download_index", lambda: manifest)
+    with webui_module._sync_status_lock:
+        gen = webui_module._sync_status_gen
+        webui_module._sync_status_state.update(refreshing=True, checked=False)
+    webui_module._sync_status_worker(gen)
+    with webui_module._sync_status_lock:
+        assert webui_module._sync_status_state["manifest"] == manifest
+        assert webui_module._sync_status_state["checked"] is True
+        assert webui_module._sync_status_state["refreshing"] is False
+        assert webui_module._sync_status_state["error"] == ""
+
+
+def test_sync_status_refresh_worker_keeps_cache_on_error(js, monkeypatch):
+    from src import webui as webui_module
+
+    stale = {"memes": []}
+    monkeypatch.setattr(
+        sync, "download_index", lambda: (_ for _ in ()).throw(RuntimeError("boom"))
+    )
+    with webui_module._sync_status_lock:
+        gen = webui_module._sync_status_gen
+        webui_module._sync_status_state.update(
+            manifest=stale, cache_loaded=True, refreshing=True, checked=False
+        )
+    webui_module._sync_status_worker(gen)
+    with webui_module._sync_status_lock:
+        assert webui_module._sync_status_state["manifest"] == stale
+        assert webui_module._sync_status_state["checked"] is True
+        assert webui_module._sync_status_state["refreshing"] is False
+        assert "boom" in webui_module._sync_status_state["error"]
+
+
+def test_sync_status_worker_discards_stale_generation(js, monkeypatch):
+    from src import webui as webui_module
+
+    monkeypatch.setattr(sync, "download_index", lambda: {"memes": []})
+    with webui_module._sync_status_lock:
+        stale_gen = webui_module._sync_status_gen
+        webui_module._sync_status_state.update(
+            manifest=None, refreshing=True, checked=False
+        )
+    webui_module._sync_status_reset()
+    webui_module._sync_status_worker(stale_gen)
+    with webui_module._sync_status_lock:
+        assert webui_module._sync_status_state["manifest"] is None
+        assert webui_module._sync_status_state["checked"] is False

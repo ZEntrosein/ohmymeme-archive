@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import shutil
+import ssl
 import tempfile
 import threading
 import time
@@ -539,7 +540,14 @@ class _WebDAVBackend(_SyncBackend):
         if headers:
             for k, v in headers.items():
                 req.add_header(k, v)
-        return urllib.request.urlopen(req, timeout=self.timeout)
+        context = None
+        if url.lower().startswith("https://") and self.cfg.get(
+            "webdav_allow_insecure", False
+        ):
+            context = ssl._create_unverified_context()
+        if context is None:
+            return urllib.request.urlopen(req, timeout=self.timeout)
+        return urllib.request.urlopen(req, timeout=self.timeout, context=context)
 
     def ensure_remote_dir(self, path):
         rel = ""
@@ -655,6 +663,12 @@ class _WebDAVBackend(_SyncBackend):
                 ) from e
             raise SyncError("WebDAV 连接测试失败: HTTP %d" % e.code) from e
         except (urllib.error.URLError, OSError, TimeoutError) as e:
+            reason = getattr(e, "reason", e)
+            text = str(reason)
+            if isinstance(reason, ssl.SSLCertVerificationError) or (
+                "CERTIFICATE_VERIFY_FAILED" in text
+            ):
+                raise SyncError("WEBDAV_SSL_UNTRUSTED: %s" % text) from e
             raise SyncError("WebDAV 网络不可达: %s" % e) from e
 
     def delete_file(self, path):
@@ -851,8 +865,8 @@ def _fetch_remote_memes(bk, remote_root):
 # ─── 多线程工作函数 ───
 
 
-def _push_worker(entries, remote_root, cache_dir, remote_memes):
-    """单线程批量上传一批文件"""
+def _push_worker(entries, remote_root, cache_dir):
+    """单线程批量上传一批文件（调用方已按远端 manifest 过滤出缺失/变更的文件）"""
     bk = _get_backend()
     bk.connect()
     local_results = {"uploaded": 0, "skipped": 0, "errors": 0, "bytes": 0, "failed": []}
@@ -868,18 +882,7 @@ def _push_worker(entries, remote_root, cache_dir, remote_memes):
             with guarded_read():
                 local_exists = local_file.exists()
                 fsize = local_file.stat().st_size if local_exists else 0
-            local_hash = entry["sha256"]
-            remote_entry = remote_memes.get(fname)
             rem_path = remote_root.rstrip("/") + "/" + REMOTE_MEME_DIR + "/" + fname
-            if remote_entry and remote_entry.get("sha256") == local_hash:
-                try:
-                    remote_ok = bk.file_exists(rem_path)
-                except Exception:
-                    remote_ok = False
-                if remote_ok:
-                    local_results["skipped"] += 1
-                    _increment_sync_progress(files_add=1)
-                    continue
             if not local_exists:
                 local_results["errors"] += 1
                 local_results["failed"].append(
@@ -1449,21 +1452,9 @@ def push(delete_remote: bool = None) -> dict:
         if not local.get("memes"):
             raise SyncError("local manifest is empty, nothing to push")
 
-    # 计算总文件数和字节数
+    # 建连前仅显示文件数；实际大小在远端清单差集确定后再读取。
     files_total = len(local["memes"])
     bytes_total = 0
-    for entry in local["memes"]:
-        try:
-            fp = _entry_local_path(cache_dir, entry)
-            if not fp.exists():
-                legacy_file = cache_dir / entry["filename"]
-                if legacy_file.is_file():
-                    fp = legacy_file
-        except ValueError:
-            continue
-        with guarded_read():
-            if fp.exists():
-                bytes_total += fp.stat().st_size
 
     if not _sync_run_lock.acquire(blocking=False):
         raise SyncError("同步正在进行中")
@@ -1485,31 +1476,55 @@ def push(delete_remote: bool = None) -> dict:
         remote_memes = _fetch_remote_memes(bk, remote_root)
         local_idx = {m["filename"]: m for m in local["memes"]}
 
-        entries = local["memes"]
-        if max_workers <= 1 or len(entries) <= 1:
+        # 仅上传云端缺失/变更的文件：按远端 manifest 比对（文件名缺失或 sha256 不同）
+        entries = [
+            m
+            for m in local["memes"]
+            if (remote_memes.get(m["filename"]) or {}).get("sha256") != m["sha256"]
+        ]
+        skipped_uptodate = len(local["memes"]) - len(entries)
+
+        # 进度总数只反映实际要上传的文件（连接前已按本地数占位，此处重算）
+        files_total = len(entries)
+        bytes_total = 0
+        for entry in entries:
+            fp = _entry_local_path(cache_dir, entry)
+            with guarded_read():
+                if not fp.exists():
+                    legacy_file = cache_dir / entry["filename"]
+                    if legacy_file.is_file():
+                        fp = legacy_file
+                if fp.exists():
+                    bytes_total += fp.stat().st_size
+        _update_sync_state(files_total=files_total, bytes_total=bytes_total)
+
+        if not entries:
+            chunks = []
+        elif max_workers <= 1 or len(entries) <= 1:
             chunks = [entries]
         else:
             chunks = _chunk_list(entries, min(max_workers, len(entries)))
 
         aggregated = {
             "uploaded": 0,
-            "skipped": 0,
+            "skipped": skipped_uptodate,
             "errors": 0,
             "bytes": 0,
             "failed": [],
         }
-        with ThreadPoolExecutor(max_workers=len(chunks)) as executor:
-            futures = [
-                executor.submit(_push_worker, ch, remote_root, cache_dir, remote_memes)
-                for ch in chunks
-            ]
-            for future in as_completed(futures):
-                r = future.result()
-                aggregated["uploaded"] += r["uploaded"]
-                aggregated["skipped"] += r["skipped"]
-                aggregated["errors"] += r["errors"]
-                aggregated["bytes"] += r["bytes"]
-                aggregated["failed"].extend(r.get("failed", []))
+        if chunks:
+            with ThreadPoolExecutor(max_workers=len(chunks)) as executor:
+                futures = [
+                    executor.submit(_push_worker, ch, remote_root, cache_dir)
+                    for ch in chunks
+                ]
+                for future in as_completed(futures):
+                    r = future.result()
+                    aggregated["uploaded"] += r["uploaded"]
+                    aggregated["skipped"] += r["skipped"]
+                    aggregated["errors"] += r["errors"]
+                    aggregated["bytes"] += r["bytes"]
+                    aggregated["failed"].extend(r.get("failed", []))
 
         if aggregated["errors"] > 0:
             _update_sync_state(failed_items=aggregated["failed"])
@@ -1649,23 +1664,32 @@ def sync_test() -> str:
 def _apply_remote_collections(remote_data: dict):
     db = get_db()
 
-    def walk(items, parent_id=None):
-        for rc in items or []:
+    def walk(nodes, parent_id=None):
+        if not isinstance(nodes, list):
+            return
+        for rc in nodes:
             if not isinstance(rc, dict):
                 continue
-            cname = str(rc.get("name") or "").strip()
+            cname = rc.get("name")
+            if not isinstance(cname, str):
+                continue
+            cname = cname.strip()
             if not cname:
                 continue
-            cid = db.create_collection(cname, parent_id=parent_id)
+            cid = db.create_collection(cname, parent_id)
             if cid < 0:
                 continue
-            for fname in rc.get("filenames", []):
-                row = db.get_by_filename(fname)
-                if row:
-                    db.add_to_collection(row["id"], cid)
-            walk(rc.get("children", []), cid)
+            filenames = rc.get("filenames")
+            if isinstance(filenames, list):
+                for fname in filenames:
+                    if not isinstance(fname, str) or not _safe_remote_fname(fname):
+                        continue
+                    row = db.get_by_filename(fname)
+                    if row:
+                        db.add_to_collection(row["id"], cid)
+            walk(rc.get("children"), cid)
 
-    walk(remote_data.get("collections", []))
+    walk(remote_data.get("collections"))
 
 
 def _apply_remote_categories(remote_data: dict):

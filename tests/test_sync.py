@@ -596,6 +596,90 @@ class TestSyncPush(unittest.TestCase):
         local = json.loads((self.data_dir / INDEX_FILENAME).read_text(encoding="utf-8"))
         self.assertNotIn("favorite", local)
 
+    def test_build_manifest_omits_collections_when_disabled(self):
+        """manifest_include_collections=False 时顶层不含 collections 键"""
+        self.cfg.set("manifest_include_collections", False)
+        sync.build_manifest()
+        local = json.loads((self.data_dir / INDEX_FILENAME).read_text(encoding="utf-8"))
+        self.assertNotIn("collections", local)
+
+    def test_build_manifest_includes_collections_by_default(self):
+        """分组写入清单默认开启"""
+        sync.build_manifest()
+        local = json.loads((self.data_dir / INDEX_FILENAME).read_text(encoding="utf-8"))
+        self.assertIn("collections", local)
+
+    def test_apply_remote_collections_restores_nested_tree(self):
+        """pull 应用远端分组时递归 children，恢复多级分组与成员关系"""
+
+        class TrackingDb:
+            def __init__(self):
+                self.next_id = 0
+                self.collections = []
+                self.members = []
+
+            def create_collection(self, name, parent_id=None):
+                self.next_id += 1
+                self.collections.append((self.next_id, name, parent_id))
+                return self.next_id
+
+            def get_by_filename(self, filename):
+                ids = {"a.png": 11, "b.png": 12}
+                return {"id": ids[filename]} if filename in ids else None
+
+            def add_to_collection(self, meme_id, collection_id):
+                self.members.append((meme_id, collection_id))
+
+        db = TrackingDb()
+        data = {
+            "collections": [
+                {
+                    "name": "父分组",
+                    "filenames": ["a.png"],
+                    "children": [
+                        {"name": "子分组", "filenames": ["b.png"]},
+                    ],
+                }
+            ]
+        }
+        with patch("src.sync.get_db", return_value=db):
+            sync._apply_remote_collections(data)
+        self.assertEqual(
+            db.collections,
+            [(1, "父分组", None), (2, "子分组", 1)],
+        )
+        self.assertEqual(db.members, [(11, 1), (12, 2)])
+
+    def test_apply_remote_collections_ignores_unsafe_names(self):
+        """远端分组条目非法/文件名不安全时跳过，不影响其余分组"""
+
+        class TrackingDb:
+            def __init__(self):
+                self.collections = []
+                self.members = []
+
+            def create_collection(self, name, parent_id=None):
+                self.collections.append((name, parent_id))
+                return 7
+
+            def get_by_filename(self, filename):
+                return {"id": 1}
+
+            def add_to_collection(self, meme_id, collection_id):
+                self.members.append((meme_id, collection_id))
+
+        db = TrackingDb()
+        data = {
+            "collections": [
+                {"name": "", "filenames": ["a.png"]},
+                {"name": "正常", "filenames": ["../evil.png", "ok.png"]},
+            ]
+        }
+        with patch("src.sync.get_db", return_value=db):
+            sync._apply_remote_collections(data)
+        self.assertEqual(db.collections, [("正常", None)])
+        self.assertEqual(db.members, [(1, 7)])
+
     def test_pull_applies_remote_favorite(self):
         """pull 把远端 favorite 并集合并进本地（经 _apply_remote_favorites）"""
         self.fake_backend.remote_memes = {"test.png": _entry("test.png", "abc")}
@@ -711,23 +795,31 @@ class TestSyncPush(unittest.TestCase):
         self.assertEqual(result["skipped"], 1)
         self.assertEqual(result["uploaded"], 0)
 
-    def test_push_reuploads_when_remote_file_missing(self):
-        """远端清单声称一致但真实文件缺失 → push 重新上传（污染自愈）"""
-        # 远端清单有 test.png(同hash)，但物理文件缺失
+    def test_push_skips_when_remote_manifest_matches(self):
+        """远端清单声明一致（同 hash）即跳过，不再逐文件复核物理存在"""
+        # 远端清单有 test.png(同hash)，物理文件缺失也以清单为准，不重传
         self.fake_backend.remote_memes = {"test.png": _entry("test.png", "abc")}
         self.fake_backend.remote_files = set()  # 物理缺失
         result = sync.push()
-        self.assertEqual(result["uploaded"], 1)  # 重新上传而非 skip
-        self.assertEqual(result["skipped"], 0)
-        self.assertIn("test.png", self.fake_backend.remote_files)  # 已补传
+        self.assertEqual(result["uploaded"], 0)
+        self.assertEqual(result["skipped"], 1)
 
-    def test_push_reuploads_when_existence_check_fails(self):
-        """file_exists 复核异常 → 保守重传（不依赖污染清单）"""
+    def test_push_skips_without_existence_check(self):
+        """仅比对远端清单，不再调用 file_exists（file_exists 抛异常也不影响）"""
         self.fake_backend.remote_memes = {"test.png": _entry("test.png", "abc")}
         self.fake_backend.raise_on_exists.add("test.png")
         result = sync.push()
-        self.assertEqual(result["uploaded"], 1)
-        self.assertEqual(result["skipped"], 0)
+        self.assertEqual(result["uploaded"], 0)
+        self.assertEqual(result["skipped"], 1)
+
+    def test_push_matching_manifest_does_not_touch_local_originals(self):
+        self.fake_backend.remote_memes = {"test.png": _entry("test.png", "abc")}
+        with patch("src.sync._entry_local_path") as local_path:
+            result = sync.push()
+        local_path.assert_not_called()
+        self.assertEqual(result["uploaded"], 0)
+        self.assertEqual(result["skipped"], 1)
+        self.assertEqual(get_sync_progress()["bytes_total"], 0)
 
     # ─── PR4 新增用例 ───
 

@@ -143,6 +143,7 @@ class Config:
         "sync_hide_upload_warning": False,  # 不再提醒上传警告
         "sync_threads": 3,  # 同步并发线程数（1-8）
         "manifest_include_tags": True,  # 将标签写入 meme-index.json 清单
+        "manifest_include_collections": True,  # 将分组写入 meme-index.json 清单
         "manifest_include_favorites": True,  # 将收藏夹写入 meme-index.json 清单
         "cloud_direct": True,  # 云端直接使用（缺失表情点击下载；默认开启）
         "cloud_thumb_auto_push": True,  # 启动时静默检测云端缺失缩略图并后台上传
@@ -177,8 +178,10 @@ class Config:
         "webdav_password": "",
         "webdav_path": "",
         "webdav_timeout": 30,  # WebDAV 请求超时（秒）
+        "webdav_allow_insecure": False,  # 忽略 WebDAV 自签名/不受信任证书
         # 复制设置
-        "copy_resize_mode": 1,  # 0不处理；1webp缩放；2转gif；3转gif隐写原图
+        # 0不处理；1webp缩放；2转gif；3转gif隐写原图；4仅改后缀为gif
+        "copy_resize_mode": 1,
         "copy_resize_max": 200,  # 缩放后最长边像素
         "copy_avoid_webp": False,  # 复制时避免 WebP（动图转 GIF，静态转 JPG）
         # 局域网互联
@@ -212,6 +215,11 @@ class Config:
         "library_genres": ["image", "gif", "chat_record"],
         "window_x": -1,
         "window_y": -1,
+        "window_width": 0,  # 主窗口宽度持久化（0=默认 960）
+        "window_height": 0,  # 主窗口高度持久化（0=默认 640）
+        "window_resize_enabled": False,  # 允许拖窗口边框调整大小（主/设置窗口）
+        "settings_window_width": 0,  # 设置窗口宽度持久化（0=默认 720）
+        "settings_window_height": 0,  # 设置窗口高度持久化（0=默认 560）
         "auto_play_gif": True,
         "hover_to_play": False,
         "hover_zoom": True,  # 悬停卡片放大预览整图
@@ -226,6 +234,8 @@ class Config:
         "hierarchy_delete_mode": "ask",
         "record_recent_use": True,  # 复制时记录最近使用
         "show_startup_animation": True,  # 启动时播放启动动画（关闭时降级 300ms 延时）
+        # 插件
+        "plugin_dirs": [],  # 额外插件扫描目录（开发直连或集合）
     }
 
     def __init__(self, path: Path = None):
@@ -320,9 +330,6 @@ class Config:
             self._dirty = True
         if saved_ver == _CONFIG_VERSION:
             return
-        # 0.2.0 及之前：删除 window_width/window_height
-        for k in ("window_width", "window_height"):
-            self._data.pop(k, None)
         # 旧布尔开关迁移到 copy_resize_mode（旧配置里没有 copy_resize_mode 键）
         if "copy_resize_mode" not in raw and (
             "copy_resize_enabled" in raw or "experimental_stego" in raw

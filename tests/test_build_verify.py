@@ -84,6 +84,11 @@ def test_rejects_truncated_helper(tmp_path, monkeypatch, build_mod):
         "read_pe_version_strings",
         lambda p: {"CompanyName": "OhMyMeme"},
     )
+
+    def reject_invalid_executable(*args, **kwargs):
+        raise OSError("invalid executable format")
+
+    monkeypatch.setattr(build_mod.subprocess, "run", reject_invalid_executable)
     assert build_mod.verify_keyfinder_bundle() is False
 
 

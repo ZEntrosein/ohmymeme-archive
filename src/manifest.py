@@ -62,6 +62,8 @@ def _write_manifest(data: dict, metadata_filenames=None) -> bool:
     """原子写入本地清单；调用方必须持有 ``_MANIFEST_LOCK``。"""
     path = _index_path()
     try:
+        if not get_config().get("manifest_include_collections", True):
+            data.pop("collections", None)
         if metadata_filenames is not None:
             cfg = get_config()
             db = get_db()
@@ -147,7 +149,10 @@ def _build_unlocked(read_priority="foreground") -> List[Dict]:
             }
         )
 
-    collections = _build_collection_tree(db)
+    collections = []
+    include_collections = bool(get_config().get("manifest_include_collections", True))
+    if include_collections:
+        collections = _build_collection_tree(db)
 
     categories = _build_category_tree(db)
     data = {

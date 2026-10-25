@@ -19,6 +19,9 @@ from src.database import MemeDB
 from src.hotkey import GlobalHotkey
 from src.tray import _create_default_icon
 
+_SETTINGS_BODY = Path(__file__).resolve().parent.parent / "src" / "vue-src" / "settings" / "settings-body.html"
+_SETTINGS_LEGACY = Path(__file__).resolve().parent.parent / "src" / "vue-src" / "settings" / "legacy.js"
+
 
 class _FakeConfig:
     def __init__(self, hotkey_show_at_mouse):
@@ -412,7 +415,7 @@ const dom = new JSDOM(`<input id="text" value="前缀灰头土脸后缀">
 const win = dom.window, doc = win.document, calls = [], fallback = [];
 let success = true;
 win.pywebview = {api:{copy_editor_text:async text => {calls.push(text);return success;}}};
-const source = fs.readFileSync(0,'utf8');
+const source = process.argv[1];
 win.eval(source); win.eval(source);
 const copy = (id,start,end) => {
   const input = doc.getElementById(id); input.focus();
@@ -456,8 +459,7 @@ const flush = async () => {
 })().catch(error=>{console.error(error);process.exitCode=1;});
 """
     result = subprocess.run(
-        [node, "-e", script],
-        input=_TEXT_CLIPBOARD_SCRIPT,
+        [node, "-e", script, _TEXT_CLIPBOARD_SCRIPT],
         cwd=root,
         capture_output=True,
         text=True,
@@ -892,6 +894,8 @@ def _start_fake_webui(monkeypatch, silent_start):
 def test_webui_start_normal_visibility_hides_without_placement(monkeypatch):
     ui, created = _start_fake_webui(monkeypatch, silent_start=False)
     assert created[0][1]["hidden"] is False
+    assert created[0][1]["width"] == 960
+    assert created[0][1]["height"] == 640
     assert ui._visible is True
 
     def fail_if_called():
@@ -956,16 +960,16 @@ def test_webui_html_exists():
     assert (HTML_DIR / "index.css").exists()
     assert (HTML_DIR / "index.js").exists()
     assert (HTML_DIR / "settings.html").exists()
-    assert (HTML_DIR / "settings.css").exists()
-    assert (HTML_DIR / "settings.js").exists()
     assert 'src="/index.js"' in html
     assert 'href="/index.css"' in html
-    settings_html = (HTML_DIR / "settings.html").read_text(encoding="utf-8")
-    assert 'src="/settings.js"' in settings_html
-    assert 'href="/settings.css"' in settings_html
+    shell = (HTML_DIR / "settings.html").read_text(encoding="utf-8")
+    assert 'src="/dist/ohmymeme.js"' in shell
+    assert 'id="settings-mount"' in shell
+    assert "<!-- plugin-sections -->" in shell
+    settings_html = _SETTINGS_BODY.read_text(encoding="utf-8")
     assert 'id="s-hotkey-show-at-mouse"' in settings_html
     assert 'id="s-napcat-image-send-mode"' in settings_html
-    settings_js = (HTML_DIR / "settings.js").read_text(encoding="utf-8")
+    settings_js = _SETTINGS_LEGACY.read_text(encoding="utf-8")
     assert settings_js.count("s.hotkey_show_at_mouse === true") == 2
     assert "hotkey_show_at_mouse," in settings_js
     assert "napcat_image_send_mode" in settings_js
@@ -977,9 +981,9 @@ def test_manifest_include_tags_settings_contract():
     from src.webui import HTML_DIR, SettingsApi
 
     assert Config.DEFAULTS.get("manifest_include_tags") is True
-    settings_html = (HTML_DIR / "settings.html").read_text(encoding="utf-8")
+    settings_html = _SETTINGS_BODY.read_text(encoding="utf-8")
     assert 'id="s-manifest-include-tags"' in settings_html
-    settings_js = (HTML_DIR / "settings.js").read_text(encoding="utf-8")
+    settings_js = _SETTINGS_LEGACY.read_text(encoding="utf-8")
     assert "s.manifest_include_tags !== false" in settings_js
     assert "manifest_include_tags," in settings_js
     import inspect
@@ -996,9 +1000,9 @@ def test_manifest_include_favorites_settings_contract():
     from src.webui import HTML_DIR, SettingsApi
 
     assert Config.DEFAULTS.get("manifest_include_favorites") is True
-    settings_html = (HTML_DIR / "settings.html").read_text(encoding="utf-8")
+    settings_html = _SETTINGS_BODY.read_text(encoding="utf-8")
     assert 'id="s-manifest-include-favorites"' in settings_html
-    settings_js = (HTML_DIR / "settings.js").read_text(encoding="utf-8")
+    settings_js = _SETTINGS_LEGACY.read_text(encoding="utf-8")
     assert "s.manifest_include_favorites !== false" in settings_js
     assert "manifest_include_favorites," in settings_js
     import inspect
@@ -1015,8 +1019,8 @@ def test_import_resolution_limit_settings_contract(tmp_path):
     from src.config import get_import_max_px
     from src.webui import HTML_DIR, JsApi, SettingsApi
 
-    settings_html = (HTML_DIR / "settings.html").read_text(encoding="utf-8")
-    settings_js = (HTML_DIR / "settings.js").read_text(encoding="utf-8")
+    settings_html = _SETTINGS_BODY.read_text(encoding="utf-8")
+    settings_js = _SETTINGS_LEGACY.read_text(encoding="utf-8")
     assert 'id="s-import-resolution-limit-enabled"' in settings_html
     assert 'id="s-import-resolution-limit-px"' in settings_html
     assert settings_js.count("s.import_resolution_limit_enabled === true") == 2
@@ -1035,9 +1039,9 @@ def test_import_resolution_limit_settings_contract(tmp_path):
     api._cfg = cfg
     assert api.save_settings(
         {"import_resolution_limit_enabled": True, "import_resolution_limit_px": "4096"}
-    ) == {"ok": True}
+    ) == {"ok": True, "theme": "dark"}
     assert get_import_max_px(Config(tmp_path / "config.json")) == 4096
-    assert api.save_settings({"import_resolution_limit_enabled": False}) == {"ok": True}
+    assert api.save_settings({"import_resolution_limit_enabled": False}) == {"ok": True, "theme": "dark"}
     assert get_import_max_px(Config(tmp_path / "config.json")) == 0
 
 
@@ -1050,8 +1054,8 @@ def test_category_direct_settings_contract_and_refresh(tmp_path, monkeypatch):
 
     cfg = Config(tmp_path / "config.json")
     assert cfg.get("show_category_uncategorized") is False
-    html = (HTML_DIR / "settings.html").read_text(encoding="utf-8")
-    javascript = (HTML_DIR / "settings.js").read_text(encoding="utf-8")
+    html = _SETTINGS_BODY.read_text(encoding="utf-8")
+    javascript = _SETTINGS_LEGACY.read_text(encoding="utf-8")
     assert 'id="s-show-category-uncategorized"' in html
     assert javascript.count("s.show_category_uncategorized === true") == 2
     assert "show_category_uncategorized," in javascript
@@ -1092,8 +1096,8 @@ def test_qq_drag_cleanup_settings_contract():
     from src.webui import HTML_DIR, JsApi, SettingsApi
 
     assert Config.DEFAULTS["qq_drag_cleanup_on_start"] is True
-    settings_html = (HTML_DIR / "settings.html").read_text(encoding="utf-8")
-    settings_js = (HTML_DIR / "settings.js").read_text(encoding="utf-8")
+    settings_html = _SETTINGS_BODY.read_text(encoding="utf-8")
+    settings_js = _SETTINGS_LEGACY.read_text(encoding="utf-8")
     assert 'id="s-qq-drag-cleanup-on-start"' in settings_html
     assert settings_js.count("s.qq_drag_cleanup_on_start !== false") == 2
     assert "qq_drag_cleanup_on_start:" in settings_js
@@ -1139,9 +1143,74 @@ def test_qq_drag_cleanup_setting_saved_without_running_cleanup(tmp_path, monkeyp
     api._cfg = cfg
     cleanup = mock.Mock()
     monkeypatch.setattr(onebot, "cleanup_qq_drag_temp_files", cleanup)
-    assert api.save_settings({"qq_drag_cleanup_on_start": False}) == {"ok": True}
+    assert api.save_settings({"qq_drag_cleanup_on_start": False}) == {"ok": True, "theme": "dark"}
     assert Config(tmp_path / "config.json").get("qq_drag_cleanup_on_start") is False
     cleanup.assert_not_called()
+
+
+
+
+def test_manifest_include_collections_settings_contract():
+    """设置页「将分组写入同步清单」开关（HTML + JS 读写 + 后端配置键 + 关闭确认）"""
+    import inspect
+
+    from src.config import Config
+    from src.webui import SettingsApi
+
+    assert Config.DEFAULTS.get("manifest_include_collections") is True
+    settings_html = _SETTINGS_BODY.read_text(encoding="utf-8")
+    assert 'id="s-manifest-include-collections"' in settings_html
+    assert "confirmManifestToggle(this, '分组')" in settings_html
+    settings_js = _SETTINGS_LEGACY.read_text(encoding="utf-8")
+    assert "s.manifest_include_collections !== false" in settings_js
+    assert "manifest_include_collections:" in settings_js
+    assert "关闭后将无法云同步" in settings_js
+    src = inspect.getsource(SettingsApi.get_settings)
+    assert '"manifest_include_collections"' in src
+    reset_src = inspect.getsource(SettingsApi.reset_settings)
+    assert '"manifest_include_collections": True' in reset_src
+
+
+def test_webdav_allow_insecure_settings_contract():
+    """WebDAV 自签名证书开关 + 测试连接确认分支（HTML + JS + 后端配置键）"""
+    import inspect
+
+    from src.config import Config
+    from src.webui import SettingsApi
+
+    assert Config.DEFAULTS.get("webdav_allow_insecure") is False
+    settings_html = _SETTINGS_BODY.read_text(encoding="utf-8")
+    assert 'id="s-webdav-insecure"' in settings_html
+    settings_js = _SETTINGS_LEGACY.read_text(encoding="utf-8")
+    assert "WEBDAV_SSL_UNTRUSTED" in settings_js
+    assert "继续使用" in settings_js
+    assert "webdav_allow_insecure" in settings_js
+    src = inspect.getsource(SettingsApi.get_settings)
+    assert '"webdav_allow_insecure"' in src
+    reset_src = inspect.getsource(SettingsApi.reset_settings)
+    assert '"webdav_allow_insecure": False' in reset_src
+
+
+def test_copy_mode_4_settings_contract():
+    """提供仅改后缀选项，同时保留定制版默认复制行为。"""
+    import inspect
+
+    from src.clipboard_util import convert_image_mode_4
+    from src.config import Config
+    from src.webui import JsApi, SettingsApi
+
+    assert Config.DEFAULTS.get("copy_resize_mode") == 1
+    settings_html = _SETTINGS_BODY.read_text(encoding="utf-8")
+    assert '<option value="4">仅修改后缀为 GIF' in settings_html
+    settings_js = _SETTINGS_LEGACY.read_text(encoding="utf-8")
+    assert "s.copy_resize_mode ?? 1" in settings_js
+    assert "case 4:" in inspect.getsource(JsApi.copy_meme)
+    assert "resize_mode != 4" in inspect.getsource(JsApi.copy_meme)
+    assert "convert_image_mode_4" in inspect.getsource(JsApi.copy_meme)
+    assert callable(convert_image_mode_4)
+    assert '"copy_resize_mode": int(d.get("copy_resize_mode", 1) or 0)' in (
+        inspect.getsource(SettingsApi.get_settings)
+    )
 
 
 def test_cloud_thumb_auto_push_settings_contract():
@@ -1153,9 +1222,9 @@ def test_cloud_thumb_auto_push_settings_contract():
 
     assert Config.DEFAULTS.get("cloud_direct") is True
     assert Config.DEFAULTS.get("cloud_thumb_auto_push") is True
-    settings_html = (HTML_DIR / "settings.html").read_text(encoding="utf-8")
+    settings_html = _SETTINGS_BODY.read_text(encoding="utf-8")
     assert 'id="s-cloud-thumb-push"' in settings_html
-    settings_js = (HTML_DIR / "settings.js").read_text(encoding="utf-8")
+    settings_js = _SETTINGS_LEGACY.read_text(encoding="utf-8")
     assert "s.cloud_thumb_auto_push !== false" in settings_js
     assert "cloud_thumb_auto_push:" in settings_js
     src = inspect.getsource(SettingsApi.get_settings)
@@ -1173,9 +1242,9 @@ def test_disable_auto_hide_settings_contract():
     from src.webui import HTML_DIR, SettingsApi
 
     assert Config.DEFAULTS.get("disable_auto_hide") is False
-    settings_html = (HTML_DIR / "settings.html").read_text(encoding="utf-8")
+    settings_html = _SETTINGS_BODY.read_text(encoding="utf-8")
     assert 'id="s-disable-auto-hide"' in settings_html
-    settings_js = (HTML_DIR / "settings.js").read_text(encoding="utf-8")
+    settings_js = _SETTINGS_LEGACY.read_text(encoding="utf-8")
     assert settings_js.count("s.disable_auto_hide === true") == 2
     assert "disable_auto_hide," in settings_js
     src = inspect.getsource(SettingsApi.get_settings)
@@ -1184,11 +1253,87 @@ def test_disable_auto_hide_settings_contract():
     assert '"disable_auto_hide": False' in reset_src
 
 
+def test_window_resize_settings_contract():
+    """设置页「允许调整窗口大小」开关（HTML 复选框 + JS 读写 + 8 向边框拖拽 + resize API）"""
+    import inspect
+
+    from src.config import Config
+    from src.webui import HTML_DIR, JsApi, SettingsApi, WebUI
+
+    assert Config.DEFAULTS.get("window_resize_enabled") is False
+    assert Config.DEFAULTS.get("settings_window_width") == 0
+    settings_html = _SETTINGS_BODY.read_text(encoding="utf-8")
+    assert 'id="s-window-resize"' in settings_html
+    settings_js = _SETTINGS_LEGACY.read_text(encoding="utf-8")
+    assert "s.window_resize_enabled === true" in settings_js
+    assert "window_resize_enabled," in settings_js
+    assert "applyWindowResizeHandles" in settings_js
+    vue_dir = HTML_DIR.parent / "vue-src"
+    main_css = (vue_dir / "style.css").read_text(encoding="utf-8")
+    assert "win-resize-handle" in main_css
+    app_vue = (vue_dir / "App.vue").read_text(encoding="utf-8")
+    assert "win-resize-layer" in app_vue
+    assert "syncWinResizeHandles" in app_vue
+    src = inspect.getsource(SettingsApi.get_settings)
+    assert '"window_resize_enabled"' in src
+    reset_src = inspect.getsource(SettingsApi.reset_settings)
+    assert '"window_resize_enabled": False' in reset_src
+    js_src = inspect.getsource(JsApi.get_settings)
+    assert '"window_resize_enabled"' in js_src
+    assert "window_resize_enabled" in inspect.getsource(JsApi.get_init_data)
+    assert hasattr(JsApi, "resize_window")
+    assert hasattr(SettingsApi, "resize_window")
+    assert hasattr(SettingsApi, "reset_main_window_size")
+    assert "resetMainWindowSize()" in settings_html
+    assert "reset_main_window_size" in settings_js
+    assert hasattr(SettingsApi, "plugin_pick_file")
+    webui_src = inspect.getsource(WebUI._create_settings_window)
+    assert "resizable=True" in webui_src
+    assert "settings_window_width" in inspect.getsource(WebUI._save_settings_window_size)
+
+
+def test_resize_window_api_clamps():
+    """resize_window 尺寸钳制（主窗 480-8000x360-6000，设置窗 600-8000x480-6000）"""
+    from src.webui import JsApi, SettingsApi
+
+    class FakeWin:
+        def __init__(self):
+            self.size = None
+
+        def resize(self, w, h):
+            self.size = (w, h)
+
+    class FakeWebui:
+        pass
+
+    fw = FakeWebui()
+    fw._window = FakeWin()
+    api = JsApi.__new__(JsApi)
+    api._webui = fw
+    api.resize_window(100, 50)
+    assert fw._window.size == (480, 360)
+    api.resize_window(99999, 99999)
+    assert fw._window.size == (8000, 6000)
+    api.resize_window(1280, 800)
+    assert fw._window.size == (1280, 800)
+
+    fw2 = FakeWebui()
+    fw2._settings_window = FakeWin()
+    sa = SettingsApi.__new__(SettingsApi)
+    sa._webui = fw2
+    sa.resize_window(100, 50, False)
+    assert fw2._settings_window.size == (600, 480)
+    sa.resize_window(99999, 99999, False)
+    assert fw2._settings_window.size == (8000, 6000)
+    sa.resize_window(720, 560, False)
+    assert fw2._settings_window.size == (720, 560)
+
+
 def test_cloud_direct_confirm_buttons_contract():
     """首次配置云端的弹窗按钮为「开启/关闭」（showConfirm 第 3/4 参），Esc/遮罩返回 null 不改动"""
     from src.webui import HTML_DIR
 
-    settings_js = (HTML_DIR / "settings.js").read_text(encoding="utf-8")
+    settings_js = _SETTINGS_LEGACY.read_text(encoding="utf-8")
     assert re.search(
         r"'云端直接使用'[\s\S]{0,400}?'开启'\s*,\s*'关闭'", settings_js
     ), "云端直接使用确认弹窗必须用「开启/关闭」按钮"
@@ -1204,8 +1349,8 @@ def test_about_links_static_contract():
     """关于页 GitHub/QQ 群外链按钮（HTML 按钮 + JS URL 常量 + open_url 接口）"""
     from src.webui import HTML_DIR
 
-    settings_html = (HTML_DIR / "settings.html").read_text(encoding="utf-8")
-    settings_js = (HTML_DIR / "settings.js").read_text(encoding="utf-8")
+    settings_html = _SETTINGS_BODY.read_text(encoding="utf-8")
+    settings_js = _SETTINGS_LEGACY.read_text(encoding="utf-8")
     assert "openAboutUrl('github')" in settings_html
     assert "openAboutUrl('qq')" in settings_html
     assert "https://github.com/TNTXZ/OhMyMeme" in settings_js
@@ -1241,7 +1386,7 @@ def test_wechat_dialog_user_agreement_warning():
     """微信导入对话框须常驻用户协议警告（合规提示，防被删）"""
     from src.webui import HTML_DIR
 
-    html = (HTML_DIR / "settings.html").read_text(encoding="utf-8")
+    html = _SETTINGS_BODY.read_text(encoding="utf-8")
     seg = html.split('id="wechat-config"', 1)
     assert len(seg) == 2
     warn_seg = seg[1].split('id="wechat-progress"', 1)[0]
@@ -1642,10 +1787,8 @@ def test_storage_dir_virtual_drive_compat_is_opt_in(monkeypatch, tmp_path):
 
 def test_virtual_drive_compat_settings_contract():
     root = Path(__file__).resolve().parent.parent
-    settings_html = (root / "src" / "webui" / "settings.html").read_text(
-        encoding="utf-8"
-    )
-    settings_js = (root / "src" / "webui" / "settings.js").read_text(encoding="utf-8")
+    settings_html = _SETTINGS_BODY.read_text(encoding="utf-8")
+    settings_js = _SETTINGS_LEGACY.read_text(encoding="utf-8")
 
     assert 'id="s-virtual-drive-compat"' in settings_html
     assert 'id="s-bulk-read-protection"' in settings_html
@@ -1764,6 +1907,7 @@ global.pywebview = { api: {
   },
 } };
 global.window = { pywebview: global.pywebview };
+  global.document = new (require('jsdom').JSDOM)('<!doctype html><html></html>').window.document;
 const filename = path.resolve('src/vue-src/composables/useMemes.ts');
 const compiled = esbuild.buildSync({
   entryPoints: [filename], bundle: true, platform: 'node', format: 'cjs',
@@ -1982,6 +2126,7 @@ const settle = () => new Promise(resolve => setImmediate(resolve));
       resolve_large_meme_import: async () => ({ duplicate: true, duplicate_ids: [7] }),
     } };
     global.window = { pywebview: global.pywebview };
+  global.document = new (require('jsdom').JSDOM)('<!doctype html><html></html>').window.document;
     const moduleInstance = new Module(filename, module);
     moduleInstance.filename = filename;
     moduleInstance.paths = Module._nodeModulePaths(path.dirname(filename));
@@ -2618,6 +2763,139 @@ const settle = () => new Promise(resolve => setImmediate(resolve));
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+def test_theme_html_uses_saved_theme_before_scripts():
+    from src.webui import _theme_html
+
+    html = '<html lang="zh-CN"><head></head><body></body></html>'
+    light = _theme_html(html, "light")
+    assert 'data-theme="light"' in light
+    assert 'background:#f8fafc;color-scheme:light' in light
+    assert 'lang="zh-CN"' in light
+    for value in ("dark", None, '<script>alert(1)</script>'):
+        dark = _theme_html(html, value)
+        assert 'data-theme="dark"' in dark
+        assert 'background:#0d0d0f;color-scheme:dark' in dark
+        assert '<script>' not in dark
+
+
+def test_theme_settings_persist_refresh_and_reset(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    import src.platform_util as platform_util
+    import src.webui as webui
+
+    monkeypatch.setattr(platform_util, "is_auto_start_enabled", lambda: False)
+    monkeypatch.setattr(platform_util, "set_auto_start", lambda enabled: None)
+    monkeypatch.setattr(webui, "_cloud_reset", lambda: None)
+    window = Mock()
+    monkeypatch.setattr(
+        webui, "webview", SimpleNamespace(windows=[window]), raising=False
+    )
+    cfg = Config(tmp_path / "config.json")
+    main = webui.JsApi.__new__(webui.JsApi)
+    main._cfg = cfg
+    settings = webui.SettingsApi.__new__(webui.SettingsApi)
+    settings._cfg = cfg
+    settings._webui = SimpleNamespace(_on_hotkey_change=Mock())
+    assert main.get_settings()["theme"] == "dark"
+    assert settings.get_settings()["theme"] == "dark"
+
+    assert settings.save_settings({"theme": "light", "hotkey": "Ctrl+Alt+N"}) == {
+        "ok": True,
+        "theme": "light",
+    }
+    settings._webui._on_hotkey_change.assert_not_called()
+    assert Config(tmp_path / "config.json").get("theme") == "light"
+    assert main.get_settings()["theme"] == "light"
+    assert settings.get_settings()["theme"] == "light"
+    assert '"theme": "light"' in window.evaluate_js.call_args.args[0]
+
+    assert settings.reset_settings()["theme"] == "dark"
+    assert Config(tmp_path / "config.json").get("theme") == "dark"
+    assert main.get_settings()["theme"] == "dark"
+
+
+# 执行真实前端函数，验证并发保存、失败恢复与刷新乱序。
+def test_theme_frontend_races():
+    script = r"""
+const fs = require('fs');
+const vm = require('vm');
+const assert = require('assert/strict');
+const source = fs.readFileSync('src/vue-src/settings/legacy.js', 'utf8');
+const elements = new Proxy({}, {get: (o, k) => o[k] ||= {value: '', checked: false}});
+const calls = [], themes = [], toasts = [];
+let resolveSave;
+const context = vm.createContext({
+  console, document: {getElementById: id => elements[id]},
+  collectSyncSettings: () => ({}), collectNapCatSettings: () => ({}),
+  refreshNapCatListenerStatus: () => {}, validateSync: () => true,
+  api: (method, values) => {
+    calls.push([method, values]);
+    return new Promise(resolve => {resolveSave = resolve});
+  },
+  applyTheme: value => themes.push(value), showToast: value => toasts.push(value),
+  applyWindowResizeHandles: () => {}, _lastCloudDirect: false,
+  _settingsDirty: true, winResizeEnabled: false,
+});
+vm.runInContext(source.slice(source.indexOf('let settingsQueue'), source.indexOf('// 打开设置向导')), context);
+(async () => {
+  elements['s-theme'].value = 'light';
+  const first = context.saveSettings();
+  elements['s-theme'].value = 'dark';
+  const second = context.saveSettings();
+  await Promise.resolve();
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0][1].theme, 'light');
+  resolveSave({ok: true, theme: 'light'});
+  await first;
+  await Promise.resolve();
+  assert.equal(calls.length, 2);
+  assert.equal(calls[1][1].theme, 'dark');
+  resolveSave(null);
+  await second;
+  assert.deepEqual(themes, ['light']);
+  assert.ok(toasts.at(-1).includes('失败'));
+  const third = context.saveSettings();
+  await Promise.resolve();
+  resolveSave({ok: true, theme: 'dark'});
+  await third;
+  assert.deepEqual(themes, ['light', 'dark']);
+
+  const app = fs.readFileSync('src/vue-src/App.vue', 'utf8');
+  let refresh = app.slice(app.indexOf('  let settingsRefreshGen'), app.indexOf('  window.refreshTags ='));
+  refresh = refresh.replaceAll(': any', '').replace('(settings?)', '(settings)');
+  const pending = [];
+  context.window = {pywebview: {api: {get_settings: () => new Promise(r => pending.push(r))}}};
+  context.state = {};
+  context.syncBadge = {value: null};
+  context.refreshLibraryView = context.search = context.syncWinResizeHandles = () => {};
+  vm.runInContext(refresh, context);
+  context.window.refreshMemes();
+  context.window.refreshMemes();
+  pending[1]({theme: 'light'});
+  await Promise.resolve();
+  pending[0]({theme: 'dark'});
+  await Promise.resolve();
+  assert.equal(themes.at(-1), 'light');
+  context.window.refreshMemes();
+  context.window.refreshMemes({theme: 'dark'});
+  pending[2]({theme: 'light'});
+  await Promise.resolve();
+  assert.equal(themes.at(-1), 'dark');
+})().catch(e => {console.error(e); process.exitCode = 1});
+"""
+    result = subprocess.run(
+        ["node", "-e", script],
+        cwd=Path(__file__).resolve().parent.parent,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_later_page_cache_warmup_follows_current_query_contract():
     root = Path(__file__).resolve().parent.parent
     source = (root / "src" / "vue-src" / "composables" / "useMemes.ts").read_text(
@@ -2862,6 +3140,7 @@ const close=kind=>{state.closed.push(kind);if(!state.blocked)state[kind]=false;}
 const ctx={visible:{value:false},hide(){this.visible.value=false;}};
 const hoverPreview={value:false},selectMode={value:false},sortEnabled={value:false};
 const appContext=vm.createContext({ctx,hoverPreview,selectMode,sortEnabled,hierarchyDrag:null,
+  syncBadge:{value:null},
   memeDetails:{value:{isOpen:()=>state.meme,close:()=>close('meme')}},
   chatRecordDetails:{value:{isOpen:()=>state.chat,close:()=>close('chat')}},
   hideWindow:()=>state.hidden++,clearHoverPreview:()=>hoverPreview.value=false,
@@ -3344,3 +3623,28 @@ def test_meme_details_can_create_and_select_collections_and_categories():
     assert "表情的归属需点击保存更改才生效" in source
     assert "emit('structure-created')" in source
     assert '@structure-created="onMemeStructureCreated"' in app_source
+
+
+# Vue 构建缺失时，实际回退路由仍下发已保存的主题。
+def test_theme_legacy_route(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    import src.webui as webui
+
+    (tmp_path / "index.html").write_text(
+        '<html lang="zh"><head></head><body>fallback</body></html>', encoding="utf-8"
+    )
+    monkeypatch.setattr(webui, "HTML_DIR", tmp_path)
+    runner = Mock()
+    monkeypatch.setattr(webui.bottle, "run", runner)
+    ui = webui.WebUI.__new__(webui.WebUI)
+    ui._port = 17853
+    ui._cfg = SimpleNamespace(get=lambda key, default=None: "light")
+    ui._setup_bottle()
+    app = runner.call_args.args[0]
+    route = next(route for route in app.routes if route.rule == "/")
+    html = route.callback()
+    assert 'data-theme="light"' in html
+    assert "fallback" in html
+    assert webui.bottle.response.content_type == "text/html; charset=utf-8"

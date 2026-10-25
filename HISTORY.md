@@ -1,3 +1,37 @@
+# v0.7.0（未发布）
+
+## 新增功能
+- **插件系统** — 新增 `src/plugin_manager.py`：扫描插件目录（`<数据目录>/plugins/` + 配置 `plugin_dirs` 开发直连）加载第三方插件（`plugin.json` manifest，`api_version` 必须为 1）；单个插件 manifest 非法/依赖缺失/entry 异常/on_load 超时仅禁用该插件，宿主与其余插件不受影响；权限声明制（`route`/`main_api`/`settings_api`/`assets:serve`/`settings:section`/`buttons`/`startup`/`window`/`host:evaluate_js`），未声明的注册调用在 `on_load` 内抛 `PermissionError` 使该插件加载失败；回调超时熔断（on_load 15s / 普通回调 10s / JS API 120s）与回调异常自动停用（下次重启恢复）
+- **设置页「插件」分组** — 左栏新增「插件」导航：插件列表为折叠栏（标题=插件名，点击展开版本/作者/仓库/权限/状态/失败原因与该插件的设置区块，右侧开关启停，停用立即生效、启用提示重启），宿主插件区块与各插件自管设置区块统一显示并自动移入对应插件折叠栏内；插件设置表单经 `data-plugin`/`data-key` 约定自动回填与收集（`pluginSaveSection`），独立存储于按插件 id 分文件的 `%APPDATA%/OhMyMeme/plugins/<id>/settings.json`（配置目录，随用户配置；合并写入，不进宿主设置；旧版 `plugins_state.json` 内嵌设置与旧位置数据目录下的设置文件首次启动自动迁移），保存后触发插件 `on_settings_changed` 并向主窗口推送 `omm-plugin-refresh` 刷新插件样式与脚本；「打开插件目录」一键直达
+- **插件资产注入** — 插件按 `windows`（main/settings）注册 CSS/JS：设置页/主窗口服务端注入（`</head>` 前插 link、`</body>` 前插 defer script，设置页另有 `<!-- plugin-sections -->` 区块锚点），插件脚本在宿主脚本之后按 id 序执行；`/plugins/<id>/<path>` 静态服务（路径穿越/禁用即 404），资产 URL 带 `版本-设置哈希` 参数、设置变化自动改 URL 防缓存
+- **插件设置页区块与前后端 API** — 插件可向设置页「插件」分组注入 HTML 区块；`pywebview.api.plugin_call(id, method, args)` 在主窗口（JsApi）与设置窗口（SettingsApi）分别分发到插件注册的方法；插件自定义 HTTP 路由（GET/POST，参数 dict，返回 str/dict 自动 JSON，Content-Type 按扩展名推断）
+- **顶栏插件按钮与布局约束** — 标题栏渲染插件按钮（`{key,label,icon,order}`，icon 为空渲染文字按钮），点击经 `JsApi.plugin_button_click` 分发到插件 handler；插件可隐藏核心按钮（`sort/select/upload/download/import/refresh/settings/close`）或覆盖其 order（默认 10/20/30/40/50/60/70/1000），经 `get_init_data` 随首屏下发
+- **启动动画与窗口尺寸覆盖** — 插件（`startup`/`window` 权限）可覆盖启动视频源/底色与主窗口初始尺寸；`get_init_data` 新增 `startup_video_src`/`startup_bg_color`（空即用默认 `OhMyMeme.mp4`/`#000000`），`WebUI._resolve_window_size()` 按「插件覆盖 > 持久化窗口尺寸 > 默认 960×640」取值（范围校验 480-8000/360-6000），窗口关闭时尺寸随位置一并持久化（配置 `window_width`/`window_height`，0=默认）
+- **允许调整窗口大小** — 设置页「窗口」新增开关（配置 `window_resize_enabled`，默认关）：开启后主窗口与设置窗口均可拖 8 向边框调整大小（绝对增量 + rAF 节流），尺寸经 `JsApi.resize_window`（钳 480-8000/360-6000）/`SettingsApi.resize_window`（钳 600-8000/480-6000，persist 写配置）持久化，设置窗关闭/重建时也保存尺寸（配置 `settings_window_width`/`settings_window_height`，0=默认 720×560），重启后保留
+- **插件启动动画支持图片/动图与文件选择** — 插件可经 `set_startup_override(..., duration_ms, media_type)` 覆盖为图片/动图（`media_type="image"` 时前端用 `<img>` 按实际时长只播一遍，GIF 时长由插件侧 PIL 逐帧解析，上限 15s；视频仍 `@ended` 收起）；`SettingsApi.plugin_pick_file(plugin_id, media)` 提供原生文件对话框（video/image/any 过滤），选中文件由插件复制进 `plugins_data/<id>/` 并经 `/plugins/<id>/data/<path>`（`resolve_asset` 新增 `data/` 前缀解析到插件数据目录，含穿越防护）对外提供
+- **设置页插件区块回填完成事件** — `initPlugins` 回填循环完成后派发 `omm-plugin-section-filled`（`detail.plugin_id`），插件脚本据以同步下拉/颜色控件等非 `data-key` 管理的控件；同时修复桥接未就绪时插件列表渲染「暂无插件」导致折叠栏不生成、设置不回填的问题——`initPlugins` 增加 `initPluginRetries`（20×200ms）与 `initPlugins` 同样的重试
+- **官方插件模板与个性化插件** — 新增配套仓库 `omm-plugin-template`（manifest 字段/权限/on_load API/生命周期/设置区块约定/路由与 API/依赖 vendor/调试的完整开发指南）与 `omm-personalized-plugin`（启动动画、背景、字体、顶栏按钮布局的个性化定制，背景与字体保存即生效；v1.1.0 起启动动画改「选择文件」并自动复制进插件数据目录，字体改常用中文字体下拉、颜色改 RGBA 滑杆 + HEX 输入 + 色块实时预览的联动控件，设置控件由插件 `assets/settings.js`+`settings.css` 注入）
+- **插件系统测试** — 新增 `tests/test_plugin_manager.py` 33 例：manifest 校验与跳过（id 非法/缺 name/version/api_version 不匹配/repo 非法/损坏 JSON）、sandbox 跳过、依赖缺失拒绝、entry 异常隔离、权限门控、回调异常与超时熔断、启停与用户禁用重启语义、设置合并与按 id 分文件持久化 roundtrip、旧 `plugins_state.json` 设置自动迁移、`on_settings_changed` 触发、资产解析与路径穿越拒绝（含 `data/` 前缀到插件数据目录）、注入顺序与禁用失效、资产版本随设置变化、自定义路由分发与 Content-Type、启动动画/窗口尺寸按 id 序覆盖、启动媒体时长/类型字段透传、按钮注册与约束、vendor sys.path 追加移除、注入辅助函数、设置页标记齐全（含窗口开关区块与插件重试/回填事件）、`_resolve_window_size` 分支、JsApi/SettingsApi 插件分发、配置窗口尺寸默认值与旧配置迁移保留；`test_startup` 补主窗口 960×640 尺寸断言、「允许调整窗口大小」开关契约与 `resize_window` 尺寸钳制 2 例；全量 `tests/` 489 passed（`test_lan` 环境性失败除外）
+- **导入超限弹窗与关闭限制开关** — 单张交互式导入（拖放本地路径/原图下载、文件上传、剪贴板）超过 2560px 或 20MB 时弹窗选择「保留」或「取消导入」（超限文件先复制到独立临时文件，超时 5 分钟自动丢弃）；设置页「基础设置 → 导入限制」新增「关闭表情包大小限制」（配置 `import_no_limit`，默认关），关闭后本地导入、云端拉取与局域网接收均不再拦截超限文件
+- **重复表情提示统一** — 导入与库中完全相同的表情（同 SHA-256）时，主窗口底部小字提示统一为「已存在相同表情包」
+- **Windows MSIX 安装包** — 构建脚本新增 `--msix`（Windows SDK `makeappx` + 模板 `scripts/installer/msix/AppxManifest.xml`，产出 `dist/OhMyMeme-<版本>.msix`，用于 Microsoft Store 上架或侧载），在 `.exe` 安装包之外追加构建，缺少工具/清单时仅告警跳过；MSIX 身份信息（Name/Publisher/PublisherDisplayName）从 Partner Center 填入模板或经环境变量 `OHMYMEME_MSIX_IDENTITY_NAME`/`OHMYMEME_MSIX_PUBLISHER`/`OHMYMEME_MSIX_PUBLISHER_DISPLAY_NAME` 覆盖，产物不签名（Store 上架时重签）；MSI（WiX）构建已移除
+
+## 变更
+- **设置页改为 Vue 入口** — `src/webui/settings.html` 仅保留 Vue 挂载壳，原 `settings.css`/`settings.js` 删除；`src/vue-src/settings/SettingsApp.vue` 注入样式、渲染主体并执行迁移后的 `legacy.js`，插件区块仍由服务端锚点注入
+- **复制处理默认仅改后缀为 GIF** — `copy_resize_mode` 默认改为 4：复制副本字节不变、仅把扩展名改为 `.gif`（桌面与安卓一致），原 0/1/2/3 模式保留；该模式不受「复制时避免 WebP」影响
+- **标签/分组/收藏可分别关闭写入同步清单** — 新增 `manifest_include_collections`（默认开）；标签与分组开关关闭前弹确认「关闭后将无法云同步标签/分组」（桌面与安卓）
+- **WebDAV 自签名证书确认** — 测试连接遇不受信任证书时弹窗选择「继续使用/不使用」；继续则保存 `webdav_allow_insecure=true` 并重试，设置页保留开关可随时关闭（桌面与安卓）
+- **窗口与云端设置精简** — 设置页新增「恢复默认窗口大小（960×640）」；移除上传/下载进度与完成提示、上传前提醒、上传删远端、下载删本地、启动获取远端索引等 8 个云端开关，固定保持原默认值
+- **上传改为按云端清单差集，仅上传缺失文件** — 「上传到远端」现在先拉取云端清单，按「文件名缺失或 SHA-256 不同」筛出云端缺失/变更的表情，只上传这些文件（进度与总数只反映待上传项）；不再对每个文件逐次发起存在性请求，大库同步明显更快（云端清单为唯一判据，不再逐文件复核物理存在）
+- **设置页导航新增「插件」分组** — 位于「危险操作」之后；`legacy.js` 脏检查跳过插件自管输入（`data-plugin`），插件设置保存不再触发宿主「有未保存的更改」提示
+- **主窗口标题栏按钮改为数据驱动** — 核心按钮按固定 order 渲染（`v-if` 隐藏 + CSS order 定位），为插件按钮与布局约束让出插槽；启动动画视频源/底色改由 `get_init_data` 下发（插件可覆盖），行为不变
+- **个性化插件移除窗口尺寸设置** — `win_width`/`win_height` 不再由插件覆盖（`window` 权限撤销），窗口大小统一走宿主「允许调整窗口大小」开关 + 拖边框调整并持久化；插件升级 v1.1.0
+
+## 修复
+- **云同步下载后多级分组丢失（#102）** — `_apply_remote_collections` 原仅创建顶层 `collections`，完全忽略 `children`，手机上传的多级分组在桌面下载后只剩空顶层分组（若成员都在子分组则看似全部丢失）；改为递归创建父子分组并按 `filenames` 关联成员，同时过滤非法/不安全文件名与条目
+- **Release 构建产物未上传** — `publish` 只执行 `gh release create`，没有把下载的 artifact 作为 Release 资产上传，正文里的下载链接因此指向不存在的文件；新增产物存在性校验与 `gh release upload <version> ... --clobber` 步骤。
+
+
 # v0.6.5
 
 ## 新增功能

@@ -79,6 +79,7 @@ from .clipboard_util import (
     convert_image_mode_1,
     convert_image_mode_2,
     convert_image_mode_3,
+    convert_image_mode_4,
     copy_image_to_clipboard,
     copy_text_with_history,
 )
@@ -102,6 +103,7 @@ from .manifest import request_background_rebuild as request_manifest_rebuild
 from .manifest import update_meme_name as update_manifest_meme_name
 from .manifest import update_meme_structure as update_manifest_meme_structure
 from .media_derivative import DAILY_COPY_VERSION, create_daily_copy
+from .plugin_manager import get_plugin_manager, route_content_type
 
 logger = logging.getLogger(__name__)
 
@@ -190,6 +192,72 @@ _STATIC_MIME_TYPES = {
     ".ico": "image/x-icon",
     ".woff2": "font/woff2",
 }
+
+# 主窗口启动动画默认视频源（插件可经 startup 覆盖）
+_DEFAULT_STARTUP_VIDEO = "/resources/OhMyMeme.mp4"
+
+
+# 在脚本加载前设置主题与底色，避免独立窗口首次绘制闪烁。
+def _theme_html(html, theme):
+    theme = "light" if theme == "light" else "dark"
+    background = "#f8fafc" if theme == "light" else "#0d0d0f"
+    return html.replace(
+        "<html ",
+        f'<html data-theme="{theme}" '
+        f'style="background:{background};color-scheme:{theme}" ',
+        1,
+    )
+
+
+def _inject_before(html: str, marker: str, inject: str) -> str:
+    """在最后一个 marker 前插入 inject（无 marker 或无内容时原样返回）"""
+    if not inject or marker not in html:
+        return html
+    idx = html.rfind(marker)
+    return html[:idx] + inject + "\n" + html[idx:]
+
+
+def _inject_after(html: str, marker: str, inject: str) -> str:
+    """在第一个 marker 后插入 inject"""
+    if not inject or marker not in html:
+        return html
+    idx = html.index(marker)
+    return html[: idx + len(marker)] + "\n" + inject + html[idx + len(marker) :]
+
+
+def _split_asset_tags(tags: str):
+    """asset_tags 输出拆成 (link 标签块, script 标签块)"""
+    links = [ln for ln in tags.splitlines() if ln.startswith("<link")]
+    scripts = [ln for ln in tags.splitlines() if ln.startswith("<script")]
+    return "\n".join(links), "\n".join(scripts)
+
+
+def _make_plugin_route_cb(pid: str, rule: str, fn):
+    """插件自定义路由回调：返回 str 或 dict（JSON），Content-Type 按扩展名推断"""
+    import json as _json
+
+    def cb():
+        try:
+            ok, val = get_plugin_manager().call_route(
+                pid, fn, dict(bottle.request.params)
+            )
+        except Exception as e:
+            logger.warning(f"plugin route error: {e}")
+            bottle.response.status = 500
+            return ""
+        if not ok:
+            bottle.response.status = 404
+            return ""
+        if isinstance(val, dict):
+            bottle.response.content_type = "application/json"
+            return _json.dumps(val, ensure_ascii=False)
+        ctype = route_content_type(rule)
+        if ctype:
+            bottle.response.content_type = ctype
+        return val if isinstance(val, str) else str(val)
+
+    return cb
+
 
 # ─── 工具函数  ───
 
@@ -426,6 +494,191 @@ def _cloud_reset():
             path.unlink()
     except OSError:
         pass
+    _sync_status_reset()
+
+
+# 顶栏同步状态：内存缓存远端清单 + 后台刷新，供主窗口低开销轮询
+_sync_status_lock = threading.Lock()
+_sync_status_state = {
+    "manifest": None,
+    "cache_loaded": False,
+    "checked": False,
+    "refreshing": False,
+    "error": "",
+    "updated_at": 0.0,
+}
+_sync_status_gen = 0
+
+
+def _sync_status_reset():
+    # 云配置变更：作废在途刷新并清空清单缓存
+    global _sync_status_gen
+    with _sync_status_lock:
+        _sync_status_gen += 1
+        _sync_status_state.update(
+            manifest=None,
+            cache_loaded=False,
+            checked=False,
+            refreshing=False,
+            error="",
+            updated_at=0.0,
+        )
+
+
+def _sync_status_invalidate():
+    # 同步完成后远端清单已变化：作废在途刷新并标记待重拉（保留旧清单供离线时展示）
+    global _sync_status_gen
+    with _sync_status_lock:
+        _sync_status_gen += 1
+        _sync_status_state.update(
+            checked=False,
+            refreshing=False,
+            error="",
+        )
+
+
+def _sync_status_set_manifest(manifest):
+    # 复用已有拉取结果（启动自动同步/云清单刷新），避免重复请求远端
+    with _sync_status_lock:
+        _sync_status_state.update(
+            manifest=manifest if isinstance(manifest, dict) else None,
+            cache_loaded=True,
+            checked=True,
+            error="",
+            updated_at=time.time(),
+        )
+
+
+def _sync_status_ensure_cache_locked():
+    # 首次查询先读 cloud-index.json 缓存出值，网络刷新由后台线程完成
+    if _sync_status_state["cache_loaded"]:
+        return
+    _sync_status_state["cache_loaded"] = True
+    data = sync_module.load_cloud_manifest()
+    if isinstance(data, dict):
+        _sync_status_state["manifest"] = data
+
+
+def _start_sync_status_refresh(force=False) -> bool:
+    # 后台拉取远端清单（refreshing 去重；已检查过则仅 force 重拉）
+    global _sync_status_gen
+    with _sync_status_lock:
+        if _sync_status_state["refreshing"]:
+            return False
+        if _sync_status_state["checked"] and not force:
+            return False
+        _sync_status_state["refreshing"] = True
+        _sync_status_state["error"] = ""
+        gen = _sync_status_gen
+    threading.Thread(target=_sync_status_worker, args=(gen,), daemon=True).start()
+    return True
+
+
+def _sync_status_worker(gen):
+    # 拉取远端清单并写入状态；代次不匹配（配置重置/同步完成）时丢弃结果
+    try:
+        data = sync_module.download_index()
+        with _sync_status_lock:
+            if gen != _sync_status_gen:
+                return
+            _sync_status_state.update(
+                manifest=data if isinstance(data, dict) else None,
+                cache_loaded=True,
+                checked=True,
+                refreshing=False,
+                error="",
+                updated_at=time.time(),
+            )
+    except Exception as e:
+        logger.info("sync status refresh failed: %s", e)
+        with _sync_status_lock:
+            if gen != _sync_status_gen:
+                return
+            _sync_status_state.update(
+                checked=True,
+                refreshing=False,
+                error=str(e),
+                updated_at=time.time(),
+            )
+
+
+def _sync_status_snapshot(force=False) -> dict:
+    # 组装顶栏所需状态：配置/清单差集/后台传输进度
+    cfg = get_config()
+    if not str(cfg.get("sync_type", "") or "").strip():
+        return {"configured": False}
+    with _sync_status_lock:
+        _sync_status_ensure_cache_locked()
+        need_refresh = force or not _sync_status_state["checked"]
+    if need_refresh:
+        _start_sync_status_refresh(force=force)
+    with _sync_status_lock:
+        manifest = _sync_status_state["manifest"]
+        checked = _sync_status_state["checked"]
+        refreshing = _sync_status_state["refreshing"]
+        error = _sync_status_state["error"]
+        checked_at = _sync_status_state["updated_at"]
+    local = set(get_db().get_all_filenames() or [])
+    remote_names = set()
+    remote_ready = set()
+    if isinstance(manifest, dict):
+        for entry in manifest.get("memes") or []:
+            if not isinstance(entry, dict):
+                continue
+            fname = entry.get("filename")
+            if not sync_module._safe_remote_fname(fname):
+                continue
+            remote_names.add(fname)
+            if sync_module._safe_sha(entry.get("sha256")):
+                remote_ready.add(fname)
+    local_missing = len(remote_ready - local) if manifest is not None else 0
+    cloud_missing = len(local - remote_names) if manifest is not None else 0
+    if manifest is not None:
+        manifest_state = "ok"
+    elif refreshing or not checked:
+        manifest_state = "loading"
+    elif error:
+        manifest_state = "error"
+    else:
+        manifest_state = "missing"
+    progress = sync_module.get_sync_progress()
+    status = str(progress.get("status", "idle") or "idle")
+    active = status in ("uploading", "downloading", "deleting")
+
+    def _int(value):
+        try:
+            return int(value or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    files_done = _int(progress.get("files_done"))
+    files_total = _int(progress.get("files_total"))
+    return {
+        "configured": True,
+        "manifest_state": manifest_state,
+        "refreshing": refreshing,
+        "checked": checked,
+        "error": error,
+        "checked_at": checked_at,
+        "local_count": len(local),
+        "remote_count": len(remote_names),
+        "local_missing": local_missing,
+        "cloud_missing": cloud_missing,
+        "synced": manifest is not None and local_missing == 0 and cloud_missing == 0,
+        "transfer": {
+            "active": active,
+            "status": status,
+            "direction": progress.get("direction", ""),
+            "files_done": files_done,
+            "files_total": files_total,
+            "remaining": max(files_total - files_done, 0) if files_total else 0,
+            "bytes_done": _int(progress.get("bytes_done")),
+            "bytes_total": _int(progress.get("bytes_total")),
+            "progress": _int(progress.get("progress")),
+            "speed": _int(progress.get("speed")),
+            "current_file": progress.get("current_file", "") or "",
+        },
+    }
 
 
 def _cloud_view():
@@ -504,6 +757,7 @@ def _cloud_refresh_worker(fetched=None):
                     local=local,
                     loaded=True,
                 )
+            _sync_status_set_manifest(data)
             cfg = get_config()
             if cfg.get("cloud_direct", False):
                 try:
@@ -2096,7 +2350,9 @@ class JsApi:
         memes = self.search_memes("", None, None, 0, MEME_PAGE)
         collections = self.get_collections()
         categories = self.get_categories()
+        fields = get_plugin_manager().init_fields()
         return {
+            "theme": self._cfg.get("theme", "dark"),
             "memes": memes,
             "tags": self.get_tags(),
             "tag_records": self.get_tag_records(),
@@ -2105,7 +2361,15 @@ class JsApi:
             "library_genres": normalize_library_genres(self._cfg.get("library_genres")),
             "show_startup_animation": self._cfg.get("show_startup_animation", True),
             "hover_zoom": self._cfg.get("hover_zoom", True),
-            "startup_bg_color": _STARTUP_BG_COLOR,
+            "window_resize_enabled": self._cfg.get("window_resize_enabled", False),
+            "startup_bg_color": fields.get("startup_bg_color") or _STARTUP_BG_COLOR,
+            "startup_video_src": fields.get("startup_video_src")
+            or _DEFAULT_STARTUP_VIDEO,
+            "startup_media_duration_ms": fields.get("startup_media_duration_ms") or 0,
+            "startup_media_type": fields.get("startup_media_type") or "",
+            "plugin_buttons": fields.get("plugin_buttons") or [],
+            "plugin_button_constraints": fields.get("plugin_button_constraints")
+            or {"hide": [], "order": {}},
             "guide_ok": guide_ok(),
         }
 
@@ -2300,7 +2564,8 @@ class JsApi:
             return {"ok": False, "error": "拖拽发送失败，请检查 NapCat 与 QQ"}
 
     def copy_meme(self, meme_id):
-        # 复制表情到剪贴板；copy_resize_mode: 0不处理 1webp缩放 2转gif 3转gif隐写原图
+        # 复制表情到剪贴板；copy_resize_mode: 0不处理 1webp缩放 2转gif
+        # 3转gif隐写原图 4仅改后缀为gif
         row = self._db.get_by_id(meme_id)
         if not row:
             return {"ok": False, "status": "copy_failed"}
@@ -2317,8 +2582,11 @@ class JsApi:
                 path = convert_image_mode_2(path, resize_max) or path
             case 3:
                 path = convert_image_mode_3(path, resize_max) or path
+            case 4:
+                path = convert_image_mode_4(path, resize_max) or path
         # 复制微信等应用会把 WebP 当文件，故兜底把残余 WebP 转为 GIF/JPG
-        if avoid_webp:
+        # 模式 4 要求字节完全不变，不参与该兜底
+        if avoid_webp and resize_mode != 4:
             path = convert_avoid_webp(path, resize_max)
         ok = copy_image_to_clipboard(path)
         if not ok:
@@ -3612,6 +3880,19 @@ class JsApi:
     def get_sync_progress(self) -> dict:
         return sync_module.get_sync_progress()
 
+    def get_sync_status(self, force: bool = False) -> dict:
+        """顶栏同步状态：是否配置云端、清单差集、后台传输进度（force 重拉清单）"""
+        try:
+            return _sync_status_snapshot(bool(force))
+        except Exception as e:
+            logger.warning("get_sync_status error: %s", e)
+            return {
+                "configured": bool(get_config().get("sync_type", "")),
+                "manifest_state": "error",
+                "error": str(e),
+                "transfer": {"active": False, "status": "idle"},
+            }
+
     def sync_push(self) -> dict:
         try:
             self._webui.ensure_local_thumbs()
@@ -3624,6 +3905,8 @@ class JsApi:
                 "error": str(e),
                 "failed_files": sync_module.get_sync_progress().get("failed_items", []),
             }
+        finally:
+            _sync_status_invalidate()
 
     def sync_pull(self) -> dict:
         try:
@@ -3636,6 +3919,8 @@ class JsApi:
                 "error": str(e),
                 "failed_files": sync_module.get_sync_progress().get("failed_items", []),
             }
+        finally:
+            _sync_status_invalidate()
 
     def run_auto_sync(self) -> dict:
         """启动时自动同步：根据配置拉取远端索引和/或全量同步"""
@@ -3650,6 +3935,8 @@ class JsApi:
 
                 fetched = download_index()
                 result["fetched"] = fetched is not None
+                if isinstance(fetched, dict):
+                    _sync_status_set_manifest(fetched)
             if self._cfg.get("cloud_direct", False):
                 # 云端直接使用：复用本次 fetch 结果（fetch 关闭则线程内自拉）
                 _start_cloud_refresh(fetched)
@@ -4021,11 +4308,20 @@ class JsApi:
         lan.confirm_device(bool(approved))
         return {"ok": True}
 
+    def plugin_call(self, plugin_id: str, method: str, args=None) -> dict:
+        """分发主窗口插件方法（manifest main_api 声明的逻辑）"""
+        return get_plugin_manager().call_main(str(plugin_id), str(method), args or [])
+
+    def plugin_button_click(self, plugin_id: str, key: str) -> dict:
+        """主窗口顶栏插件按钮点击分发"""
+        return get_plugin_manager().call_button(str(plugin_id), str(key))
+
     def get_settings(self) -> dict:
         d = self._cfg.to_dict()
         from .platform_util import is_auto_start_enabled
 
         return {
+            "theme": d.get("theme", "dark"),
             "hotkey": d.get("hotkey", "Ctrl+Alt+N"),
             "hotkey_show_at_mouse": d.get("hotkey_show_at_mouse", False),
             "auto_play_gif": d.get("auto_play_gif", True),
@@ -4058,6 +4354,7 @@ class JsApi:
             "webdav_user": d.get("webdav_user", ""),
             "webdav_password": d.get("webdav_password", ""),
             "webdav_path": d.get("webdav_path", ""),
+            "webdav_allow_insecure": d.get("webdav_allow_insecure", False),
             "show_upload_progress": d.get("show_upload_progress", True),
             "show_upload_done": d.get("show_upload_done", True),
             "show_download_progress": d.get("show_download_progress", True),
@@ -4100,6 +4397,7 @@ class JsApi:
             "hover_zoom": d.get("hover_zoom", True),
             "copy_avoid_webp": d.get("copy_avoid_webp", False),
             "disable_auto_hide": d.get("disable_auto_hide", False),
+            "window_resize_enabled": d.get("window_resize_enabled", False),
         }
 
     def notion_test_connection(self, settings) -> dict:
@@ -4173,6 +4471,7 @@ class JsApi:
         set_auto_start(False)
         _cloud_reset()
         return {
+            "theme": self._cfg.get("theme", "dark"),
             "hotkey": hotkey,
             "hotkey_show_at_mouse": self._cfg.get("hotkey_show_at_mouse", False),
             "auto_play_gif": self._cfg.get("auto_play_gif", True),
@@ -4207,6 +4506,7 @@ class JsApi:
             "webdav_user": "",
             "webdav_password": "",
             "webdav_path": "",
+            "webdav_allow_insecure": False,
             "show_upload_progress": True,
             "show_upload_done": True,
             "show_download_progress": True,
@@ -4225,7 +4525,20 @@ class JsApi:
             "bulk_read_pause_seconds": 1.0,
             "bulk_read_prefetch_pages": False,
             "hover_zoom": True,
+            "window_resize_enabled": False,
         }
+
+    def resize_window(self, width: int, height: int):
+        """拖动边框调整主窗口大小（window_resize_enabled 开启时前端调用）"""
+        w = self._webui._window
+        if not w:
+            return
+        try:
+            nw = max(480, min(8000, int(width)))
+            nh = max(360, min(6000, int(height)))
+            w.resize(nw, nh)
+        except Exception:
+            pass
 
     def move_window(self, dx: int, dy: int):
         w = self._webui._window
@@ -4894,6 +5207,40 @@ class SettingsApi:
             "allow_secret_config": lan.get_status()["allow_secret_config"],
         }
 
+    def plugin_list(self) -> list:
+        """插件列表（manifest 元信息 + 状态 + 权限清单）"""
+        return get_plugin_manager().list_info()
+
+    def plugin_set_enabled(self, plugin_id: str, enabled: bool) -> dict:
+        """切换插件启用状态（禁用立即生效，启用需重启）"""
+        return get_plugin_manager().set_enabled(str(plugin_id), bool(enabled))
+
+    def plugin_get_settings(self, plugin_id: str) -> dict:
+        """读取插件自有设置"""
+        return get_plugin_manager().get_settings(str(plugin_id))
+
+    def plugin_save_settings(self, plugin_id: str, data: dict) -> dict:
+        """保存插件自有设置（成功后通知前端刷新插件样式）"""
+        result = get_plugin_manager().save_settings(str(plugin_id), data or {})
+        if result.get("ok"):
+            import json as _json
+
+            get_plugin_manager().evaluate_js(
+                "window.ommPluginRefresh&&window.ommPluginRefresh(%s)"
+                % _json.dumps(str(plugin_id))
+            )
+        return result
+
+    def plugin_open_dir(self) -> dict:
+        """在系统文件管理器打开插件安装目录"""
+        return get_plugin_manager().open_plugins_dir()
+
+    def plugin_call(self, plugin_id: str, method: str, args=None) -> dict:
+        """分发设置窗口插件方法（manifest settings_api 声明的逻辑）"""
+        return get_plugin_manager().call_settings(
+            str(plugin_id), str(method), args or []
+        )
+
     def lan_confirm_device(self, approved: bool) -> dict:
         from . import lan
 
@@ -4905,6 +5252,7 @@ class SettingsApi:
         from .platform_util import is_auto_start_enabled
 
         return {
+            "theme": d.get("theme", "dark"),
             "hotkey": d.get("hotkey", "Ctrl+Alt+N"),
             "hotkey_show_at_mouse": d.get("hotkey_show_at_mouse", False),
             "auto_play_gif": d.get("auto_play_gif", True),
@@ -4952,6 +5300,7 @@ class SettingsApi:
             "webdav_user": d.get("webdav_user", ""),
             "webdav_password": d.get("webdav_password", ""),
             "webdav_path": d.get("webdav_path", ""),
+            "webdav_allow_insecure": d.get("webdav_allow_insecure", False),
             "show_upload_progress": d.get("show_upload_progress", True),
             "show_upload_done": d.get("show_upload_done", True),
             "show_download_progress": d.get("show_download_progress", True),
@@ -4986,9 +5335,11 @@ class SettingsApi:
             "copy_avoid_webp": d.get("copy_avoid_webp", False),
             "disable_auto_hide": d.get("disable_auto_hide", False),
             "manifest_include_tags": d.get("manifest_include_tags", True),
+            "manifest_include_collections": d.get("manifest_include_collections", True),
             "manifest_include_favorites": d.get("manifest_include_favorites", True),
             "cloud_direct": d.get("cloud_direct", True),
             "cloud_thumb_auto_push": d.get("cloud_thumb_auto_push", True),
+            "window_resize_enabled": d.get("window_resize_enabled", False),
         }
 
     def _safe_refresh(self, js_function: str) -> dict:
@@ -5127,7 +5478,10 @@ class SettingsApi:
                     )
                 except onebot.OneBotError as exc:
                     return {"ok": False, "error": str(exc)}
-            if "auto_start" in settings:
+            previous_hotkey = self._cfg.get("hotkey", "Ctrl+Alt+N")
+            if "auto_start" in settings and settings["auto_start"] != self._cfg.get(
+                "auto_start", False
+            ):
                 from .platform_util import set_auto_start
 
                 set_auto_start(settings["auto_start"])
@@ -5146,7 +5500,8 @@ class SettingsApi:
                     _cloud_reset()
                     if cloud:
                         _start_cloud_refresh()
-            if "hotkey" in settings:
+            self._refresh_main_settings()
+            if "hotkey" in settings and settings["hotkey"] != previous_hotkey:
                 self._webui._on_hotkey_change(settings["hotkey"])
             if napcat_changed:
                 try:
@@ -5156,18 +5511,32 @@ class SettingsApi:
                 except Exception:
                     logger.exception("NapCat 命令监听重载失败")
                     return {"ok": False, "error": "命令监听重载失败"}
-            try:
-                if len(webview.windows) > 0:
-                    refresh_js = (
-                        "window.refreshLibrary && window.refreshLibrary('structure')"
-                        if hidden_collection_changed or category_sidebar_changed
-                        else "refreshMemes()"
-                    )
-                    webview.windows[0].evaluate_js(f"{refresh_js};")
-            except Exception:
-                pass
-            return {"ok": True}
-        return {"ok": False, "error": "设置数据无效"}
+            if hidden_collection_changed or category_sidebar_changed:
+                try:
+                    if webview.windows:
+                        webview.windows[0].evaluate_js(
+                            "window.refreshLibrary && "
+                            "window.refreshLibrary('structure');"
+                        )
+                except Exception:
+                    logger.debug("主窗口结构刷新失败", exc_info=True)
+            return {"ok": True, "theme": self._cfg.get("theme", "dark")}
+        return {"ok": False, "error": "invalid_settings"}
+
+    # 将已保存的界面设置直接推送到主窗口。
+    def _refresh_main_settings(self):
+        import json
+
+        settings = {
+            "theme": self._cfg.get("theme", "dark"),
+            "hover_zoom": self._cfg.get("hover_zoom", True),
+            "window_resize_enabled": self._cfg.get("window_resize_enabled", False),
+        }
+        try:
+            if webview.windows:
+                webview.windows[0].evaluate_js(f"refreshMemes({json.dumps(settings)});")
+        except Exception:
+            logger.debug("主窗口设置刷新失败", exc_info=True)
 
     def reset_settings(self) -> dict:
         prev_cache_dir = self._cfg.get("cache_dir", "")
@@ -5185,17 +5554,17 @@ class SettingsApi:
         set_auto_start(False)
         onebot.stop_command_listener()
         _cloud_reset()
-        try:
-            if len(webview.windows) > 0:
-                refresh_js = (
-                    "window.refreshLibrary && window.refreshLibrary('structure')"
-                    if category_sidebar_changed
-                    else "refreshMemes()"
-                )
-                webview.windows[0].evaluate_js(f"{refresh_js};")
-        except Exception:
-            pass
+        self._refresh_main_settings()
+        if category_sidebar_changed:
+            try:
+                if webview.windows:
+                    webview.windows[0].evaluate_js(
+                        "window.refreshLibrary && window.refreshLibrary('structure');"
+                    )
+            except Exception:
+                logger.debug("主窗口结构刷新失败", exc_info=True)
         return {
+            "theme": self._cfg.get("theme", "dark"),
             "hotkey": hotkey,
             "hotkey_show_at_mouse": self._cfg.get("hotkey_show_at_mouse", False),
             "auto_play_gif": self._cfg.get("auto_play_gif", True),
@@ -5230,6 +5599,7 @@ class SettingsApi:
             "webdav_user": "",
             "webdav_password": "",
             "webdav_path": "",
+            "webdav_allow_insecure": False,
             "show_upload_progress": True,
             "show_upload_done": True,
             "show_download_progress": True,
@@ -5263,10 +5633,41 @@ class SettingsApi:
             "copy_avoid_webp": self._cfg.get("copy_avoid_webp", False),
             "disable_auto_hide": False,
             "manifest_include_tags": True,
+            "manifest_include_collections": True,
             "manifest_include_favorites": True,
             "cloud_direct": True,
             "cloud_thumb_auto_push": True,
+            "window_resize_enabled": False,
         }
+
+    def resize_window(self, width: int, height: int, persist: bool = False):
+        """拖动边框调整设置窗口大小；persist=True 时同时持久化尺寸"""
+        w = self._webui._settings_window
+        if not w:
+            return
+        try:
+            nw = max(600, min(8000, int(width)))
+            nh = max(480, min(6000, int(height)))
+            w.resize(nw, nh)
+            if persist:
+                self._cfg.set("settings_window_width", nw)
+                self._cfg.set("settings_window_height", nh)
+                self._cfg.save()
+        except Exception:
+            pass
+
+    def reset_main_window_size(self) -> dict:
+        """恢复主窗口默认大小 960x640 并清除持久化尺寸"""
+        try:
+            self._cfg.set("window_width", 0)
+            self._cfg.set("window_height", 0)
+            self._cfg.save()
+            w = self._webui._window
+            if w:
+                w.resize(960, 640)
+            return {"ok": True}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
 
     def move_window(self, dx: int, dy: int):
         w = self._webui._settings_window
@@ -5603,6 +6004,26 @@ class SettingsApi:
         path = result[0] if isinstance(result, (tuple, list)) else result
         return {"ok": True, "path": path}
 
+    def plugin_pick_file(self, plugin_id: str, media: str = "any") -> dict:
+        """为插件打开文件选择对话框（插件设置区块用，media=video/image/any）"""
+        pid = str(plugin_id)
+        info = get_plugin_manager().list_info()
+        if not any(p.get("id") == pid and p.get("status") == "loaded" for p in info):
+            return {"ok": False, "error": "plugin_disabled"}
+        types = {
+            "video": ("Video (*.mp4;*.webm;*.mov;*.mkv;*.avi)",),
+            "image": ("Images (*.png;*.jpg;*.jpeg;*.gif;*.webp;*.bmp;*.avif)",),
+            "any": (
+                "Media (*.mp4;*.webm;*.mov;*.gif;*.png;*.jpg;*.jpeg;*.webp;*.bmp)",
+                "All files (*.*)",
+            ),
+        }.get(str(media), ("All files (*.*)",))
+        result = self._dialog(webview.FileDialog.OPEN, file_types=types)
+        if not result:
+            return {"ok": False, "cancelled": True}
+        path = result[0] if isinstance(result, (tuple, list)) else result
+        return {"ok": True, "path": str(path)}
+
     def apply_storage_dir(self, path, move_files=False, virtual_drive_compat=None):
         """应用新的表情包存储目录；move_files=True 时后台迁移现有文件"""
         compat = (
@@ -5873,6 +6294,8 @@ class SettingsApi:
                 "error": str(e),
                 "failed_files": sync_module.get_sync_progress().get("failed_items", []),
             }
+        finally:
+            _sync_status_invalidate()
 
     def sync_pull(self, remove_local: bool = None) -> dict:
         try:
@@ -5893,6 +6316,8 @@ class SettingsApi:
                 "error": str(e),
                 "failed_files": sync_module.get_sync_progress().get("failed_items", []),
             }
+        finally:
+            _sync_status_invalidate()
 
     def sync_test(self) -> str:
         try:
@@ -5960,6 +6385,7 @@ class SettingsApi:
             manifest = download_index()
             if not manifest:
                 return {"ok": False, "error": "无法获取远端索引"}
+            _sync_status_set_manifest(manifest)
             db = get_db()
             local_rows = db.search(keyword="", tags=None, limit=999999)
             local_count = len(local_rows)
@@ -7862,16 +8288,50 @@ class WebUI:
             vue_html = HTML_DIR / "vue.html"
             # 仅当 vue.html 与构建产物都存在时才走 Vue 前端，否则回退旧 index.html
             if vue_html.exists() and (HTML_DIR / "dist" / "ohmymeme.js").exists():
+                tags = get_plugin_manager().asset_tags("main")
+                try:
+                    html = _theme_html(
+                        vue_html.read_text(encoding="utf-8"), self._cfg.get("theme")
+                    )
+                    html = _inject_before(html, "</body>", tags)
+                    bottle.response.content_type = "text/html; charset=utf-8"
+                    return html
+                except OSError as e:
+                    logger.warning(f"vue.html 读取失败回退静态: {e}")
                 return bottle.static_file("vue.html", root=str(HTML_DIR))
             html_path = HTML_DIR / "index.html"
             if html_path.exists():
-                return bottle.static_file("index.html", root=str(HTML_DIR))
+                try:
+                    html = _theme_html(
+                        html_path.read_text(encoding="utf-8"), self._cfg.get("theme")
+                    )
+                    bottle.response.content_type = "text/html; charset=utf-8"
+                    return html
+                except OSError as e:
+                    logger.warning(f"index.html 读取失败: {e}")
+                    return bottle.HTTPError(500, "页面读取失败")
             return "<h1>OhMyMeme</h1><p>index.html not found</p>"
 
         @app.route("/settings/")
         def settings_page():
             html_path = HTML_DIR / "settings.html"
             if html_path.exists():
+                links, scripts = _split_asset_tags(
+                    get_plugin_manager().asset_tags("settings")
+                )
+                sections = get_plugin_manager().settings_sections()
+                try:
+                    html = _theme_html(
+                        html_path.read_text(encoding="utf-8"), self._cfg.get("theme")
+                    )
+                    html = _inject_before(html, "</head>", links)
+                    html = _inject_after(html, "<!-- plugin-sections -->", sections)
+                    # 插件脚本在 Vue 入口之后注入（defer 文档序）
+                    html = _inject_before(html, "</body>", scripts)
+                    bottle.response.content_type = "text/html; charset=utf-8"
+                    return html
+                except OSError as e:
+                    logger.warning(f"settings.html 读取失败回退静态: {e}")
                 return bottle.static_file("settings.html", root=str(HTML_DIR))
             return "<h1>设置</h1><p>settings.html not found</p>"
 
@@ -8085,6 +8545,26 @@ class WebUI:
                 bottle.abort(404, "Not Found")
             return bottle.static_file(name, root=str(RESOURCES_DIR))
 
+        # 插件资产与自定义路由：须注册在兜底静态路由之前（Bottle 按注册序匹配）
+        @app.route("/plugins/<plugin_id>/<relpath:path>")
+        def serve_plugin_asset(plugin_id, relpath):
+            resolved = get_plugin_manager().resolve_asset(plugin_id, relpath)
+            if not resolved:
+                bottle.abort(404, "Not Found")
+            path, ctype = resolved
+            return bottle.static_file(
+                os.path.basename(path),
+                root=os.path.dirname(path),
+                mimetype=ctype or "application/octet-stream",
+            )
+
+        for _pid, _rule, _fn in get_plugin_manager().custom_routes():
+            app.route(
+                _rule,
+                method=["GET", "POST"],
+                callback=_make_plugin_route_cb(_pid, _rule, _fn),
+            )
+
         @app.route("/<filepath:path>")
         def static_files(filepath):
             # 按扩展名强制 MIME，规避本机 .js 映射被改写成 text/plain 时
@@ -8250,18 +8730,22 @@ class WebUI:
         url = f"http://127.0.0.1:{self._port}/"
         wx = self._cfg.get("window_x", -1)
         wy = self._cfg.get("window_y", -1)
+        width, height = self._resolve_window_size()
         self._window = webview.create_window(
             "OhMyMeme",
             url,
             js_api=self._api,
-            width=960,
-            height=640,
+            width=width,
+            height=height,
             x=wx if (wx is not None and wx >= 0) else None,
             y=wy if (wy is not None and wy >= 0) else None,
             resizable=True,
             frameless=True,
             easy_drag=False,
             hidden=self._silent_start,
+            background_color=(
+                "#f8fafc" if self._cfg.get("theme") == "light" else "#0d0d0f"
+            ),
         )
         if platform.system() == "Windows":
             self._window.events.loaded += lambda: _install_text_clipboard_bridge(
@@ -8288,12 +8772,17 @@ class WebUI:
     def _create_settings_window(self):
         try:
             if self._settings_window is not None:
+                self._save_settings_window_size()
                 try:
                     self._settings_window.destroy()
                 except Exception:
                     pass
                 self._settings_window = None
 
+            sw = int(self._cfg.get("settings_window_width", 0) or 0)
+            sh = int(self._cfg.get("settings_window_height", 0) or 0)
+            sw = sw if 600 <= sw <= 8000 else 720
+            sh = sh if 480 <= sh <= 6000 else 560
             settings_url = f"http://127.0.0.1:{self._port}/settings/"
             sx = sy = None
             if self._window is not None:
@@ -8301,21 +8790,24 @@ class WebUI:
                     mx, my = self._window.x, self._window.y
                     mw, mh = self._window.width, self._window.height
                     if mx is not None and my is not None and mw and mh:
-                        sx = mx + (mw - 720) // 2
-                        sy = my + (mh - 560) // 2
+                        sx = mx + (mw - sw) // 2
+                        sy = my + (mh - sh) // 2
                 except Exception:
                     sx = sy = None
             self._settings_window = webview.create_window(
                 "设置 - OhMyMeme",
                 settings_url,
                 js_api=self._settings_api,
-                width=720,
-                height=560,
+                width=sw,
+                height=sh,
                 x=sx,
                 y=sy,
-                resizable=False,
+                resizable=True,
                 frameless=True,
                 easy_drag=False,
+                background_color=(
+                    "#f8fafc" if self._cfg.get("theme") == "light" else "#0d0d0f"
+                ),
             )
             if platform.system() == "Windows":
                 window = self._settings_window
@@ -8324,6 +8816,19 @@ class WebUI:
         except Exception as e:
             logger.warning(f"create settings window error: {e}")
             return False
+
+    def _save_settings_window_size(self):
+        """设置窗口销毁前持久化尺寸（下次打开沿用）"""
+        w = self._settings_window
+        if not w:
+            return
+        try:
+            if w.width and w.height:
+                self._cfg.set("settings_window_width", int(w.width))
+                self._cfg.set("settings_window_height", int(w.height))
+                self._cfg.save()
+        except Exception:
+            pass
 
     def focus_settings_window(self):
         """把设置窗口重新拉到前台（对话框关闭后恢复焦点用）"""
@@ -8342,6 +8847,7 @@ class WebUI:
 
     def close_settings(self):
         if self._settings_window:
+            self._save_settings_window_size()
             try:
                 self._settings_window.destroy()
             except Exception as e:
@@ -8355,12 +8861,37 @@ class WebUI:
         except Exception:
             pass
 
+    def _resolve_window_size(self):
+        """主窗口尺寸：插件 window 覆盖 > 持久化尺寸 > 默认 960x640"""
+        try:
+            overrides = get_plugin_manager().window_params()
+        except Exception:
+            overrides = {}
+
+        def _norm(value, fallback, lo, hi):
+            try:
+                value = int(value)
+            except (TypeError, ValueError):
+                return fallback
+            return value if lo <= value <= hi else fallback
+
+        width = _norm(overrides.get("width"), None, 480, 8000)
+        height = _norm(overrides.get("height"), None, 360, 6000)
+        if width is None:
+            width = _norm(self._cfg.get("window_width", 0), 960, 480, 8000)
+        if height is None:
+            height = _norm(self._cfg.get("window_height", 0), 640, 360, 6000)
+        return width, height
+
     def _save_window_position(self):
         if not self._window:
             return
         try:
             self._cfg.set("window_x", self._window.x)
             self._cfg.set("window_y", self._window.y)
+            if self._window.width and self._window.height:
+                self._cfg.set("window_width", int(self._window.width))
+                self._cfg.set("window_height", int(self._window.height))
             self._cfg.save()
         except Exception:
             pass

@@ -235,6 +235,53 @@ class TestConfig(unittest.TestCase):
             Config(self.config_path).get("manifest_include_favorites"), False
         )
 
+    def test_manifest_include_collections_default_on(self):
+        cfg = Config(self.config_path)
+        self.assertIs(cfg.get("manifest_include_collections"), True)
+        self.assertIs(Config.DEFAULTS.get("manifest_include_collections"), True)
+
+        cfg.set("manifest_include_collections", False)
+        cfg.save()
+        self.assertIs(
+            Config(self.config_path).get("manifest_include_collections"), False
+        )
+
+    def test_copy_mode_default_keeps_custom_webp_resize(self):
+        cfg = Config(self.config_path)
+        self.assertEqual(cfg.get("copy_resize_mode"), 1)
+        self.assertEqual(Config.DEFAULTS.get("copy_resize_mode"), 1)
+
+    def test_custom_cloud_preferences_are_preserved(self):
+        self.config_path.write_text(
+            json.dumps(
+                {
+                    "sync_auto_fetch_index": True,
+                    "sync_delete_remote": True,
+                    "sync_remove_local": True,
+                    "sync_hide_upload_warning": True,
+                    "show_upload_progress": False,
+                    "show_upload_done": False,
+                    "show_download_progress": False,
+                    "show_download_done": False,
+                    "webdav_allow_insecure": True,
+                }
+            ),
+            encoding="utf-8",
+        )
+        cfg = Config(self.config_path)
+        self.assertIs(cfg.get("sync_auto_fetch_index"), True)
+        self.assertIs(cfg.get("sync_delete_remote"), True)
+        self.assertIs(cfg.get("sync_remove_local"), True)
+        self.assertIs(cfg.get("sync_hide_upload_warning"), True)
+        self.assertIs(cfg.get("show_upload_progress"), False)
+        self.assertIs(cfg.get("show_upload_done"), False)
+        self.assertIs(cfg.get("show_download_progress"), False)
+        self.assertIs(cfg.get("show_download_done"), False)
+        # WebDAV 信任开关独立保存。
+        self.assertIs(cfg.get("webdav_allow_insecure"), True)
+        cfg.update_from_dict({"sync_delete_remote": False})
+        self.assertIs(cfg.get("sync_delete_remote"), False)
+
     def test_removed_auto_paste_setting_is_not_retained(self):
         self.config_path.write_text('{"auto_paste_meme": true}', encoding="utf-8")
 
@@ -8407,6 +8454,27 @@ class TestBackup(unittest.TestCase):
         r = backup.restore_backup(bad, self.tmp, self.cache, self.db)
         self.assertFalse(r["ok"])
         self.assertIn("不完整", r["error"])
+
+
+class TestGifSuffixCopy(unittest.TestCase):
+    def test_suffix_only_copy_keeps_bytes(self):
+        from src.clipboard_util import convert_image_mode_4
+
+        with tempfile.TemporaryDirectory() as d:
+            src = Path(d) / "a.webp"
+            payload = b"RIFF\x00\x00\x00\x00WEBPVP8 not-a-real-image"
+            src.write_bytes(payload)
+            out = convert_image_mode_4(str(src))
+            self.assertTrue(out.endswith(".gif"))
+            self.assertEqual(Path(out).read_bytes(), payload)
+
+    def test_gif_input_is_not_copied(self):
+        from src.clipboard_util import convert_image_mode_4
+
+        with tempfile.TemporaryDirectory() as d:
+            src = Path(d) / "a.gif"
+            src.write_bytes(b"GIF89a")
+            self.assertEqual(convert_image_mode_4(str(src)), str(src))
 
 
 if __name__ == "__main__":
