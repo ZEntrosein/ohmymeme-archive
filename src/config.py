@@ -213,11 +213,13 @@ class Config:
         # UI
         "theme": "dark",
         "library_genres": ["image", "gif", "chat_record"],
-        "window_x": -1,
-        "window_y": -1,
+        "window_x": None,  # None=未保存，交给系统居中（负坐标合法，不能用 -1 当哨兵）
+        "window_y": None,
+        "window_pos_set": False,  # 是否已由 _save_window_position 真正写过坐标
         "window_width": 0,  # 主窗口宽度持久化（0=默认 960）
         "window_height": 0,  # 主窗口高度持久化（0=默认 640）
         "window_resize_enabled": False,  # 允许拖窗口边框调整大小（主/设置窗口）
+        "sort_mode": "manifest",  # 主窗口排序（manifest/name，可带 _desc）
         "settings_window_width": 0,  # 设置窗口宽度持久化（0=默认 720）
         "settings_window_height": 0,  # 设置窗口高度持久化（0=默认 560）
         "auto_play_gif": True,
@@ -315,6 +317,14 @@ class Config:
                 for k in self.DEFAULTS:
                     if k in raw:
                         self._data[k] = raw[k]
+                # 老配置没有 window_pos_set：旧默认值 -1 是「未保存」哨兵，负坐标
+                # 放开后它会通过范围校验，清成 None 让窗口回到系统居中；
+                # 新版写过坐标时标志为真，-1 是副屏上的合法坐标，原样保留
+                if not self._data.get("window_pos_set"):
+                    if self._data.get("window_x") == -1:
+                        self._data["window_x"] = None
+                    if self._data.get("window_y") == -1:
+                        self._data["window_y"] = None
                 self._migrate(raw)
             except (json.JSONDecodeError, OSError):
                 pass

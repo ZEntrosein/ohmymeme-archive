@@ -18,6 +18,7 @@ const state = reactive({
   selectedIds: new Set<number>(),
   allTags: [] as TagRecord[],
   searchQuery: '',
+  sortMode: 'manifest',
   total: 0,
   page: 1,
   pageCount: 1,
@@ -67,7 +68,7 @@ export function useMemes() {
     // 后端会先取消上一个查询的预热任务；设置未启用或没有后续页时只执行取消。
     void api(
       'start_page_cache_warmup', query, selectedTags, collectionId,
-      offset, MEME_PAGE, state.total, categoryId, [...genres],
+      offset, MEME_PAGE, state.total, categoryId, [...genres], state.sortMode,
     )
   }
 
@@ -92,8 +93,9 @@ export function useMemes() {
       state.allTags = Array.isArray(data.tag_records) ? data.tag_records : legacyTags(data.tags)
       state.collections = data.collections || []
       state.categories = data.categories || []
+      if (data.sort_mode) state.sortMode = data.sort_mode
       state.page = 1
-      const library = await api('search_library', '', [], null, 0, MEME_PAGE, null, [...state.activeGenres])
+      const library = await api('search_library', '', [], null, 0, MEME_PAGE, null, [...state.activeGenres], false, state.sortMode)
       if (library && Array.isArray(library.memes) && Array.isArray(library.chat_records)) {
         state.memes = library.memes
         state.chatRecords = library.chat_records
@@ -135,7 +137,7 @@ export function useMemes() {
         'search_library',
         state.searchQuery, selectedTags, state.activeCollection,
         offset, MEME_PAGE, state.activeCategory, [...state.activeGenres],
-        refreshRandom,
+        refreshRandom, state.sortMode,
       )
       if (gen !== searchGen) return false
       // 桥接失败（null/非数组）时保留当前分页与结果，避免暂时性故障触发空页回退或清空网格
@@ -170,6 +172,14 @@ export function useMemes() {
   }
 
   function setSearch(q: string) { state.searchQuery = q }
+
+  let sortSave = Promise.resolve<unknown>(null)
+  async function setSortMode(mode: string) {
+    if (!['manifest', 'manifest_desc', 'name_asc', 'name_desc'].includes(mode)) return
+    state.sortMode = mode
+    sortSave = sortSave.then(() => api('save_sort_mode', mode))
+    await Promise.all([search(), sortSave])
+  }
 
   function toggleGenre(genre: Genre) {
     state.activeGenres = state.activeGenres.includes(genre)
@@ -274,6 +284,7 @@ export function useMemes() {
 
   function canReorder(): boolean {
     const q = state.searchQuery.trim()
+    if (state.sortMode !== 'manifest') return false
     if (!state.activeGenres.some(genre => genre !== 'chat_record') || state.chatTotal > 0) return false
     if (state.memes.some(meme => meme.cloud)) return false
     if (q || state.activeTags.size > 0) return false
@@ -293,6 +304,7 @@ export function useMemes() {
     goToPage,
     setSearch,
     toggleGenre,
+    setSortMode,
     toggleTag,
     setActiveCollection,
     setActiveCategory,

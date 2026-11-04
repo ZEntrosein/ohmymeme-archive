@@ -148,6 +148,63 @@ def _name_sort_key(name):
     return key
 
 
+# 拼音检索文本缓存（原文 → 全拼 + 首字母）；超限整体清空，避免极端名称撑爆内存
+_pinyin_cache = {}
+_pinyin_cache_lock = threading.Lock()
+_PINYIN_CACHE_MAX = 20000
+_PINYIN_KEYWORD_RE = re.compile(r"^[a-z]+$")
+
+
+def _load_lazy_pinyin():
+    global _lazy_pinyin
+    if _lazy_pinyin is None:
+        try:
+            from pypinyin import lazy_pinyin as _lp
+
+            _lazy_pinyin = _lp
+        except Exception:
+            _lazy_pinyin = False
+    return _lazy_pinyin
+
+
+def pinyin_text(text):
+    """检索用拼音文本（小写全拼 + 空格 + 首字母）；pypinyin 缺失时返回空串"""
+    raw = str(text or "")
+    if not raw:
+        return ""
+    with _pinyin_cache_lock:
+        cached = _pinyin_cache.get(raw)
+    if cached is not None:
+        return cached
+    value = ""
+    lp = _load_lazy_pinyin()
+    if lp:
+        try:
+            parts = [p for p in lp(raw) if p]
+        except Exception:
+            parts = []
+        if parts:
+            full = "".join(parts).lower()
+            initials = "".join(p[0] for p in parts).lower()
+            value = full + " " + initials
+    with _pinyin_cache_lock:
+        if len(_pinyin_cache) >= _PINYIN_CACHE_MAX:
+            _pinyin_cache.clear()
+        _pinyin_cache[raw] = value
+    return value
+
+
+def pinyin_matches(keyword, *texts):
+    """纯字母关键词是否命中任一文本的拼音（全拼或首字母）；非纯字母一律 False"""
+    kw = str(keyword or "").strip().lower()
+    if not kw or not _PINYIN_KEYWORD_RE.match(kw):
+        return False
+    for text in texts:
+        if kw in pinyin_text(text):
+            return True
+    return False
+
+
 class MemeDB:
     """SQLite元数据存储，线程安全"""
 
@@ -172,8 +229,7 @@ class MemeDB:
     def _init_db(self):
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         conn = self._get_conn()
-        conn.executescript(
-            """
+        conn.executescript("""
             CREATE TABLE IF NOT EXISTS memes (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
                 filename    TEXT    NOT NULL,
@@ -312,15 +368,13 @@ class MemeDB:
                 ON chat_tags(tag_id);
             CREATE INDEX IF NOT EXISTS idx_chat_collections_collection
                 ON chat_collections(collection_id);
-        """
-        )
+        """)
         self._migrate(conn)
 
     def _migrate(self, conn):
         """迁移旧表：添加可能缺失的列并补建依赖新列的索引（幂等，可重复执行）"""
         # 来源映射单独建表，使旧数据库与旧备份恢复后都能自动获得该能力。
-        conn.executescript(
-            """
+        conn.executescript("""
                 CREATE TABLE IF NOT EXISTS categories (
                     id          INTEGER PRIMARY KEY AUTOINCREMENT,
                     name        TEXT NOT NULL COLLATE NOCASE,
@@ -388,8 +442,7 @@ class MemeDB:
                     ON chat_tags(tag_id);
                 CREATE INDEX IF NOT EXISTS idx_chat_collections_collection
                     ON chat_collections(collection_id);
-            """
-        )
+            """)
         # 早期版本把 OneBot 进程内短 message_id 误写入摘要序号列。
         # package_json 中的 real_seq 才能跨 NapCat 重启重新定位原消息；
         # 启动与备份恢复时都把已有记录的摘要修正为真实序号。
@@ -422,8 +475,7 @@ class MemeDB:
             conn.commit()
             conn.execute("PRAGMA foreign_keys=OFF")
             try:
-                conn.executescript(
-                    """
+                conn.executescript("""
                     BEGIN;
                     CREATE TABLE tags_new (
                         id       INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -436,8 +488,7 @@ class MemeDB:
                     DROP TABLE tags;
                     ALTER TABLE tags_new RENAME TO tags;
                     COMMIT;
-                    """
-                )
+                    """)
             except Exception:
                 if conn.in_transaction:
                     conn.rollback()
@@ -1174,11 +1225,9 @@ class MemeDB:
         """返回最近保存记录的轻量摘要。"""
         row = (
             self._get_conn()
-            .execute(
-                """SELECT id, title, name, media_folder, node_count,
+            .execute("""SELECT id, title, name, media_folder, node_count,
                           record_count, updated_at
-               FROM chat_records ORDER BY updated_at DESC, id DESC LIMIT 1"""
-            )
+               FROM chat_records ORDER BY updated_at DESC, id DESC LIMIT 1""")
             .fetchone()
         )
         return dict(row) if row else None
@@ -1226,13 +1275,11 @@ class MemeDB:
 
     def _prune_orphan_tags(self, conn):
         """清理未被表情或聊天记录使用的孤儿标签"""
-        conn.execute(
-            """DELETE FROM tags WHERE id NOT IN (
+        conn.execute("""DELETE FROM tags WHERE id NOT IN (
                 SELECT DISTINCT tag_id FROM meme_tags
                 UNION
                 SELECT DISTINCT tag_id FROM chat_tags
-            )"""
-        )
+            )""")
 
     @staticmethod
     def _normalize_tag(tag: Any) -> Optional[Tuple[str, str]]:
@@ -1743,12 +1790,10 @@ class MemeDB:
     def get_tags_map(self) -> Dict[str, List[str]]:
         """按文件名批量取全部标签（manifest 构建用，单查询避免 N+1）"""
         conn = self._get_conn()
-        rows = conn.execute(
-            """SELECT m.filename, t.name FROM memes m
+        rows = conn.execute("""SELECT m.filename, t.name FROM memes m
                JOIN meme_tags mt ON mt.meme_id = m.id
                JOIN tags t ON t.id = mt.tag_id
-               ORDER BY m.filename, t.name"""
-        ).fetchall()
+               ORDER BY m.filename, t.name""").fetchall()
         out: Dict[str, List[str]] = {}
         for fname, name in rows:
             out.setdefault(fname, []).append(name)
@@ -1758,12 +1803,10 @@ class MemeDB:
         """按文件名批量读取分类标签，供清单保留同名不同分类的属性。"""
         rows = (
             self._get_conn()
-            .execute(
-                """SELECT m.filename, t.name, t.category FROM memes m
+            .execute("""SELECT m.filename, t.name, t.category FROM memes m
                JOIN meme_tags mt ON mt.meme_id = m.id
                JOIN tags t ON t.id = mt.tag_id
-               ORDER BY m.filename, t.category, t.name"""
-            )
+               ORDER BY m.filename, t.category, t.name""")
             .fetchall()
         )
         out: Dict[str, List[dict]] = {}
@@ -2833,6 +2876,69 @@ class MemeDB:
             return f"NOT {gif}"
         return None
 
+    def _pinyin_match_ids(self, keyword) -> Optional[List[int]]:
+        """纯字母关键词的拼音命中（名称/标签名全拼或首字母）；非纯字母返回 None"""
+        kw = str(keyword or "").strip().lower()
+        if not kw or not _PINYIN_KEYWORD_RE.match(kw):
+            return None
+        conn = self._get_conn()
+        ids = set()
+        for r in conn.execute("SELECT id, filename, original_name FROM memes"):
+            if kw in pinyin_text(r["filename"]) or kw in pinyin_text(
+                r["original_name"]
+            ):
+                ids.add(r["id"])
+        tag_ids = [
+            r["id"]
+            for r in conn.execute("SELECT id, name FROM tags")
+            if kw in pinyin_text(r["name"])
+        ]
+        for i in range(0, len(tag_ids), 500):
+            chunk = tag_ids[i : i + 500]
+            ph = ",".join("?" for _ in chunk)
+            ids.update(
+                r["meme_id"]
+                for r in conn.execute(
+                    f"SELECT DISTINCT meme_id FROM meme_tags WHERE tag_id IN ({ph})",
+                    chunk,
+                )
+            )
+        return sorted(ids)
+
+    def _keyword_filter(
+        self,
+        keyword,
+        prefix: str = "",
+        include_description: bool = False,
+        include_ocr_text: bool = False,
+    ) -> Tuple[str, list]:
+        """关键词 WHERE 片段与参数：文件名/显示名/标签名 LIKE + 拼音命中 id"""
+        kw = f"%{keyword}%"
+        conds = [
+            f"{prefix}filename LIKE ?",
+            f"{prefix}original_name LIKE ?",
+            f"{prefix}id IN (SELECT mt.meme_id FROM meme_tags mt "
+            f"JOIN tags t ON t.id = mt.tag_id WHERE t.name LIKE ?)",
+        ]
+        params = [kw, kw, kw]
+        if include_description:
+            conds.extend(
+                [f"{prefix}manual_description LIKE ?", f"{prefix}ai_description LIKE ?"]
+            )
+            params.extend([kw, kw])
+        if include_ocr_text:
+            conds.extend(
+                [f"{prefix}manual_ocr_text LIKE ?", f"{prefix}ai_ocr_text LIKE ?"]
+            )
+            params.extend([kw, kw])
+        pids = self._pinyin_match_ids(keyword) or []
+        for i in range(0, len(pids), 500):
+            chunk = pids[i : i + 500]
+            ph = ",".join("?" for _ in chunk)
+            conds.append(f"{prefix}id IN ({ph})")
+            params.extend(chunk)
+        return "(" + " OR ".join(conds) + ")", params
+
     def search(
         self,
         keyword: str = "",
@@ -2860,26 +2966,11 @@ class MemeDB:
             params.extend(meme_ids)
 
         if keyword:
-            kw = f"%{keyword}%"
-            keyword_parts = ["m.filename LIKE ?", "m.original_name LIKE ?"]
-            keyword_params = [kw, kw]
-            if include_description:
-                keyword_parts.extend(
-                    ["m.manual_description LIKE ?", "m.ai_description LIKE ?"]
-                )
-                keyword_params.extend([kw, kw])
-            if include_ocr_text:
-                keyword_parts.extend(
-                    ["m.manual_ocr_text LIKE ?", "m.ai_ocr_text LIKE ?"]
-                )
-                keyword_params.extend([kw, kw])
-            keyword_parts.append(
-                "m.id IN (SELECT mt.meme_id FROM meme_tags mt "
-                "JOIN tags t ON t.id = mt.tag_id WHERE t.name LIKE ?)"
+            cond, kparams = self._keyword_filter(
+                keyword, "m.", include_description, include_ocr_text
             )
-            keyword_params.append(kw)
-            where.append("(" + " OR ".join(keyword_parts) + ")")
-            params.extend(keyword_params)
+            where.append(cond)
+            params.extend(kparams)
 
         normalized_tags = self._normalize_tags(tags)
         if normalized_tags:
@@ -2887,14 +2978,12 @@ class MemeDB:
                 "(t.category=? COLLATE NOCASE AND t.name=? COLLATE NOCASE)"
                 for _ in normalized_tags
             )
-            where.append(
-                f"""m.id IN (
+            where.append(f"""m.id IN (
                 SELECT mt.meme_id FROM meme_tags mt
                 JOIN tags t ON t.id = mt.tag_id
                 WHERE {tag_conditions}
                 GROUP BY mt.meme_id HAVING COUNT(DISTINCT t.id) = ?
-            )"""
-            )
+            )""")
             for category, name in normalized_tags:
                 params.extend([category, name])
             params.append(len(normalized_tags))
@@ -2902,12 +2991,10 @@ class MemeDB:
         if collection_id is not None:
             if isinstance(collection_id, list):
                 placeholders = ",".join("?" for _ in collection_id)
-                where.append(
-                    f"""m.id IN (
+                where.append(f"""m.id IN (
                     SELECT mc.meme_id FROM meme_collections mc
                     WHERE mc.collection_id IN ({placeholders})
-                )"""
-                )
+                )""")
                 params.extend(collection_id)
             else:
                 where.append(
@@ -2932,11 +3019,9 @@ class MemeDB:
             where.append("m.id IN (SELECT meme_id FROM favorites)")
 
         if uncategorized_only:
-            where.append(
-                """NOT EXISTS (
+            where.append("""NOT EXISTS (
                 SELECT 1 FROM meme_collections mc WHERE mc.meme_id = m.id
-            )"""
-            )
+            )""")
 
         excluded_ids = list(
             dict.fromkeys(int(value) for value in (exclude_collection_ids or []))
@@ -2972,7 +3057,10 @@ class MemeDB:
             ), m.id LIMIT ? OFFSET ?"""
             params.extend([primary_cid, limit, offset])
         else:
-            sql += " ORDER BY m.sort_order ASC, m.updated_at DESC LIMIT ? OFFSET ?"
+            sql += (
+                " ORDER BY m.sort_order ASC, m.updated_at DESC, m.id ASC"
+                " LIMIT ? OFFSET ?"
+            )
             params.extend([limit, offset])
 
         rows = conn.execute(sql, params).fetchall()
@@ -2996,57 +3084,38 @@ class MemeDB:
         where = ["(stego_of_hash IS NULL OR stego_of_hash = '')"]
         params = []
         if keyword:
-            kw = f"%{keyword}%"
-            keyword_parts = ["filename LIKE ?", "original_name LIKE ?"]
-            keyword_params = [kw, kw]
-            if include_description:
-                keyword_parts.extend(
-                    ["manual_description LIKE ?", "ai_description LIKE ?"]
-                )
-                keyword_params.extend([kw, kw])
-            if include_ocr_text:
-                keyword_parts.extend(["manual_ocr_text LIKE ?", "ai_ocr_text LIKE ?"])
-                keyword_params.extend([kw, kw])
-            keyword_parts.append(
-                "memes.id IN (SELECT mt.meme_id FROM meme_tags mt "
-                "JOIN tags t ON t.id = mt.tag_id WHERE t.name LIKE ?)"
+            cond, kparams = self._keyword_filter(
+                keyword, "", include_description, include_ocr_text
             )
-            keyword_params.append(kw)
-            where.append("(" + " OR ".join(keyword_parts) + ")")
-            params.extend(keyword_params)
+            where.append(cond)
+            params.extend(kparams)
         normalized_tags = self._normalize_tags(tags)
         if normalized_tags:
             tag_conditions = " OR ".join(
                 "(t.category=? COLLATE NOCASE AND t.name=? COLLATE NOCASE)"
                 for _ in normalized_tags
             )
-            where.append(
-                f"""id IN (
+            where.append(f"""id IN (
                 SELECT mt.meme_id FROM meme_tags mt
                 JOIN tags t ON t.id = mt.tag_id
                 WHERE {tag_conditions}
                 GROUP BY mt.meme_id HAVING COUNT(DISTINCT t.id) = ?
-            )"""
-            )
+            )""")
             for category, name in normalized_tags:
                 params.extend([category, name])
             params.append(len(normalized_tags))
         if collection_id is not None:
             if isinstance(collection_id, list):
                 placeholders = ",".join("?" for _ in collection_id)
-                where.append(
-                    f"""id IN (
+                where.append(f"""id IN (
                     SELECT meme_id FROM meme_collections
                     WHERE collection_id IN ({placeholders})
-                )"""
-                )
+                )""")
                 params.extend(collection_id)
             else:
-                where.append(
-                    """id IN (
+                where.append("""id IN (
                     SELECT meme_id FROM meme_collections WHERE collection_id = ?
-                )"""
-                )
+                )""")
                 params.append(collection_id)
 
         if uncategorized_category:
@@ -3062,11 +3131,9 @@ class MemeDB:
         if favorite_only:
             where.append("id IN (SELECT meme_id FROM favorites)")
         if uncategorized_only:
-            where.append(
-                """NOT EXISTS (
+            where.append("""NOT EXISTS (
                 SELECT 1 FROM meme_collections WHERE meme_id = memes.id
-            )"""
-            )
+            )""")
         excluded_ids = list(
             dict.fromkeys(int(value) for value in (exclude_collection_ids or []))
         )
@@ -3126,6 +3193,23 @@ class MemeDB:
             (limit, offset),
         ).fetchall()
         return [dict(r) for r in rows]
+
+    def set_original_name(self, meme_id: int, name: str):
+        """只改显示名，不动 updated_at（同步重命名不改变本机列表排序）"""
+        with self._lock:
+            conn = self._get_conn()
+            conn.execute("UPDATE memes SET original_name=? WHERE id=?", (name, meme_id))
+            conn.commit()
+
+    def ordered_ids(self) -> List[tuple]:
+        """默认「全部」列表的行顺序（id, filename），与 search() 无筛选分支同序"""
+        conn = self._get_conn()
+        rows = conn.execute(
+            "SELECT id, filename FROM memes "
+            "WHERE (stego_of_hash IS NULL OR stego_of_hash = '') "
+            "ORDER BY sort_order ASC, updated_at DESC, id ASC"
+        ).fetchall()
+        return [(r[0], r[1]) for r in rows]
 
     def get_all_phash(self) -> List[dict]:
         """返回所有可见 meme 的感知哈希快照，供全库相似度比对（排除隐写载体）"""

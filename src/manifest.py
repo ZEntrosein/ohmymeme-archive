@@ -301,6 +301,25 @@ def remove_memes(filenames) -> bool:
         _MANIFEST_LOCK.release()
 
 
+def index_path() -> Path:
+    return _index_path()
+
+
+def index_order() -> List[str]:
+    """本地清单 memes 的文件名顺序（不可用时空列表）"""
+    try:
+        data = json.loads(_index_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    if not isinstance(data, dict) or not isinstance(data.get("memes"), list):
+        return []
+    order = []
+    for m in data["memes"]:
+        if isinstance(m, dict) and isinstance(m.get("filename"), str):
+            order.append(m["filename"])
+    return order
+
+
 def _load_unlocked() -> Dict:
     """加载索引文件，不存在时返回空结构"""
     path = _index_path()

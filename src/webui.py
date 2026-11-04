@@ -95,9 +95,10 @@ from .config import (
     resolve_path,
     set_guide_ok,
 )
-from .database import _UNSET, MemeDB, get_db
+from .database import _UNSET, MemeDB, _name_sort_key, get_db, pinyin_matches
 from .manifest import add_memes as add_memes_to_manifest
 from .manifest import build as build_manifest
+from .manifest import index_order, index_path
 from .manifest import remove_memes as remove_memes_from_manifest
 from .manifest import request_background_rebuild as request_manifest_rebuild
 from .manifest import update_meme_name as update_manifest_meme_name
@@ -129,6 +130,10 @@ def _normalize_bulk_read_settings(settings: dict) -> dict:
 
 # 分页：主窗口单页展示的表情包数量（与前端 index.js MEME_PAGE 保持一致）
 MEME_PAGE = 200
+
+# 窗口坐标合法范围：最小化时系统返回 -32000 之类哨兵值，超出即视为无效坐标
+_WINDOW_COORD_MIN = -10000
+_WINDOW_COORD_MAX = 20000
 
 # 贡献者 SVG 缓存：TTL 1 小时，避免每次打开设置页都请求外网；刷新失败退避
 # 重试，避免上游不可用时每个请求都反复触发 10s 慢抓取
@@ -458,6 +463,30 @@ _cloud_state = {
 }
 _cloud_inflight = set()
 _cloud_inflight_lock = threading.Lock()
+
+# 主窗口排序模式：manifest=清单序（默认）/manifest_desc 反向/name_asc|name_desc 显示名
+_SORT_MODES = ("manifest", "manifest_desc", "name_asc", "name_desc")
+
+# 本地清单顺序缓存（按文件 mtime+size 失效），避免每次排序查询都重解析 JSON
+_local_manifest_cache = {"key": None, "order": []}
+_local_manifest_lock = threading.Lock()
+
+
+def _local_manifest_order():
+    """本地清单 memes 文件名顺序（不可用时空列表）"""
+    try:
+        st = index_path().stat()
+    except OSError:
+        return []
+    key = (st.st_mtime_ns, st.st_size)
+    with _local_manifest_lock:
+        if _local_manifest_cache["key"] == key:
+            return _local_manifest_cache["order"]
+    order = index_order()
+    with _local_manifest_lock:
+        _local_manifest_cache["key"] = key
+        _local_manifest_cache["order"] = order
+    return order
 
 
 def _cloud_ensure_loaded():
@@ -1157,7 +1186,9 @@ class JsApi:
                 hay = (
                     it["name"] + " " + it["filename"] + " " + " ".join(it["tags"])
                 ).lower()
-                if kw not in hay:
+                if kw not in hay and not pinyin_matches(
+                    kw, it["name"], it["filename"], *it["tags"]
+                ):
                     continue
             if path_prefix and not any(
                 cp == path_prefix or cp.startswith(path_prefix + "/")
@@ -1202,6 +1233,24 @@ class JsApi:
         rest = [c for c in cloud_out if c["filename"] not in pos]
         return extras + [r for _, r in paired] + rest
 
+    def _sort_rows(self, rows, order, mode):
+        """按 manifest/名称模式排序行（本地+云混合）；order 为空时保持原查询序"""
+        if mode in ("manifest", "manifest_desc"):
+            if not order:
+                return rows
+            pos = {fname: i for i, fname in enumerate(order)}
+            extras = [r for r in rows if r["filename"] not in pos]
+            paired = [(pos[r["filename"]], r) for r in rows if r["filename"] in pos]
+            paired.sort(key=lambda t: t[0], reverse=(mode == "manifest_desc"))
+            if mode == "manifest_desc":
+                return [r for _, r in paired] + extras
+            return extras + [r for _, r in paired]
+        return sorted(
+            rows,
+            key=lambda r: _name_sort_key(r.get("name") or r["filename"]),
+            reverse=(mode == "name_desc"),
+        )
+
     def _cloud_row(self, it) -> dict:
         """云条目 → 前端行（无 id，cloud 标记，file_hash 为 sha256）"""
         fname = it["filename"].lower()
@@ -1232,17 +1281,27 @@ class JsApi:
         limit=200,
         category_id=None,
         genre=None,
+        sort_mode="",
     ):
         """搜索表情，支持 offset/limit 分页"""
+        if isinstance(category_id, str):
+            sort_mode, category_id = category_id, None
+        mode = sort_mode if sort_mode in _SORT_MODES else ""
+        if collection_id == -5 or (collection_id == -3 and mode == "manifest"):
+            mode = ""
         cloud = self._cloud_filtered(keyword, tags, collection_id, category_id, genre)
         order = self._cloud_order(collection_id) if cloud else None
+        if mode in ("manifest", "manifest_desc") and not order:
+            if collection_id is None or collection_id in (-2, -4):
+                order = _local_manifest_order() or None
         merging = bool(cloud) and order is not None
+        fetch_all = merging or bool(mode)
         rows = self._search_meme_rows(
             keyword,
             tags,
             collection_id,
-            0 if merging else offset,
-            -1 if merging else limit,
+            0 if fetch_all else offset,
+            -1 if fetch_all else limit,
             category_id,
             genre,
         )
@@ -1291,6 +1350,12 @@ class JsApi:
                     "recently_used": row["id"] in recent_ids,
                 }
             )
+        if mode:
+            combined = result + [self._cloud_row(item) for item in cloud]
+            if mode == "manifest_desc" and not order:
+                order = [item["filename"] for item in combined]
+            combined = self._sort_rows(combined, order, mode)
+            return combined[offset:] if limit < 0 else combined[offset : offset + limit]
         if merging:
             # 清单序穿插合并后统一切片（本地全量已取回）
             merged = self._merge_manifest_order(result, cloud, order)
@@ -1490,6 +1555,7 @@ class JsApi:
         category_id=None,
         genre="all",
         refresh_random=False,
+        sort_mode="",
     ) -> dict:
         """统一分页搜索图片、GIF 和聊天记录。"""
         # 把取消旧预热与查询合并到同一次 pywebview 调用中。若由前端先发
@@ -1563,6 +1629,7 @@ class JsApi:
                     remaining,
                     category_id,
                     meme_genre,
+                    sort_mode,
                 )
         return {
             "memes": memes,
@@ -1616,6 +1683,7 @@ class JsApi:
         total=0,
         category_id=None,
         genre="all",
+        sort_mode="",
     ) -> dict:
         """后台补建当前查询后续页的日常副本和缩略图。"""
         self._ensure_page_cache_state()
@@ -1646,6 +1714,7 @@ class JsApi:
             total,
             category_id,
             list(genre) if isinstance(genre, (list, tuple)) else genre,
+            sort_mode,
         )
         worker = threading.Thread(
             target=self._run_page_cache_warmup,
@@ -1669,6 +1738,7 @@ class JsApi:
         total,
         category_id,
         genre,
+        sort_mode="",
     ):
         """串行预热；新搜索会递增 generation，让旧任务尽快退出。"""
         try:
@@ -1712,7 +1782,13 @@ class JsApi:
             while meme_offset < meme_total:
                 if not self._page_cache_is_current(generation):
                     return
-                rows = self._search_meme_rows(
+                search_rows = (
+                    self.search_memes
+                    if sort_mode in _SORT_MODES
+                    else self._search_meme_rows
+                )
+                options = {"sort_mode": sort_mode} if sort_mode in _SORT_MODES else {}
+                rows = search_rows(
                     keyword,
                     tags,
                     collection_id,
@@ -1720,12 +1796,15 @@ class JsApi:
                     page_size,
                     category_id,
                     meme_genre,
+                    **options,
                 )
                 if not rows:
                     break
                 for row in rows:
                     if not self._page_cache_is_current(generation):
                         return
+                    if row.get("cloud"):
+                        continue
                     try:
                         self._webui._get_thumbnail_path(
                             int(row["id"]),
@@ -1969,6 +2048,39 @@ class JsApi:
         except Exception as exc:
             logger.exception("delete chat record failed")
             return {"ok": False, "error": str(exc)}
+
+    def locate_meme(self, meme_id, page_size=MEME_PAGE):
+        """定位表情在默认「全部」列表中的序号与页码（与 search_memes 默认视图同序）
+
+        云清单合并顺序必须与 search_memes 的默认分支保持一致：改那里的
+        `_cloud_filtered`/`_cloud_order`/`_merge_manifest_order` 时同步改这里。
+        """
+        try:
+            mid = int(meme_id)
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "无效的表情 id"}
+        if mid <= 0:
+            return {"ok": False, "error": "无效的表情 id"}
+        try:
+            size = int(page_size)
+        except (TypeError, ValueError):
+            size = MEME_PAGE
+        size = size if size > 0 else MEME_PAGE
+        mode = self._cfg.get("sort_mode", "")
+        mode = mode if mode in _SORT_MODES else ""
+        rows = self.search_memes("", None, None, 0, -1, sort_mode=mode)
+        for idx, r in enumerate(rows):
+            if r.get("id") == mid:
+                return {
+                    "ok": True,
+                    "id": mid,
+                    "index": idx,
+                    "page": idx // size + 1,
+                    "index_in_page": idx % size,
+                    "total": len(rows),
+                    "page_size": size,
+                }
+        return {"ok": False, "id": mid, "error": "表情不在默认列表中"}
 
     def get_tags(self) -> list:
         """标签列表（云端直接使用开启时并入云端独有标签）"""
@@ -2347,12 +2459,14 @@ class JsApi:
 
     def get_init_data(self) -> dict:
         """批返回初始化所需数据，减少 JS bridge 往返"""
-        memes = self.search_memes("", None, None, 0, MEME_PAGE)
+        sort_mode = self._cfg.get("sort_mode", "manifest")
+        memes = self.search_memes("", None, None, 0, MEME_PAGE, sort_mode=sort_mode)
         collections = self.get_collections()
         categories = self.get_categories()
         fields = get_plugin_manager().init_fields()
         return {
             "theme": self._cfg.get("theme", "dark"),
+            "sort_mode": sort_mode,
             "memes": memes,
             "tags": self.get_tags(),
             "tag_records": self.get_tag_records(),
@@ -3682,13 +3796,31 @@ class JsApi:
 
     # 非阻塞检查更新：新鲜缓存即返，首次/过期/force 触发后台检查返回 pending
     def check_update(self, debug=False, force=False) -> dict:
-        from . import __version__ as cur_ver
-
-        info = updater.check_latest_cached(force=bool(debug) or bool(force))
-        info["current"] = cur_ver
+        info = updater.update_info(force=bool(debug) or bool(force))
         if debug or self._webui._update_debug:
             info["has_update"] = True
         return info
+
+    def open_url(self, url: str) -> bool:
+        """用系统默认浏览器打开外链（更新跳商店/关于页），仅允许 http(s)"""
+        from urllib.parse import urlparse
+
+        if urlparse(url or "").scheme not in ("http", "https"):
+            return False
+        try:
+            if platform.system() == "Windows":
+                os.startfile(url)
+            elif platform.system() == "Darwin":
+                import subprocess
+
+                subprocess.Popen(["open", url])
+            else:
+                import subprocess
+
+                subprocess.Popen(["xdg-open", url])
+            return True
+        except Exception:
+            return False
 
     def start_download(self, url: str) -> bool:
         return updater.start_download(url)
@@ -3697,9 +3829,20 @@ class JsApi:
         return updater.get_download_progress()
 
     def run_downloaded_installer(self) -> bool:
+        path = updater.last_downloaded_path()
         ok = updater.run_downloaded_installer()
         if ok:
-            self._webui._schedule_quit()
+            self._webui._schedule_quit(path)
+        return ok
+
+    def rerun_installer(self) -> bool:
+        """重新运行已下载的安装包（启动失败后不必重新下载）"""
+        path = updater.last_downloaded_path()
+        if not path:
+            return False
+        ok = updater.run_installer(path)
+        if ok:
+            self._webui._schedule_quit(path)
         return ok
 
     def download_update(self, url: str) -> dict:
@@ -4418,6 +4561,14 @@ class JsApi:
     def cancel_notion_import(self):
         """取消 Notion 导入。"""
         notion_import.cancel_notion_import()
+
+    def save_sort_mode(self, mode) -> dict:
+        """保存主窗口排序模式（_SORT_MODES 之一）"""
+        if mode not in _SORT_MODES:
+            return {"ok": False, "error": "invalid sort mode"}
+        self._cfg.set("sort_mode", mode)
+        self._cfg.save()
+        return {"ok": True}
 
     def save_settings(self, settings: dict):
         if isinstance(settings, dict):
@@ -5197,6 +5348,42 @@ class SettingsApi:
         from . import lan
 
         return lan.get_lan_ip()
+
+    def lan_qr(self) -> dict:
+        """生成连接二维码（IP + 端口 + 密钥，仅局域网服务运行时）"""
+        import base64
+        import json
+
+        import qrcode
+
+        from . import lan
+
+        st = lan.get_status()
+        if st.get("status") != "running":
+            return {"ok": False, "error": "局域网服务未运行"}
+        ip = lan.get_lan_ip()
+        if not ip:
+            return {"ok": False, "error": "未获取到局域网 IP"}
+        # 用握手实际使用的密钥（设置页可能用未保存的输入值启动服务）
+        secret = lan.runtime_secret()
+        if secret is None:
+            secret = self._cfg.get("lan_secret", "")
+        payload = json.dumps(
+            {
+                "v": 1,
+                "app": "ohmymeme",
+                "ip": ip,
+                "port": st.get("port"),
+                "secret": secret,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        img = qrcode.make(payload, box_size=8, border=2)
+        buf = io.BytesIO()
+        img.save(buf, "PNG")
+        b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+        return {"ok": True, "qr": "data:image/png;base64," + b64}
 
     def lan_set_allow_secret_config(self, enabled: bool) -> dict:
         from . import lan
@@ -6252,10 +6439,7 @@ class SettingsApi:
 
     # 非阻塞检查更新：新鲜缓存即返，首次/过期/force 触发后台检查返回 pending
     def check_update(self, debug=False, force=False) -> dict:
-        from . import __version__ as cur_ver
-
-        info = updater.check_latest_cached(force=bool(debug) or bool(force))
-        info["current"] = cur_ver
+        info = updater.update_info(force=bool(debug) or bool(force))
         if debug or self._webui._update_debug:
             info["has_update"] = True
         return info
@@ -6267,9 +6451,20 @@ class SettingsApi:
         return updater.get_download_progress()
 
     def run_downloaded_installer(self) -> bool:
+        path = updater.last_downloaded_path()
         ok = updater.run_downloaded_installer()
         if ok:
-            self._webui._schedule_quit()
+            self._webui._schedule_quit(path)
+        return ok
+
+    def rerun_installer(self) -> bool:
+        """重新运行已下载的安装包（启动失败后不必重新下载）"""
+        path = updater.last_downloaded_path()
+        if not path:
+            return False
+        ok = updater.run_installer(path)
+        if ok:
+            self._webui._schedule_quit(path)
         return ok
 
     def download_update(self, url: str) -> dict:
@@ -7103,6 +7298,7 @@ class WebUI:
         self._pending_hide = False
         self._hotkey_session = False
         self._last_toggle_ms = 0
+        self._last_tray_toggle_ms = 0
         self._window_state_lock = threading.Lock()
         self._library_refresh_lock = threading.Lock()
         self._library_refresh_timer = None
@@ -7243,22 +7439,107 @@ class WebUI:
         with self._window_state_lock:
             self._visible = True
             self._hotkey_session = False
+            self._pending_hide = False
             self._show_on_gui()
+            win = self._window
+        self._focus_search_async(win)
 
     def _show_on_gui(self):
         """必须在 _window_state_lock 内调用（状态与窗口操作原子化）"""
+        win = self._window
+        if win is None:
+            return
+        # 先撤销最小化：Show/Activate 不重置 WindowState，Win+D/显示桌面/任务栏
+        # 最小化后只 show 会让窗口"以最小化状态显示"，屏幕上永远看不到内容
         try:
-            self._window.on_top = True  # 置顶一下提升 z-order，随即复位不长期置顶
-            self._window.on_top = False
-            if callable(self._window.show):
-                self._window.show()
-            if callable(self._window.focus):
-                self._window.focus()
-            self._window.evaluate_js(
-                "focusSearch();window.refreshRecent&&window.refreshRecent()"
-            )
-        except Exception:
-            pass
+            shown = getattr(getattr(win, "events", None), "shown", None)
+            if hasattr(win, "restore") and (shown is None or shown.is_set()):
+                win.restore()
+        except Exception as e:
+            logger.debug("restore window: %s", e)
+        # 置顶一下提升 z-order，随即复位不长期置顶；失败绝不能阻断后续 show
+        try:
+            win.on_top = True
+            win.on_top = False
+        except Exception as e:
+            logger.debug("raise window z-order: %s", e)
+        try:
+            if callable(getattr(win, "show", None)):
+                win.show()
+        except Exception as e:
+            logger.warning("show window error: %s", e)
+        try:
+            if callable(getattr(win, "focus", None)):
+                win.focus()
+        except Exception as e:
+            logger.debug("focus window: %s", e)
+        self._ensure_window_on_screen(win)
+
+    # 窗口至少要有这么大的可见区域才算「在屏内」，否则移回主屏（1px 交集不算可见）
+    _MIN_VISIBLE_W = 200
+    _MIN_VISIBLE_H = 120
+    _MIN_VISIBLE_RATIO = 0.3
+
+    def _ensure_window_on_screen(self, win=None):
+        """窗口可见区域过小时移回主屏（换显示器/RDP/DPI 后常见）"""
+        win = win or self._window
+        if win is None:
+            return
+        try:
+            events = getattr(win, "events", None)
+            shown = getattr(events, "shown", None)
+            if shown is not None and not shown.is_set():
+                return
+            screens = getattr(webview, "screens", None) if HAS_WEBVIEW else None
+            screens = screens() if callable(screens) else screens
+            if not screens:
+                return
+            x, y = int(win.x), int(win.y)
+            width, height = int(win.width), int(win.height)
+        except Exception as e:
+            logger.debug("window geometry read: %s", e)
+            return
+        if width <= 0 or height <= 0:
+            return
+        need_w = min(self._MIN_VISIBLE_W, width * self._MIN_VISIBLE_RATIO)
+        need_h = min(self._MIN_VISIBLE_H, height * self._MIN_VISIBLE_RATIO)
+        for screen in screens:
+            sx, sy = int(screen.x), int(screen.y)
+            sw, sh = int(screen.width), int(screen.height)
+            visible_w = min(x + width, sx + sw) - max(x, sx)
+            visible_h = min(y + height, sy + sh) - max(y, sy)
+            if visible_w >= need_w and visible_h >= need_h:
+                return
+        primary = screens[0]
+        tx = int(primary.x) + max(0, (int(primary.width) - width) // 2)
+        ty = int(primary.y) + max(0, (int(primary.height) - height) // 2)
+        try:
+            win.move(tx, ty)
+            logger.warning("window off-screen (%s,%s), moved to (%s,%s)", x, y, tx, ty)
+        except Exception as e:
+            logger.warning("move off-screen window failed: %s", e)
+
+    def _focus_search_async(self, win=None):
+        """搜索框聚焦放独立线程：JS 求值挂起时不占用窗口状态锁与托盘/热键线程"""
+        win = win or self._window
+        if win is None:
+            return
+
+        def _run():
+            try:
+                win.evaluate_js(
+                    "focusSearch();window.refreshRecent&&window.refreshRecent()"
+                )
+            except Exception:
+                pass
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _on_window_minimized(self):
+        """系统最小化（Win+D/显示桌面）后同步可见状态，使托盘/热键一次即可还原"""
+        with self._window_state_lock:
+            self._visible = False
+            self._hotkey_session = False
 
     def hide(self):
         """隐藏主窗口（线程安全：持锁完成状态更新 + 原生窗口操作）"""
@@ -7267,6 +7548,7 @@ class WebUI:
         with self._window_state_lock:
             self._visible = False
             self._hotkey_session = False
+            self._pending_hide = False
             self._hide_on_gui()
 
     def _hide_on_gui(self):
@@ -7302,9 +7584,18 @@ class WebUI:
         else:
             self.show()
 
+    _TRAY_DEBOUNCE_S = 0.4
+
     def toggle_safe(self):
-        if self._window:
-            self.toggle()
+        """托盘切换：去抖避免左键双击先显示后立刻隐藏"""
+        if not self._window:
+            return
+        now = time.monotonic()
+        with self._window_state_lock:
+            if now - self._last_tray_toggle_ms < self._TRAY_DEBOUNCE_S:
+                return
+            self._last_tray_toggle_ms = now
+        self.toggle()
 
     _HOTKEY_DEBOUNCE_S = 0.25
 
@@ -7334,6 +7625,9 @@ class WebUI:
             self._show_on_gui()
             # 在锁内设置 _hotkey_session，避免 show 与 schedule_hide 之间的竞争窗口
             self._hotkey_session = True
+            win = self._window
+        # 聚焦搜索框放到锁外：evaluate_js 可能阻塞，不能占着窗口状态锁
+        self._focus_search_async(win)
 
     def schedule_hide(self):
         if self._cfg.get("disable_auto_hide", False):
@@ -7362,10 +7656,13 @@ class WebUI:
         t.daemon = True
         t.start()
 
-    def _schedule_quit(self):
-        """更新安装程序启动后，短暂等待并强制结束当前进程（确保 exe 不被占用）"""
+    def _schedule_quit(self, watch_path: str = ""):
+        """等安装程序进程确认已启动后再结束当前进程（未启动则保留运行以便重试）"""
 
         def _force_kill():
+            if watch_path and not updater.wait_installer_started(watch_path):
+                logger.warning("installer not started, keep running: %s", watch_path)
+                return
             time.sleep(1.5)
             if os.name == "nt":
                 try:
@@ -8728,8 +9025,7 @@ class WebUI:
         time.sleep(0.3)
 
         url = f"http://127.0.0.1:{self._port}/"
-        wx = self._cfg.get("window_x", -1)
-        wy = self._cfg.get("window_y", -1)
+        wx, wy = self._saved_window_position()
         width, height = self._resolve_window_size()
         self._window = webview.create_window(
             "OhMyMeme",
@@ -8737,8 +9033,8 @@ class WebUI:
             js_api=self._api,
             width=width,
             height=height,
-            x=wx if (wx is not None and wx >= 0) else None,
-            y=wy if (wy is not None and wy >= 0) else None,
+            x=wx,
+            y=wy,
             resizable=True,
             frameless=True,
             easy_drag=False,
@@ -8757,6 +9053,12 @@ class WebUI:
                 self._window
             )
         self._visible = not self._silent_start
+        try:
+            # 首次显示后校正屏幕外坐标；被系统最小化时同步可见状态
+            self._window.events.shown += lambda: self._ensure_window_on_screen()
+            self._window.events.minimized += self._on_window_minimized
+        except Exception as e:
+            logger.debug("bind window events: %s", e)
 
         self._started = True
         # 注册 LAN 设备确认回调（窗口创建完成后）
@@ -8853,13 +9155,8 @@ class WebUI:
             except Exception as e:
                 logger.warning(f"destroy settings error: {e}")
             self._settings_window = None
-        # 关闭设置页时自动停止局域网服务
-        try:
-            from . import lan
-
-            lan.stop()
-        except Exception:
-            pass
+        # 关闭设置页不停止局域网服务：手机发现/传输通常在设置页关闭后进行，
+        # 停服由开关关闭、恢复默认或程序退出负责（main.shutdown 兜底 lan.stop）
 
     def _resolve_window_size(self):
         """主窗口尺寸：插件 window 覆盖 > 持久化尺寸 > 默认 960x640"""
@@ -8883,15 +9180,41 @@ class WebUI:
             height = _norm(self._cfg.get("window_height", 0), 640, 360, 6000)
         return width, height
 
+    def _saved_window_position(self):
+        """读取持久化窗口坐标；哨兵值交给系统摆放，负坐标合法（副屏在主屏左侧/上方）"""
+        try:
+            wx = int(self._cfg.get("window_x", -1))
+            wy = int(self._cfg.get("window_y", -1))
+        except (TypeError, ValueError):
+            return None, None
+        # 最小化时系统返回 -32000 之类哨兵坐标，写盘后下次启动会在屏幕外
+        if not (_WINDOW_COORD_MIN < wx <= _WINDOW_COORD_MAX):
+            return None, None
+        if not (_WINDOW_COORD_MIN < wy <= _WINDOW_COORD_MAX):
+            return None, None
+        return wx, wy
+
     def _save_window_position(self):
         if not self._window:
             return
         try:
-            self._cfg.set("window_x", self._window.x)
-            self._cfg.set("window_y", self._window.y)
+            # 尺寸与坐标分开判断：最小化态下坐标是哨兵值，但尺寸仍应保存
             if self._window.width and self._window.height:
                 self._cfg.set("window_width", int(self._window.width))
                 self._cfg.set("window_height", int(self._window.height))
+            wx = self._window.x
+            wy = self._window.y
+            # 最小化/隐藏态下拿到的哨兵坐标不写盘，否则下次启动窗口不可见
+            if (
+                wx is not None
+                and wy is not None
+                and _WINDOW_COORD_MIN < wx <= _WINDOW_COORD_MAX
+                and _WINDOW_COORD_MIN < wy <= _WINDOW_COORD_MAX
+            ):
+                self._cfg.set("window_x", wx)
+                self._cfg.set("window_y", wy)
+                # 标记坐标确实写过：否则下次加载无法区分 -1 是旧哨兵还是副屏上的合法坐标
+                self._cfg.set("window_pos_set", True)
             self._cfg.save()
         except Exception:
             pass

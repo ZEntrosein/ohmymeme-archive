@@ -176,6 +176,56 @@ def test_import_bytes_respects_optional_resolution_limit(lan_env, monkeypatch):
     assert db.get_by_hash(hashlib.sha256(data).hexdigest())["width"] == 3000
 
 
+def test_record_device_dedup_by_ip(lan_env):
+    """互联设备列表：按 IP 去重、更新名称/系统与最近配对时间，持久化可重读"""
+    cfg, db, tmp = lan_env
+    lan.record_device(
+        "192.168.1.20",
+        {"name": "Pixel 8", "model": "Pixel 8", "os": "Android 15", "ver": "0.6.0"},
+    )
+    lan.record_device(
+        "192.168.1.20",
+        {
+            "name": "Pixel 8 Pro",
+            "model": "Pixel 8 Pro",
+            "os": "Android 15",
+            "ver": "0.6.1",
+        },
+    )
+    devices = lan.load_devices()
+    assert len(devices) == 1
+    assert devices[0]["ip"] == "192.168.1.20"
+    assert devices[0]["name"] == "Pixel 8 Pro"
+    assert devices[0]["ver"] == "0.6.1"
+    assert devices[0]["last_seen"] > 0
+    # 文件落在隔离后的 data_dir，下次启动仍可读到
+    assert (tmp / "data" / "lan_devices.json").is_file()
+
+
+def test_devices_snapshot_marks_online(lan_env):
+    """设备列表按当前连接标记在线；get_status 一并下发"""
+    cfg, db, tmp = lan_env
+    lan.record_device("10.0.0.5", {"name": "Phone", "os": "Android 14", "ver": "0.6.0"})
+    lan.record_device(
+        "10.0.0.6", {"name": "Tablet", "os": "Android 14", "ver": "0.6.0"}
+    )
+    with lan._lan_lock:
+        lan._lan_state["clients"] = [{"addr": "10.0.0.5:41000", "connected_at": 1}]
+    devices = {d["ip"]: d for d in lan.get_status()["devices"]}
+    assert devices["10.0.0.5"]["online"] is True
+    assert devices["10.0.0.6"]["online"] is False
+    # 清理，避免影响后续“已连接设备”断言
+    with lan._lan_lock:
+        lan._lan_state["clients"] = []
+
+
+def test_record_device_ignores_empty_ip(lan_env):
+    """缺少对端地址时不写入列表"""
+    cfg, db, tmp = lan_env
+    lan.record_device("", {"name": "Ghost"})
+    assert lan.load_devices() == []
+
+
 def test_udp_discovery(lan_env):
     cfg, db, tmp = lan_env
     udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -825,7 +875,11 @@ def test_transfer_completes_when_all_files_done(lan_env):
     _send_frame(
         sock,
         key,
-        {"cmd": "push_file", "filename": "c.png", "data": base64.b64encode(png).decode()},
+        {
+            "cmd": "push_file",
+            "filename": "c.png",
+            "data": base64.b64encode(png).decode(),
+        },
     )
     pushed = _recv_frame(sock, key)
     assert pushed["ok"] is True
@@ -859,7 +913,11 @@ def test_transfer_without_meta_degrades(lan_env):
     _send_frame(
         sock,
         key,
-        {"cmd": "push_file", "filename": "d.png", "data": base64.b64encode(png).decode()},
+        {
+            "cmd": "push_file",
+            "filename": "d.png",
+            "data": base64.b64encode(png).decode(),
+        },
     )
     pushed = _recv_frame(sock, key)
     assert pushed["ok"] is True
@@ -960,3 +1018,87 @@ def test_get_status_exposes_pending_confirm(lan_env):
         sock.close()
     finally:
         lan.set_confirm_callback(old)
+
+
+class _ManifestDb:
+    """push_manifest 的最小 DB 桩：记录成员增删、改名与排序"""
+
+    def __init__(self):
+        self.ids = {"a.png": 11, "b.png": 12}
+        self.names = {"a.png": "旧名A", "b.png": "b"}
+        self.members = {5: {11, 12}, 6: set()}
+        self.added = []
+        self.removed = []
+        self.renamed = []
+        self.reordered = []
+        self.next_cid = 5
+
+    def get_by_filename(self, filename):
+        mid = self.ids.get(filename)
+        if not mid:
+            return None
+        return {"id": mid, "original_name": self.names.get(filename, "")}
+
+    def create_collection(self, name, parent_id=None):
+        cid = self.next_cid
+        self.next_cid += 1
+        self.members.setdefault(cid, set())
+        return cid
+
+    def add_to_collection(self, meme_id, collection_id):
+        self.members.setdefault(collection_id, set()).add(meme_id)
+        self.added.append((meme_id, collection_id))
+
+    def remove_from_collection(self, meme_id, collection_id):
+        self.members.setdefault(collection_id, set()).discard(meme_id)
+        self.removed.append((meme_id, collection_id))
+
+    def search(self, collection_id=None, limit=0, **kwargs):
+        names = {v: k for k, v in self.ids.items()}
+        return [
+            {"id": mid, "filename": names[mid]}
+            for mid in sorted(self.members.get(collection_id, set()))
+        ]
+
+    def reorder_memes(self, meme_ids):
+        self.reordered = list(meme_ids)
+
+    def set_original_name(self, meme_id, name):
+        self.renamed.append((meme_id, name))
+
+    def count(self):
+        return len(self.ids)
+
+
+def test_push_manifest_applies_names_and_moves(monkeypatch):
+    """手机推清单：改名生效、移出分组的成员按远端差集移除、重建本地清单"""
+    import src.sync as sync_module
+
+    db = _ManifestDb()
+    built = []
+    monkeypatch.setattr(lan, "get_db", lambda: db)
+    monkeypatch.setattr(lan, "build_manifest", lambda: built.append(1))
+    monkeypatch.setattr(sync_module, "get_db", lambda: db)
+
+    manifest = {
+        "version": 3,
+        "memes": [
+            {"filename": "a.png", "name": "新名A"},
+            {"filename": "b.png", "name": "b"},
+        ],
+        "collections": [
+            {
+                "name": "G",
+                "filenames": ["a.png"],
+                "children": [{"name": "子", "filenames": []}],
+            }
+        ],
+    }
+
+    result = lan.LanServer()._cmd_push_manifest(manifest)
+
+    assert result == {"ok": True, "local_count": 2}
+    assert db.added == [(11, 5)]
+    assert db.removed == [(12, 5)]
+    assert db.renamed == [(11, "新名A")]
+    assert built == [1]

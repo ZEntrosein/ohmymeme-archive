@@ -79,6 +79,7 @@ python -m pytest tests/ -v
 - 网格拖拽槽位回归探针：`tests/fixtures/grid_slot_probe.cjs`（Node 脚本）
 - 热键测试夹具下通过 `PYTEST_CURRENT_TEST` 环境变量禁用真实文件日志，避免污染 `hotkey.log`
 - 微信 keyfinder 的 C++ 测试在 CI 独立 job 运行（`cmake -DWKF_BUILD_TESTS=ON` + ctest，Windows only）
+- 上游 dev 合并的组合回归位于 `test_cloud_direct.py` 与 `test_startup.py`：验证排序与分类标签/隐藏/体裁/聊天分页共存、排序偏好串行保存、后续页预热顺序，以及清单重建锁被占用时列表仍可刷新。新增二维码依赖 `qrcode` 已在 `requirements.txt` 中声明（Conda 环境复用该依赖表）。
 
 ## 前端
 
@@ -153,6 +154,7 @@ python scripts/build.py --linux --installer-only --package deb  # Linux 包类�
 ```
 
 - **PyInstaller 不支持交叉编译**，各平台需在对应系统上构建；跨平台构建用 GitHub Actions
+- **构建来源标记**：打包前重写 `src/__init__.py` 的 `__build_source__`（源码运行恒为 `dev`；CI 构建 `github`、nightly 工作流 `nightly`、MSIX 稳定版 `msstore`，nightly MSIX 保持 `nightly`），构建结束恢复 `dev`；`msstore` 构建的更新入口指向 Microsoft Store（见 AGENTS.md「更新」）
 - Windows 安装包需 [InnoSetup 6/7](https://jrsoftware.org/isdl.php)
 - Windows 追加格式（`--msix`，在 `.exe` 之外追加，工具缺失时仅告警跳过）：
   - `--msix`：Windows SDK 的 `makeappx.exe` 生成 `dist/OhMyMeme-<版本>.msix`（Microsoft Store 上架 / 侧载）。模板 `scripts/installer/msix/AppxManifest.xml`，产物不签名（Store 会重签）

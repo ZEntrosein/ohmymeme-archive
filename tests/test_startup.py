@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from pathlib import Path
 from unittest import mock
 
@@ -21,6 +22,13 @@ from src.tray import _create_default_icon
 
 _SETTINGS_BODY = Path(__file__).resolve().parent.parent / "src" / "vue-src" / "settings" / "settings-body.html"
 _SETTINGS_LEGACY = Path(__file__).resolve().parent.parent / "src" / "vue-src" / "settings" / "legacy.js"
+
+
+def _wait_calls(target, count, timeout=2.0):
+    """等待后台窗口切换线程写入期望调用次数（托盘/热键回调改为异步执行）"""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline and len(target.calls) < count:
+        time.sleep(0.01)
 
 
 class _FakeConfig:
@@ -937,11 +945,16 @@ def test_app_routes_hotkey_and_tray_to_separate_zero_argument_methods():
 
     app = OhMyMemeApp.__new__(OhMyMemeApp)
     app._webui = FakeWebUI()
+    app._toggle_busy = False
+    app._toggle_started_at = 0.0
+    app._toggle_lock = threading.Lock()
 
     app._on_hotkey()
+    _wait_calls(app._webui, 1)
     assert app._webui.calls == ["hotkey"]
 
     app._on_tray_show()
+    _wait_calls(app._webui, 2)
 
     assert app._webui.calls == ["hotkey", "tray"]
     assert len(inspect.signature(app._on_hotkey).parameters) == 0
@@ -1146,8 +1159,6 @@ def test_qq_drag_cleanup_setting_saved_without_running_cleanup(tmp_path, monkeyp
     assert api.save_settings({"qq_drag_cleanup_on_start": False}) == {"ok": True, "theme": "dark"}
     assert Config(tmp_path / "config.json").get("qq_drag_cleanup_on_start") is False
     cleanup.assert_not_called()
-
-
 
 
 def test_manifest_include_collections_settings_contract():
@@ -2166,6 +2177,97 @@ const settle = () => new Promise(resolve => setImmediate(resolve));
     assert.deepEqual([...state.activeGenres], selected);
     assert.deepEqual(persisted, selected);
   }
+})().catch(error => { console.error(error); process.exitCode = 1; });
+"""
+    result = subprocess.run(
+        [node, "-e", script],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_sort_mode_restores_and_reaches_library_and_warmup_without_resetting_genres():
+    import shutil
+
+    import pytest
+
+    root = Path(__file__).resolve().parent.parent
+    node = shutil.which("node")
+    if not node or not (root / "node_modules" / "esbuild").is_dir():
+        pytest.skip("排序状态回归测试需要 Node 和前端依赖")
+    script = r"""
+const assert = require('node:assert/strict');
+const path = require('node:path');
+const Module = require('node:module');
+const esbuild = require('esbuild');
+const filename = path.resolve('src/vue-src/composables/useMemes.ts');
+const compiled = esbuild.buildSync({ entryPoints: [filename], bundle: true,
+  platform: 'node', format: 'cjs', external: ['vue'], write: false }).outputFiles[0].text;
+let savedSort = 'name_desc', releaseFirst;
+const searches = [], warmups = [], writes = [], genreWrites = [];
+global.document = new (require('jsdom').JSDOM)('<!doctype html><html></html>').window.document;
+global.pywebview = { api: {
+  get_init_data: async () => ({ sort_mode: savedSort, library_genres: ['gif'],
+    memes: [], categories: [], collections: [], tags: [] }),
+  search_library: async (...args) => {
+    searches.push(args); return { memes: [], chat_records: [], chat_total: 0, total: 500 };
+  },
+  start_page_cache_warmup: async (...args) => { warmups.push(args); return {}; },
+  set_library_genres: async value => { genreWrites.push(value); return { ok: true }; },
+  save_sort_mode: async mode => {
+    writes.push(mode);
+    if (writes.length === 1) await new Promise(resolve => { releaseFirst = resolve; });
+    savedSort = mode;
+    return { ok: true };
+  },
+} };
+global.window = { pywebview: global.pywebview };
+function session() {
+  const instance = new Module(filename, module);
+  instance.filename = filename;
+  instance.paths = Module._nodeModulePaths(path.dirname(filename));
+  instance._compile(compiled, filename);
+  return instance.exports.useMemes();
+}
+const settle = () => new Promise(resolve => setImmediate(resolve));
+(async () => {
+  const use = session();
+  await use.loadInitData();
+  assert.equal(use.state.sortMode, 'name_desc');
+  assert.equal(searches.at(-1)[8], 'name_desc');
+  assert.equal(warmups.at(-1)[8], 'name_desc');
+  assert.deepEqual(searches.at(-1)[6], ['gif']);
+  use.state.activeCategory = -12;
+  use.state.activeCollection = 42;
+  use.state.searchQuery = 'kept';
+  const first = use.setSortMode('name_asc');
+  const last = use.setSortMode('manifest_desc');
+  await settle();
+  assert.deepEqual(writes, ['name_asc']);
+  releaseFirst();
+  await Promise.all([first, last]);
+  assert.deepEqual(writes, ['name_asc', 'manifest_desc']);
+  assert.equal(savedSort, 'manifest_desc');
+  assert.equal(searches.at(-1)[8], 'manifest_desc');
+  assert.equal(warmups.at(-1)[8], 'manifest_desc');
+  assert.deepEqual([...use.state.activeGenres], ['gif']);
+  assert.equal(use.state.activeCategory, -12);
+  assert.equal(use.state.activeCollection, 42);
+  assert.equal(use.state.searchQuery, 'kept');
+  assert.equal(genreWrites.length, 0);
+  await use.setSortMode('invalid');
+  assert.equal(writes.length, 2);
+  const reopened = session();
+  await reopened.loadInitData();
+  assert.equal(reopened.state.sortMode, 'manifest_desc');
+  assert.deepEqual([...reopened.state.activeGenres], ['gif']);
+  assert.equal(reopened.canReorder(), false);
+  await reopened.setSortMode('manifest');
+  assert.equal(reopened.canReorder(), true);
 })().catch(error => { console.error(error); process.exitCode = 1; });
 """
     result = subprocess.run(

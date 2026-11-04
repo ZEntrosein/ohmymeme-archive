@@ -393,6 +393,9 @@ def _reset_cloud_state():
             )
         with webui_module._cloud_inflight_lock:
             webui_module._cloud_inflight.clear()
+        with webui_module._local_manifest_lock:
+            webui_module._local_manifest_cache["key"] = None
+            webui_module._local_manifest_cache["order"] = []
         webui_module._sync_status_reset()
 
     _reset()
@@ -553,6 +556,107 @@ def test_search_memes_recent_excludes_cloud(js):
     )
     assert js.api.search_memes("", None, -3, 0, 10) == []
     assert js.api.count_memes(collection_id=-3) == 0
+
+
+# ─── 排序模式（sort_mode） ───
+
+
+def _write_local_manifest(js, filenames):
+    import src.manifest as manifest_module
+
+    manifest_module.index_path().write_text(
+        json.dumps({"version": 3, "memes": [{"filename": f} for f in filenames]}),
+        encoding="utf-8",
+    )
+
+
+def test_sort_mode_display_name_asc_desc(js):
+    js.db.add_meme(filename="a.png", file_hash=SHA_A, original_name="cat")
+    js.db.add_meme(filename="b.png", file_hash=SHA_B, original_name="dog")
+    js.db.add_meme(filename="c.png", file_hash=SHA_C, original_name="apple")
+    api = js.api
+    assert _names(api.search_memes("", None, None, 0, 10, "name_asc")) == [
+        "c.png",
+        "a.png",
+        "b.png",
+    ]
+    assert _names(api.search_memes("", None, None, 0, 10, "name_desc")) == [
+        "b.png",
+        "a.png",
+        "c.png",
+    ]
+    assert _names(api.search_memes("", None, None, 1, 2, "name_asc")) == [
+        "a.png",
+        "b.png",
+    ]
+    # 无效模式回退默认查询序（全量返回）
+    rows = api.search_memes("", None, None, 0, 10, "bogus")
+    assert set(_names(rows)) == {"a.png", "b.png", "c.png"}
+
+
+def test_sort_mode_manifest_local_fallback(js):
+    js.db.add_meme(filename="a.png", file_hash=SHA_A)
+    js.db.add_meme(filename="b.png", file_hash=SHA_B)
+    _write_local_manifest(js, ["b.png", "a.png"])
+    api = js.api
+    assert _names(api.search_memes("", None, None, 0, 10, "manifest")) == [
+        "b.png",
+        "a.png",
+    ]
+    assert _names(api.search_memes("", None, None, 0, 10, "manifest_desc")) == [
+        "a.png",
+        "b.png",
+    ]
+
+
+def test_sort_mode_manifest_extras(js):
+    js.db.add_meme(filename="a.png", file_hash=SHA_A)
+    js.db.add_meme(filename="b.png", file_hash=SHA_B)
+    js.db.add_meme(filename="new.png", file_hash=SHA_D)
+    _write_local_manifest(js, ["b.png", "a.png"])
+    api = js.api
+    # 不在清单的本地行：正序排最前、反向排最后
+    assert _names(api.search_memes("", None, None, 0, 10, "manifest")) == [
+        "new.png",
+        "b.png",
+        "a.png",
+    ]
+    assert _names(api.search_memes("", None, None, 0, 10, "manifest_desc")) == [
+        "a.png",
+        "b.png",
+        "new.png",
+    ]
+
+
+def test_sort_mode_with_cloud(js):
+    js.db.add_meme(filename="a.png", file_hash=SHA_A, original_name="apple")
+    _set_cloud(
+        js,
+        {"memes": [{"filename": "c.png", "name": "cat", "sha256": SHA_C}]},
+    )
+    api = js.api
+    rows = api.search_memes("", None, None, 0, 10, "name_asc")
+    assert _names(rows) == ["a.png", "c.png"]
+    assert rows[1]["cloud"] is True
+    assert "id" not in rows[1]
+    # manifest 序：本地 a.png 不在清单排最前；云清单序为 c.png
+    assert _names(api.search_memes("", None, None, 0, 10, "manifest")) == [
+        "a.png",
+        "c.png",
+    ]
+    assert _names(api.search_memes("", None, None, 0, 10, "manifest_desc")) == [
+        "c.png",
+        "a.png",
+    ]
+
+
+def test_save_sort_mode(js):
+    assert js.api.save_sort_mode("name_asc") == {"ok": True}
+    assert js.api._cfg.get("sort_mode") == "name_asc"
+    assert js.api.save_sort_mode("bogus") == {
+        "ok": False,
+        "error": "invalid sort mode",
+    }
 
 
 def test_cloud_filters(js):
@@ -1535,3 +1639,290 @@ def test_sync_status_worker_discards_stale_generation(js, monkeypatch):
     with webui_module._sync_status_lock:
         assert webui_module._sync_status_state["manifest"] is None
         assert webui_module._sync_status_state["checked"] is False
+
+
+def test_locate_meme_returns_page_and_index(js):
+    """定位到默认「全部」列表：返回 1 基页码与页内序号，非法 id 返回失败"""
+    ids = []
+    for name in ("a.png", "b.png", "c.png"):
+        js.db.add_meme(
+            filename=name, file_hash=hashlib.sha256(name.encode()).hexdigest()
+        )
+        ids.append(js.db.get_by_filename(name)["id"])
+
+    first = js.api.locate_meme(ids[0], 2)
+    assert first["ok"] is True
+    assert first["index"] == 0 and first["page"] == 1 and first["index_in_page"] == 0
+    assert first["total"] == 3 and first["page_size"] == 2
+
+    third = js.api.locate_meme(ids[2], 2)
+    assert third["page"] == 2 and third["index_in_page"] == 0
+
+    assert js.api.locate_meme(0)["ok"] is False
+    assert js.api.locate_meme(99999)["ok"] is False
+
+
+def test_locate_meme_follows_cloud_manifest_order(js):
+    """云清单可用时按清单序合并后定位，云条目（无 id）不参与命中"""
+    for name in ("a.png", "b.png"):
+        js.db.add_meme(
+            filename=name, file_hash=hashlib.sha256(name.encode()).hexdigest()
+        )
+    a_id = js.db.get_by_filename("a.png")["id"]
+    b_id = js.db.get_by_filename("b.png")["id"]
+    _set_cloud(
+        js,
+        {
+            "memes": [
+                {"filename": "b.png", "name": "b", "sha256": "b" * 64},
+                {"filename": "a.png", "name": "a", "sha256": "a" * 64},
+                {"filename": "c.png", "name": "云端c", "sha256": "c" * 64},
+            ]
+        },
+    )
+
+    assert js.api.locate_meme(b_id)["index"] == 0
+    assert js.api.locate_meme(a_id)["index"] == 1
+    assert js.api.locate_meme(a_id)["total"] == 3
+
+
+def _add_local(js, *names):
+    """建本地行（文件名 + sha），返回 {filename: id}"""
+    out = {}
+    for name in names:
+        js.db.add_meme(
+            filename=name, file_hash=hashlib.sha256(name.encode()).hexdigest()
+        )
+        out[name] = js.db.get_by_filename(name)["id"]
+    return out
+
+
+def test_sort_mode_name_asc_desc(js):
+    """名称排序 A-Z / Z-A 对本地行生效，且排序发生在分页切片之前"""
+    _add_local(js, "b.png", "a.png", "c.png")
+
+    asc = [
+        r["filename"] for r in js.api.search_memes("", None, None, 0, 10, "name_asc")
+    ]
+    assert asc == ["a.png", "b.png", "c.png"]
+
+    desc = [
+        r["filename"] for r in js.api.search_memes("", None, None, 0, 10, "name_desc")
+    ]
+    assert desc == ["c.png", "b.png", "a.png"]
+
+    page = [
+        r["filename"] for r in js.api.search_memes("", None, None, 1, 1, "name_asc")
+    ]
+    assert page == ["b.png"]
+
+
+def test_sort_mode_manifest_falls_back_to_local_index(js):
+    """无云清单时 manifest 模式回退本地 meme-index.json 顺序，新增本地行排最前"""
+    from src.manifest import index_path
+
+    _add_local(js, "a.png", "b.png", "c.png")
+    local_index = {
+        "version": 3,
+        "memes": [{"filename": "c.png"}, {"filename": "a.png"}],
+        "collections": [],
+        "favorite": [],
+    }
+    index_path().write_text(json.dumps(local_index), encoding="utf-8")
+
+    asc = [
+        r["filename"] for r in js.api.search_memes("", None, None, 0, 10, "manifest")
+    ]
+    assert asc == ["b.png", "c.png", "a.png"]
+
+    desc = [
+        r["filename"]
+        for r in js.api.search_memes("", None, None, 0, 10, "manifest_desc")
+    ]
+    assert desc == ["a.png", "c.png", "b.png"]
+
+
+def test_sort_mode_locate_meme_same_order(js):
+    """排序模式下 locate_meme 与 search_memes 用同一序计算页码"""
+    ids = _add_local(js, "b.png", "a.png")
+    js.cfg.set("sort_mode", "name_asc")
+
+    assert js.api.locate_meme(ids["a.png"])["index"] == 0
+    assert js.api.locate_meme(ids["b.png"])["index"] == 1
+
+
+def test_sort_mode_invalid_falls_back_to_default(js):
+    """非法 sort_mode 视为未指定，退回默认查询序（不报错）"""
+    _add_local(js, "b.png", "a.png")
+    rows = js.api.search_memes("", None, None, 0, 10, "bogus")
+    assert len(rows) == 2
+
+
+def test_cloud_rows_match_pinyin_keyword(js):
+    """云端行也支持拼音检索：全拼与首字母都能命中中文显示名"""
+    _set_cloud(
+        js,
+        {
+            "memes": [
+                {"filename": "x.png", "name": "表情包", "sha256": "a" * 64},
+            ]
+        },
+    )
+
+    for keyword in ("biaoqingbao", "bqb"):
+        rows = js.api.search_memes(keyword, None, None, 0, 10)
+        assert [r["filename"] for r in rows] == ["x.png"]
+    assert js.api.count_memes(keyword="bqb") == 1
+
+
+def test_sorted_library_preserves_custom_filters_and_chat_pagination(js, monkeypatch):
+    parent = js.db.create_category("父级")
+    child = js.db.create_category("子级", parent_id=parent)
+    group = js.db.create_collection("分组")
+    tags = [{"category": "状态", "name": "灰头土脸"}]
+    for filename, name, category in (
+        ("z.png", "表情10", parent),
+        ("a.gif", "表情2", parent),
+        ("nested.png", "表情1", child),
+        ("hidden.png", "表情0", parent),
+    ):
+        mid = js.db.add_meme(
+            filename,
+            file_hash=hashlib.sha256(filename.encode()).hexdigest(),
+            original_name=name,
+            category_id=category,
+            tags=tags,
+        )
+        js.db.add_to_collection(mid, group)
+    hidden = js.db.get_by_filename("hidden.png")["id"]
+    js.db.add_to_collection(hidden, js.db.ensure_hidden_collection())
+    chat = js.db.save_chat_record(
+        {"title": "记录", "source": {"self_id": 1, "message_id": 10}, "summary": {}}
+    )["id"]
+    js.db.update_chat_record_details(
+        chat, tags, category_id=parent, collection_ids=[group]
+    )
+    _set_cloud(
+        js,
+        {
+            "memes": [
+                {
+                    "filename": "cloud.webp",
+                    "name": "表情3",
+                    "sha256": SHA_D,
+                    "category_path": ["父级"],
+                    "tags": ["灰头土脸"],
+                    "tag_records": tags,
+                }
+            ],
+            "collections": [{"name": "分组", "filenames": ["cloud.webp"]}],
+        },
+    )
+    monkeypatch.setattr(
+        js.api,
+        "_find_meme_file",
+        lambda *_: pytest.fail("metadata sorting must not access original media"),
+    )
+    query = dict(
+        tags=tags,
+        collection_id=group,
+        category_id=-parent - 4,
+        genre=["image", "gif", "chat_record"],
+        sort_mode="name_asc",
+    )
+    first = js.api.search_library(limit=2, **query)
+    assert first["total"] == 4
+    assert [item["id"] for item in first["chat_records"]] == [chat]
+    assert _names(first["memes"]) == ["a.gif"]
+    assert _names(js.api.search_library(offset=2, limit=2, **query)["memes"]) == [
+        "cloud.webp",
+        "z.png",
+    ]
+    for genres, expected in ((["image"], 2), (["gif"], 1), ([], 0)):
+        result = js.api.search_library(**{**query, "genre": genres})
+        assert result["total"] == expected
+        assert result["chat_records"] == []
+    assert js.api.count_memes(keyword="huitoutulian", tags=tags) == 4
+    assert js.api.locate_meme(hidden)["ok"] is False
+
+
+def test_sorted_warmup_matches_filtered_mixed_pages(js, monkeypatch):
+    from src import webui as webui_module
+
+    parent = js.db.create_category("父级")
+    child = js.db.create_category("子级", parent_id=parent)
+    for filename, category in (
+        ("z.png", parent),
+        ("c.png", parent),
+        ("a.png", parent),
+        ("nested.png", child),
+    ):
+        js.db.add_meme(
+            filename,
+            file_hash=hashlib.sha256(filename.encode()).hexdigest(),
+            original_name=filename,
+            category_id=category,
+        )
+    chat = js.db.save_chat_record(
+        {"title": "记录", "source": {"self_id": 1, "message_id": 20}, "summary": {}}
+    )["id"]
+    js.db.set_chat_category(chat, parent)
+    _set_cloud(
+        js,
+        {
+            "memes": [
+                {
+                    "filename": "b.png",
+                    "name": "b.png",
+                    "sha256": SHA_D,
+                    "category_path": ["父级"],
+                }
+            ]
+        },
+    )
+    warmed = []
+    monkeypatch.setattr(webui_module.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(js.api, "_page_cache_is_current", lambda generation: True)
+    js.api._webui._get_thumbnail_path = lambda mid, filename, **kwargs: warmed.append(
+        (filename, kwargs["read_priority"])
+    )
+    js.api._run_page_cache_warmup(
+        1,
+        "",
+        [],
+        None,
+        2,
+        1,
+        5,
+        -parent - 4,
+        ["image", "gif", "chat_record"],
+        "name_asc",
+    )
+    assert warmed == [("c.png", "background"), ("z.png", "background")]
+
+
+def test_manifest_sort_does_not_wait_for_background_rebuild(js):
+    import threading
+    from src import manifest
+
+    _add_local(js, "a.png", "b.png")
+    _write_local_manifest(js, ["b.png", "a.png"])
+    completed = threading.Event()
+    result = {}
+
+    def search():
+        try:
+            result.update(js.api.search_library(genre=["image"], sort_mode="manifest"))
+        finally:
+            js.db.close()
+            completed.set()
+
+    with manifest._MANIFEST_LOCK:
+        worker = threading.Thread(target=search, daemon=True)
+        worker.start()
+        finished_without_unlock = completed.wait(1)
+    worker.join(timeout=2)
+    assert (
+        finished_without_unlock
+    ), "list refresh must not wait for the manifest rebuild"
+    assert _names(result["memes"]) == ["b.png", "a.png"]
