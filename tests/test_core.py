@@ -8097,8 +8097,12 @@ class TestHotkeyWatchdog(unittest.TestCase):
 
     @mock.patch.dict("sys.modules", {"keyboard": None}, clear=False)
     def test_unregister_stops_watchdog(self):
+        import gc
+
         from src.hotkey import GlobalHotkey
 
+        # 在 keyboard 被屏蔽时回收上例实例，避免析构调用混入本例计数。
+        gc.collect()
         fake_mod = self._fake_keyboard_module()
         fake_mod.add_calls = 0
 

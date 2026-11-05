@@ -78,6 +78,7 @@ python -m pytest tests/ -v
 - `test_core.py` 等为 unittest 风格，`test_startup.py` 为全生命周期集成测试（mock WebUI）
 - 网格拖拽槽位回归探针：`tests/fixtures/grid_slot_probe.cjs`（Node 脚本）
 - 热键测试夹具下通过 `PYTEST_CURRENT_TEST` 环境变量禁用真实文件日志，避免污染 `hotkey.log`
+- 注销热键的调用次数测试在屏蔽 `keyboard` 时回收前例实例，避免延迟析构混入当前用例的 mock 计数。
 - 微信 keyfinder 的 C++ 测试在 CI 独立 job 运行（`cmake -DWKF_BUILD_TESTS=ON` + ctest，Windows only）
 - 上游 dev 合并的组合回归位于 `test_cloud_direct.py` 与 `test_startup.py`：验证排序与分类标签/隐藏/体裁/聊天分页共存、排序偏好串行保存、后续页预热顺序，以及清单重建锁被占用时列表仍可刷新。新增二维码依赖 `qrcode` 已在 `requirements.txt` 中声明（Conda 环境复用该依赖表）。
 
