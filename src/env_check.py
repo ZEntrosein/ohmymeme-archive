@@ -20,6 +20,7 @@ try:
 except ImportError:
     winreg = None
 
+from . import __app_name__
 from .config import _get_config_dir
 
 logger = logging.getLogger(__name__)
@@ -283,7 +284,7 @@ def _run_tk(checks) -> None:
         raise RuntimeError("tkinter 不可用")
     failed = any(not c["ok"] for c in checks)
     root = tkinter.Tk()
-    root.title("OhMyMeme 环境检测")
+    root.title(f"{__app_name__} 环境检测")
     root.resizable(False, False)
 
     body = tkinter.Frame(root, padx=18, pady=14)
@@ -351,14 +352,14 @@ def _run_messagebox(checks) -> None:
     """tkinter 不可用时的 ctypes MessageBox 兜底（确定同样写标记）"""
     import ctypes
 
-    lines = ["OhMyMeme 环境检测", ""]
+    lines = [f"{__app_name__} 环境检测", ""]
     for c in checks:
         status = "通过" if c["ok"] else "未通过"
         lines.append(f"[{status}] {c['name']}：{c['detail']}")
     lines.append("")
     lines.append("点「确定」继续启动并记住本次检测；点「取消」本次不记住。")
     ret = ctypes.windll.user32.MessageBoxW(
-        None, "\n".join(lines), "OhMyMeme 环境检测", 0x01
+        None, "\n".join(lines), f"{__app_name__} 环境检测", 0x01
     )
     if ret == 1:
         mark_done(checks)

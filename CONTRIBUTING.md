@@ -1,4 +1,4 @@
-# 贡献指南
+# OhMyMeme Archive 贡献指南
 
 面向开发者的环境搭建、代码规范、测试与构建说明。用户文档见 [README.md](README.md)，AI 编码助手的完整项目上下文见 [AGENTS.md](AGENTS.md)。
 
@@ -7,8 +7,8 @@
 **要求**: Python 3.10+（推荐 3.12）、Node.js（构建 Vue 前端）；Linux 额外需要 GTK/WebKit 依赖（见下）。
 
 ```bash
-git clone https://github.com/ZEntrosein/ohmymeme-notion.git
-cd ohmymeme-notion
+git clone https://github.com/ZEntrosein/ohmymeme-archive.git
+cd ohmymeme-archive
 pip install -r requirements.txt
 npm install
 python -m src
@@ -154,11 +154,11 @@ python scripts/build.py --linux --installer-only --package deb  # Linux 包类�
 ```
 
 - **PyInstaller 不支持交叉编译**，各平台需在对应系统上构建；跨平台构建用 GitHub Actions
-- **构建来源标记**：打包前重写 `src/__init__.py` 的 `__build_source__`（源码运行恒为 `dev`；CI 稳定版含 MSIX 为 `github`，nightly 工作流为 `nightly`），构建结束恢复 `dev`。所有格式的更新检查均指向 `ZEntrosein/ohmymeme-notion`，仅接收稳定版。
+- **构建来源标记**：打包前重写 `src/__init__.py` 的 `__build_source__`（源码运行恒为 `dev`；CI 稳定版含 MSIX 为 `github`，nightly 工作流为 `nightly`），构建结束恢复 `dev`。所有格式的更新检查均指向 `ZEntrosein/ohmymeme-archive`，仅接收稳定版。
 - Windows 安装包需 [InnoSetup 6/7](https://jrsoftware.org/isdl.php)
 - Windows 追加格式（`--msix`，在 `.exe` 之外追加，工具缺失时仅告警跳过）：
   - `--msix`：Windows SDK 的 `makeappx.exe` 生成 `dist/OhMyMeme-<版本>.msix`（Microsoft Store 上架 / 侧载）。模板 `scripts/installer/msix/AppxManifest.xml`，产物不签名（Store 会重签）
-  - MSIX 模板使用本 fork 的独立侧载身份（`ZEntrosein.OhMyMemeNotion` / `CN=ZEntrosein` / `ZEntrosein`），不复用上游 Store 身份。如需上架或签名，须使用自己的 Partner Center 产品信息及证书；可用环境变量覆盖：`OHMYMEME_MSIX_IDENTITY_NAME`/`OHMYMEME_MSIX_PUBLISHER`/`OHMYMEME_MSIX_PUBLISHER_DISPLAY_NAME`
+  - MSIX 模板使用本 fork 的独立侧载身份（`ZEntrosein.OhMyMemeArchive` / `CN=ZEntrosein` / `ZEntrosein`），不复用上游 Store 身份。如需上架或签名，须使用自己的 Partner Center 产品信息及证书；可用环境变量覆盖：`OHMYMEME_MSIX_IDENTITY_NAME`/`OHMYMEME_MSIX_PUBLISHER`/`OHMYMEME_MSIX_PUBLISHER_DISPLAY_NAME`
   - Microsoft Store 上架时的「隐私策略 URL」填写仓库内 [docs/privacy.md](docs/privacy.md) 的公开链接；该文件须与实际网络行为保持一致（新增联网功能时同步更新）
 - Linux 包支持 .deb / .rpm / .AppImage，构建机需装 GTK/WebKit 依赖（见 AGENTS.md「Linux 打包（GTK）」）
 - 输出目录: `dist/`
@@ -178,6 +178,8 @@ python scripts/build.py --linux --installer-only --package deb  # Linux 包类�
 本地 `upstream` 继续指向原项目，可照常 fetch / merge 上游 `dev`。后续合并若涉及 workflow、更新地址或 MSIX 身份，保留以上 fork 设置；不必改写上游历史。
 
 ## 数据与配置路径
+
+显示名称为 `OhMyMeme Archive`，仓库为 `ZEntrosein/ohmymeme-archive`；`config.py` / `platform_util.py` 中的 `APP_NAME`、可执行文件及构建产物名仍使用 `OhMyMeme`，保持现有数据目录、单实例、自启动与更新安装兼容。本地已有克隆目录不要求移动，避免破坏虚拟环境中的绝对路径。
 
 | 用途 | Windows | macOS | Linux |
 |------|---------|-------|-------|

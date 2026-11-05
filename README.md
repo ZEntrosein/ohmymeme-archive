@@ -1,12 +1,12 @@
-# OhMyMeme Notion
+# OhMyMeme Archive
 
-轻量化跨平台表情包管理系统 — 突破表情包上限，快捷键呼出、搜索即复制。
+表情包与聊天记录的结构化归档管理 — 层级类别、分组、分类标签与可编辑元数据，支持虚拟盘图库。
 
 ### **QQ交流群：891636253**
 
-本仓库是 [OhMyMeme/OhMyMeme](https://github.com/OhMyMeme/OhMyMeme) 的定制 fork，包含 Notion 导入、聊天记录归档与虚拟盘支持。文中 QQ 群与演示来自上游项目。
+本仓库是 [OhMyMeme/OhMyMeme](https://github.com/OhMyMeme/OhMyMeme) 的定制 fork，开发重点是更丰富的结构化元数据、表情包与聊天记录的统一归档，以及虚拟盘环境下的访问与缓存。文中 QQ 群与演示来自上游项目。
 
-[**从本定制版 Release 下载**](https://github.com/ZEntrosein/ohmymeme-notion/releases)
+[**从本定制版 Release 下载**](https://github.com/ZEntrosein/ohmymeme-archive/releases)
 
 ![picture](https://raw.githubusercontent.com/OhMyMeme/OhMyMeme/refs/heads/dev/resource/picture.gif)
 
@@ -88,7 +88,7 @@
 
 ### 下载
 
-从 [本定制版 Releases](https://github.com/ZEntrosein/ohmymeme-notion/releases) 下载对应系统的安装包或可执行文件，直接运行。正式版由维护者手动发布；Nightly 是默认分支的每日测试构建。
+从 [本定制版 Releases](https://github.com/ZEntrosein/ohmymeme-archive/releases) 下载对应系统的安装包或可执行文件，直接运行。正式版由维护者手动发布；Nightly 是默认分支的每日测试构建。
 
 Windows 提供 `.exe` 安装包及使用独立身份的未签名 `.msix` 侧载包；本定制版尚未上架 Microsoft Store，通常使用 `.exe`。
 
@@ -99,11 +99,13 @@ Windows 提供 `.exe` 安装包及使用独立身份的未签名 `.msix` 侧载�
 **环境要求**: Python 3.10+
 
 ```bash
-git clone https://github.com/ZEntrosein/ohmymeme-notion.git
-cd ohmymeme-notion
+git clone https://github.com/ZEntrosein/ohmymeme-archive.git
+cd ohmymeme-archive
 pip install -r requirements.txt
 python -m src
 ```
+
+更名前的本地克隆目录可继续使用。应用沿用 `OhMyMeme` 的配置和数据库目录，已有图库、设置及启动方式继续有效。
 
 - 主窗口与设置页前端均为 Vue 3，源码运行时若构建产物缺失会自动执行一次 `npx vite build`
 - Linux 额外需要 GTK/WebKit 依赖（`python3-gi` + `gir1.2-webkit2-*`），详见 [CONTRIBUTING.md](CONTRIBUTING.md)

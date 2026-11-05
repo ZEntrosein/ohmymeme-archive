@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- OhMyMeme Notion MSIX manifest (sideload) -->
+<!-- OhMyMeme Archive MSIX manifest (sideload) -->
 <!--
   定制版使用独立侧载身份，不复用上游 Microsoft Store 产品身份。
   如需上架，Identity 字段须替换为自己的 Partner Center 产品标识：
@@ -18,12 +18,12 @@
   IgnorableNamespaces="uap rescap">
 
   <Identity
-    Name="ZEntrosein.OhMyMemeNotion"
+    Name="ZEntrosein.OhMyMemeArchive"
     Publisher="CN=ZEntrosein"
     Version="0.0.0.0" />
 
   <Properties>
-    <DisplayName>OhMyMeme</DisplayName>
+    <DisplayName>OhMyMeme Archive</DisplayName>
     <PublisherDisplayName>ZEntrosein</PublisherDisplayName>
     <Logo>Assets\StoreLogo.png</Logo>
     <Description>轻量化跨平台表情包管理系统</Description>
@@ -41,7 +41,7 @@
   <Applications>
     <Application Id="OhMyMeme" Executable="OhMyMeme.exe" EntryPoint="windows.fullTrustApplication">
       <uap:VisualElements
-        DisplayName="OhMyMeme"
+        DisplayName="OhMyMeme Archive"
         Description="轻量化跨平台表情包管理系统"
         BackgroundColor="transparent"
         Square150x150Logo="Assets\Square150x150Logo.png"

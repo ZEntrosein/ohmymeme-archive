@@ -1364,7 +1364,7 @@ def test_about_links_static_contract():
     settings_js = _SETTINGS_LEGACY.read_text(encoding="utf-8")
     assert "openAboutUrl('github')" in settings_html
     assert "openAboutUrl('qq')" in settings_html
-    assert "https://github.com/TNTXZ/OhMyMeme" in settings_js
+    assert "https://github.com/ZEntrosein/ohmymeme-archive" in settings_js
     assert "qm.qq.com/cgi-bin/qm/qr" in settings_js
     assert "api('open_url'" in settings_js
 
@@ -1388,9 +1388,11 @@ def test_open_url_dispatches_to_default_browser(monkeypatch):
     calls = []
     monkeypatch.setattr(webui_module.platform, "system", lambda: "Windows")
     monkeypatch.setattr(os, "startfile", lambda u: calls.append(u), raising=False)
-    ok = webui_module.SettingsApi.open_url(None, "https://github.com/TNTXZ/OhMyMeme")
+    ok = webui_module.SettingsApi.open_url(
+        None, "https://github.com/ZEntrosein/ohmymeme-archive"
+    )
     assert ok is True
-    assert calls == ["https://github.com/TNTXZ/OhMyMeme"]
+    assert calls == ["https://github.com/ZEntrosein/ohmymeme-archive"]
 
 
 def test_wechat_dialog_user_agreement_warning():

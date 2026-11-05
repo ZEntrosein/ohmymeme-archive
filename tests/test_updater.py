@@ -279,7 +279,7 @@ class TestForkUpdates(unittest.TestCase):
     # 最新版接口失败时仍只从定制仓库回退，跳过 nightly 和预发布
     def test_fallback_stays_in_fork_and_selects_stable_release(self):
         stable_url = (
-            "https://github.com/ZEntrosein/ohmymeme-notion/"
+            "https://github.com/ZEntrosein/ohmymeme-archive/"
             "releases/download/9.0.0/OhMyMeme-9.0.0-setup.exe"
         )
         assets = [
@@ -299,10 +299,10 @@ class TestForkUpdates(unittest.TestCase):
             fetch.call_args_list,
             [
                 mock.call(
-                    "https://api.github.com/repos/ZEntrosein/ohmymeme-notion/releases/latest"
+                    "https://api.github.com/repos/ZEntrosein/ohmymeme-archive/releases/latest"
                 ),
                 mock.call(
-                    "https://api.github.com/repos/ZEntrosein/ohmymeme-notion/releases?per_page=5"
+                    "https://api.github.com/repos/ZEntrosein/ohmymeme-archive/releases?per_page=5"
                 ),
             ],
         )

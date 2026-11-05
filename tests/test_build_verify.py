@@ -350,7 +350,7 @@ def test_msix_uses_fork_identity_and_channel(
         }
         identity = root.find("p:Identity", namespace)
         assert identity.attrib == {
-            "Name": "ZEntrosein.OhMyMemeNotion",
+            "Name": "ZEntrosein.OhMyMemeArchive",
             "Publisher": "CN=ZEntrosein",
             "Version": "0.7.0.0",
         }

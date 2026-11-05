@@ -1,10 +1,10 @@
 ; OhMyMeme Windows Installer (Inno Setup)
 ; 编译: iscc windows.iss
 
-#define MyAppName "OhMyMeme"
+#define MyAppName "OhMyMeme Archive"
 #define MyAppVersion "0.1.0"
 #define MyAppPublisher "OhMyMeme"
-#define MyAppURL "https://github.com/ZEntrosein/ohmymeme-notion"
+#define MyAppURL "https://github.com/ZEntrosein/ohmymeme-archive"
 #define MyAppExeName "OhMyMeme.exe"
 #define SourceDir "..\..\dist\src.dist"
 
@@ -15,7 +15,7 @@ AppVersion={#MyAppVersion}
 AppVerName={#MyAppName} {#MyAppVersion}
 AppPublisher={#MyAppPublisher}
 AppPublisherURL={#MyAppURL}
-DefaultDirName={autopf}\{#MyAppName}
+DefaultDirName={autopf}\OhMyMeme
 DefaultGroupName={#MyAppName}
 AllowNoIcons=yes
 OutputDir=..\..\dist
@@ -42,11 +42,11 @@ Name: "autostart"; Description: "开机自动启动"; GroupDescription: "启动�
 Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Registry]
-Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "{#MyAppName}"; ValueData: """{app}\{#MyAppExeName}"" --silent"; Tasks: autostart; Flags: uninsdeletevalue
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "OhMyMeme"; ValueData: """{app}\{#MyAppExeName}"" --silent"; Tasks: autostart; Flags: uninsdeletevalue
 
 [InstallDelete]
 ; 升级时清理旧版启动文件夹快捷方式（v0.2.1 及之前使用文件夹方式）
-Name: "{userstartup}\{#MyAppName}.lnk"; Type: files
+Name: "{userstartup}\OhMyMeme.lnk"; Type: files
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"

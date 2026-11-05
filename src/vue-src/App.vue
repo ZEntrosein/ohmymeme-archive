@@ -2102,7 +2102,7 @@ onUnmounted(() => {
   <div id="app">
     <header id="titlebar" @mousedown="onTitlebarMouseDown">
       <div class="titlebar__left">
-        <div class="logo" title="返回主页" @click="goHome">OhMy<span>Meme</span></div>
+        <div class="logo" title="返回主页" @click="goHome">OhMy<span>Meme</span> Archive</div>
       </div>
       <span class="spacer"></span>
       <div class="titlebar__actions">

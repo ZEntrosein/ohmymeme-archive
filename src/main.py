@@ -302,7 +302,7 @@ class OhMyMemeApp:
             except Exception:
                 pass
         self._cfg.save()
-        logger.info("OhMyMeme 已退出")
+        logger.info("%s 已退出", __app_name__)
         # 强制退出，避免残留的非 daemon 线程阻止解释器正常退出
         os._exit(0)
 
@@ -310,7 +310,7 @@ class OhMyMemeApp:
 def main():
     import argparse
 
-    parser = argparse.ArgumentParser(description="OhMyMeme")
+    parser = argparse.ArgumentParser(description=__app_name__)
     parser.add_argument(
         "--debug-update",
         action="store_true",
@@ -370,13 +370,13 @@ def main():
         return
 
     if not acquire_single_instance():
-        logger.warning("检测到 OhMyMeme 已在运行，退出当前实例")
+        logger.warning("检测到 %s 已在运行，退出当前实例", __app_name__)
         if os.name == "nt":
             try:
                 import ctypes
 
                 ctypes.windll.user32.MessageBoxW(
-                    None, "OhMyMeme 已在运行", "OhMyMeme", 0x40
+                    None, f"{__app_name__} 已在运行", __app_name__, 0x40
                 )
             except Exception:
                 pass

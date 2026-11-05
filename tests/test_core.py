@@ -28,7 +28,7 @@ from src.database import MemeDB
 class TestVersion(unittest.TestCase):
     def test_version(self):
         self.assertIsNotNone(re.match(r"\d+\.\d+\.\d+", __version__))
-        self.assertEqual(__app_name__, "OhMyMeme")
+        self.assertEqual(__app_name__, "OhMyMeme Archive")
 
 
 class TestCrypto(unittest.TestCase):

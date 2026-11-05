@@ -3,6 +3,8 @@
 import logging
 import threading
 
+from . import __app_name__
+
 try:
     from PIL import Image as PILImage
     from PIL import ImageDraw
@@ -82,7 +84,9 @@ class TrayManager:
             menu_items = []
             if self._source_mode:
                 menu_items.append(
-                    pystray.MenuItem("OhMyMeme (dev)", lambda: None, enabled=False)
+                    pystray.MenuItem(
+                        f"{__app_name__} (dev)", lambda: None, enabled=False
+                    )
                 )
             menu_items += [
                 pystray.MenuItem(
@@ -93,7 +97,10 @@ class TrayManager:
             ]
             dev_tag = " (dev)" if self._source_mode else ""
             self._icon = pystray.Icon(
-                "OhMyMeme", icon_image, "OhMyMeme" + dev_tag, pystray.Menu(*menu_items)
+                "OhMyMeme",
+                icon_image,
+                __app_name__ + dev_tag,
+                pystray.Menu(*menu_items),
             )
             self._lang = lang
             return True

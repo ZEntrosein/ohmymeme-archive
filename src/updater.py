@@ -18,10 +18,10 @@ from . import __version__
 logger = logging.getLogger(__name__)
 
 _GITHUB_LATEST = (
-    "https://api.github.com/repos/ZEntrosein/ohmymeme-notion/releases/latest"
+    "https://api.github.com/repos/ZEntrosein/ohmymeme-archive/releases/latest"
 )
 _GITHUB_LIST = (
-    "https://api.github.com/repos/ZEntrosein/ohmymeme-notion/releases?per_page=5"
+    "https://api.github.com/repos/ZEntrosein/ohmymeme-archive/releases?per_page=5"
 )
 
 # GitHub 镜像（按顺序逐个尝试）

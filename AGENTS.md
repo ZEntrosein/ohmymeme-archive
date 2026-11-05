@@ -1,7 +1,9 @@
-# OhMyMeme — AI Agent Guide
+# OhMyMeme Archive — AI Agent Guide
 
 ## 项目概述
-轻量化跨平台表情包管理系统，突破表情包数量限制，支持全局快捷键呼出、搜索复制、FTP/S3/R2 同步、局域网互联。
+面向表情包与聊天记录的结构化归档管理，基于 OhMyMeme 扩展层级类别、分组、分类标签、人工/AI 元数据与虚拟盘缓存。
+
+显示名称由 `src.__app_name__` 定义为 `OhMyMeme Archive`，仓库为 `ZEntrosein/ohmymeme-archive`。保留 `config.py` / `platform_util.py` 的 `APP_NAME="OhMyMeme"`、安装 AppId、自启动注册表键和二进制/构建产物名，改名不得迁移真实用户数据或更换单实例锁。已有本地克隆目录不自动移动；Notion 既有功能标识与数据库来源表不作为项目品牌批量替换。
 
 ## 架构
 ```
@@ -285,7 +287,7 @@ tests/
 - 远端旧 manifest 缺 sha256 的条目跳过不显示（`cloud_missing` 计日志）；测试 `tests/test_cloud_direct.py`
 
 ### 更新
-- GitHub API 查询: 固定 `ZEntrosein/ohmymeme-notion` 的 `/releases/latest` → `/releases?per_page=5` 回退，合并上游时保留 fork 更新地址
+- GitHub API 查询: 固定 `ZEntrosein/ohmymeme-archive` 的 `/releases/latest` → `/releases?per_page=5` 回退，合并上游时保留 fork 更新地址
 - **仅检查稳定版**：`_parse_release` 跳过 prerelease 与含 `nightly` 的 tag（保证软件更新绝不指向非正式版）；`_parse_version` 跳过非数字段（如 `0.6.0-nightly`）
 - **非阻塞检查**：`check_latest_cached(force=False)` 是唯一入口——**`_ensure_check_started` 先查 `_check_running`（在跑则一律返回 `pending`，含 force 刷新未完成时，绝不命中旧 `_check_result`），再对非 force + 新鲜缓存（`_CHECK_TTL`=24h）直接返回**；无缓存/缓存过期/`force=True` 触发后台 daemon 线程跑 `check_latest()` 填 `_check_result`+`_check_result_at`（`_check_lock` 保护，幂等只启动一次），立即返回 `pending: true`（永不阻塞网络 3.8s~20s+）。**generation token**：`reset_check_cache()` 推进 `_check_generation`，后台 `_task` 完成时仅当代号匹配才写结果，防在途旧任务覆盖 reset 后新状态。`webui.py` 的 `JsApi.check_update`/`SettingsApi.check_update` 支持 `(debug, force)` 透传；前端 `App.vue` 的 `checkUpdateAndPrompt`（onMounted/24h 定时）首发 `force=true`、pending 时转 `checkUpdateResult` 非 force 轮询，settings legacy 的 `checkUpdate` 首发 force、while 轮询暂取非 force——避免完成后再次 force 触发新检查造成永久 pending。**这解决了启动期间 `check_update` 同步阻塞曾导致的界面交互卡顿，及缓存不失效时 24h 定时器形同虚设的问题**
 - 镜像并发: `_urlopen_mirror` / `_urlretrieve_mirror` 用 `ThreadPoolExecutor` + `as_completed`
@@ -621,7 +623,7 @@ python scripts/build.py --lang en  # 指定语言构建
 ### Windows MSIX 打包（Microsoft Store）
 - **触发**：`--msix`（三个 workflow 的 windows job 均以 `--installer-only --msix` 调用；nightly 额外带 `--nightly`）
 - **工具定位**（缺失仅告警跳过，不中断）：`find_makeappx()` = `MAKEAPPX_DIR`/`MAKEAPPX` → 扫描 `C:\Program Files (x86)\Windows Kits\10\bin\<ver>\x64\makeappx.exe` 取最高版本（runner 预装 Windows SDK）
-- **MSIX**（`build_msix`）：模板 `scripts/installer/msix/AppxManifest.xml` 使用本 fork 的独立侧载身份（`Name=ZEntrosein.OhMyMemeNotion` / `Publisher=CN=ZEntrosein` / `PublisherDisplayName=ZEntrosein`），稳定包来源为 `github`。`OHMYMEME_MSIX_IDENTITY_NAME`/`OHMYMEME_MSIX_PUBLISHER`/`OHMYMEME_MSIX_PUBLISHER_DISPLAY_NAME` 可覆盖身份，上架时须使用自己的 Store 产品标识和证书。`Version` 由 `_msix_four_part` 转四段式 `X.Y.Z.0`；`_msix_assets` 从图标生成资产，`dist/msix-staging` 汇总 onedir 与清单，调用 `makeappx pack` 后清理暂存目录。保持 full-trust、未签名侧载和 AppData/注册表虚拟化；MSIX 与 exe 的配置/data 目录不互通。回归测试在 `tests/test_build_verify.py` 检查交给 makeappx 的实际清单与更新渠道。
+- **MSIX**（`build_msix`）：模板 `scripts/installer/msix/AppxManifest.xml` 使用本 fork 的独立侧载身份（`Name=ZEntrosein.OhMyMemeArchive` / `Publisher=CN=ZEntrosein` / `PublisherDisplayName=ZEntrosein`），稳定包来源为 `github`。`OHMYMEME_MSIX_IDENTITY_NAME`/`OHMYMEME_MSIX_PUBLISHER`/`OHMYMEME_MSIX_PUBLISHER_DISPLAY_NAME` 可覆盖身份，上架时须使用自己的 Store 产品标识和证书。`Version` 由 `_msix_four_part` 转四段式 `X.Y.Z.0`；`_msix_assets` 从图标生成资产，`dist/msix-staging` 汇总 onedir 与清单，调用 `makeappx pack` 后清理暂存目录。保持 full-trust、未签名侧载和 AppData/注册表虚拟化；MSIX 与 exe 的配置/data 目录不互通。回归测试在 `tests/test_build_verify.py` 检查交给 makeappx 的实际清单与更新渠道。
 - 产物命名 `OhMyMeme-<filename_version>.msix`（nightly 即 `OhMyMeme-nightly.msix`）
 - **Store 上架配套**：Partner Center「隐私策略 URL」指向仓库内 `docs/privacy.md`（中英双语，逐条列出全部主动联网目标：GitHub 更新检查/镜像、用户自建 FTP/S3/R2/WebDAV、抖音 `douyin.com`、微信 CDN、`googledownloads.cn`、`contributor.starsfire.top`、`uapis.cn`）。**新增任何联网功能时须同步更新该文件**（Store 会核对声明与实际行为是否一致）
 

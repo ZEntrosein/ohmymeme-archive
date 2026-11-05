@@ -62,6 +62,7 @@ except ImportError:
     HAS_BOTTLE = False
 
 from . import (
+    __app_name__,
     adb_util,
     backup,
     notion_import,
@@ -8607,7 +8608,7 @@ class WebUI:
                 except OSError as e:
                     logger.warning(f"index.html 读取失败: {e}")
                     return bottle.HTTPError(500, "页面读取失败")
-            return "<h1>OhMyMeme</h1><p>index.html not found</p>"
+            return f"<h1>{__app_name__}</h1><p>index.html not found</p>"
 
         @app.route("/settings/")
         def settings_page():
@@ -9028,7 +9029,7 @@ class WebUI:
         wx, wy = self._saved_window_position()
         width, height = self._resolve_window_size()
         self._window = webview.create_window(
-            "OhMyMeme",
+            __app_name__,
             url,
             js_api=self._api,
             width=width,
@@ -9097,7 +9098,7 @@ class WebUI:
                 except Exception:
                     sx = sy = None
             self._settings_window = webview.create_window(
-                "设置 - OhMyMeme",
+                f"设置 - {__app_name__}",
                 settings_url,
                 js_api=self._settings_api,
                 width=sw,

@@ -1,8 +1,8 @@
-# OhMyMeme 隐私策略 / Privacy Policy
+# OhMyMeme Archive 隐私策略 / Privacy Policy
 
-最后更新 / Last updated：2026-10-18
+最后更新 / Last updated：2026-11-05
 
-本文件同时用作 Microsoft Store 上架所需的「隐私策略 URL」
+本文件为 OhMyMeme Archive 的隐私策略，随项目发行。
 
 ---
 
@@ -10,7 +10,7 @@
 
 ### 1. 概述
 
-OhMyMeme（下称「本应用」）是一款在您的本机运行的表情包管理与同步工具。开发者**不运营任何用于收集用户数据的服务器**，本应用不设账号体系，不接入统计、埋点或崩溃上报服务。本应用不收集、不上传您的个人信息。
+OhMyMeme Archive（下称「本应用」）是一款在您的本机运行的表情包与聊天记录归档工具。开发者**不运营任何用于收集用户数据的服务器**，本应用不设账号体系，不接入统计、埋点或崩溃上报服务。本应用不收集、不上传您的个人信息。
 
 ### 2. 收集的信息
 
@@ -64,7 +64,7 @@ OhMyMeme（下称「本应用」）是一款在您的本机运行的表情包管
 
 本策略如有更新将随版本在项目仓库中更新并注明日期。
 
-联系方式：[Issues · OhMyMeme/OhMyMeme](https://github.com/OhMyMeme/OhMyMeme/issues)
+联系方式：[Issues · ZEntrosein/ohmymeme-archive](https://github.com/ZEntrosein/ohmymeme-archive/issues)
 
 ---
 
@@ -72,7 +72,7 @@ OhMyMeme（下称「本应用」）是一款在您的本机运行的表情包管
 
 ### Overview
 
-OhMyMeme is a local-first sticker/meme manager that runs entirely on your device. The developer operates **no server that collects user data**; there is no account system, no analytics, no telemetry, and no crash reporting. All user data (config, database, images, thumbnails, index) is stored **only on your own device**; sensitive fields such as cloud-sync passwords are encrypted at rest (AES/Fernet).
+OhMyMeme Archive is a local-first meme and chat record archive manager that runs entirely on your device. The developer operates **no server that collects user data**; there is no account system, no analytics, no telemetry, and no crash reporting. All user data (config, database, images, thumbnails, index) is stored **only on your own device**; sensitive fields such as cloud-sync passwords are encrypted at rest (AES/Fernet).
 
 ### Network connections
 
@@ -92,4 +92,4 @@ This application is not directed to children under 13 and collects no personal i
 
 ### Contact
 
-[Issues · OhMyMeme/OhMyMeme](https://github.com/OhMyMeme/OhMyMeme/issues)
+[Issues · ZEntrosein/ohmymeme-archive](https://github.com/ZEntrosein/ohmymeme-archive/issues)

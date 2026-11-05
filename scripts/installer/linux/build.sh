@@ -62,7 +62,7 @@ build_appimage() {
     # .desktop 文件
     cat > "$appdir/usr/share/applications/com.ohmymeme.desktop" << 'DESKTOP'
 [Desktop Entry]
-Name=OhMyMeme
+Name=OhMyMeme Archive
 Comment=轻量化跨平台表情包管理系统
 Exec=OhMyMeme
 Icon=com.ohmymeme
@@ -112,7 +112,7 @@ build_deb() {
 
     cat > "$deb_root/usr/share/applications/com.ohmymeme.desktop" << 'DESKTOP'
 [Desktop Entry]
-Name=OhMyMeme
+Name=OhMyMeme Archive
 Comment=轻量化跨平台表情包管理系统
 Exec=ohmymeme
 Icon=com.ohmymeme
@@ -161,7 +161,7 @@ Version: 0.1.0
 Release: 1%{?dist}
 Summary: 轻量化跨平台表情包管理系统
 License: MIT
-URL: https://github.com/ZEntrosein/ohmymeme-notion
+URL: https://github.com/ZEntrosein/ohmymeme-archive
 Source0: ohmymeme-0.1.0.tar.gz
 
 %description
@@ -183,7 +183,7 @@ ln -sf %{_bindir}/OhMyMeme %{buildroot}/%{_bindir}/ohmymeme
 %post
 cat > /usr/share/applications/com.ohmymeme.desktop << EOF
 [Desktop Entry]
-Name=OhMyMeme
+Name=OhMyMeme Archive
 Comment=轻量化跨平台表情包管理系统
 Exec=ohmymeme
 Icon=com.ohmymeme
