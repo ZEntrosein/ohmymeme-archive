@@ -28,13 +28,13 @@ jobs:
           path: build/ffmpeg-win64/out
           key: ffmpeg-win64-${{ hashFiles('scripts/ffmpeg/build_win64.sh') }}
       - name: Install cross toolchain
-        if: steps.cache.outputs.cache_hit != 'true'
+        if: steps.cache.outputs.cache-hit != 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 nasm pkg-config xz-utils
       - name: Build trimmed ffmpeg
-        if: steps.cache.outputs.cache_hit != 'true'
+        if: steps.cache.outputs.cache-hit != 'true'
         run: bash scripts/ffmpeg/build_win64.sh
       - name: Upload artifact
         uses: actions/upload-artifact@v4

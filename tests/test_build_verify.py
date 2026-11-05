@@ -5,6 +5,7 @@
 """
 
 import importlib.util
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import pytest
@@ -315,3 +316,56 @@ def test_ensure_ffmpeg_skipped_on_non_windows(tmp_path, monkeypatch, build_mod):
     """仅 Windows 打包内置，其余平台返回 None 交给运行时 PATH 检测"""
     monkeypatch.setattr(build_mod, "IS_WINDOWS", False)
     assert build_mod.ensure_ffmpeg() is None
+
+
+# 侧载 MSIX 的身份与更新渠道独立于上游商店，nightly 保留自身标记
+@pytest.mark.parametrize(
+    "filename_version,source", [("0.7.0", "github"), ("nightly", "nightly")]
+)
+def test_msix_uses_fork_identity_and_channel(
+    tmp_path, monkeypatch, build_mod, filename_version, source
+):
+    monkeypatch.setattr(build_mod, "BUILD_DIR", tmp_path)
+    monkeypatch.setattr(build_mod, "find_makeappx", lambda: "makeappx.exe")
+    for name in (
+        "OHMYMEME_MSIX_IDENTITY_NAME",
+        "OHMYMEME_MSIX_PUBLISHER",
+        "OHMYMEME_MSIX_PUBLISHER_DISPLAY_NAME",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    dist = tmp_path / "OhMyMeme"
+    dist.mkdir()
+    (dist / "OhMyMeme.exe").write_bytes(b"MZ")
+    sources = []
+    monkeypatch.setattr(build_mod, "set_build_source", sources.append)
+    monkeypatch.setattr(build_mod, "build_pyinstaller", lambda **kwargs: "0.7.0")
+    monkeypatch.setattr(build_mod, "_msix_assets", lambda path: path.mkdir())
+
+    # 检查实际交给 makeappx 的清单，避免只验证模板文本
+    def pack(command, **kwargs):
+        staging = Path(command[command.index("/d") + 1])
+        root = ET.parse(staging / "AppxManifest.xml").getroot()
+        namespace = {
+            "p": "http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+        }
+        identity = root.find("p:Identity", namespace)
+        assert identity.attrib == {
+            "Name": "ZEntrosein.OhMyMemeNotion",
+            "Publisher": "CN=ZEntrosein",
+            "Version": "0.7.0.0",
+        }
+        assert (staging / "OhMyMeme.exe").read_bytes() == b"MZ"
+        assert sources == [source]
+        output = Path(command[command.index("/p") + 1])
+        assert output.name == f"OhMyMeme-{filename_version}.msix"
+        output.write_bytes(b"package")
+        return build_mod.subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(build_mod.subprocess, "run", pack)
+    build_mod.build_msix(
+        "0.7.0",
+        target="Windows",
+        filename_version=filename_version,
+        ffmpeg="ffmpeg.exe",
+    )
+    assert not (tmp_path / "msix-staging").exists()

@@ -1002,10 +1002,10 @@ def build_msix(
         print(L("makeappx_not_found"))
         return
 
-    # MSIX 走商店渠道：以 msstore 来源标记重建 onedir（nightly 保留 nightly 标记）
+    # 定制版 MSIX 为侧载包，与 exe 使用相同的 GitHub 更新渠道
     if ffmpeg is None:
         ffmpeg = ensure_ffmpeg(allow_missing=allow_missing_ffmpeg)
-    source = "nightly" if filename_version == "nightly" else "msstore"
+    source = "nightly" if filename_version == "nightly" else "github"
     set_build_source(source)
     build_pyinstaller(target="Windows", ffmpeg=ffmpeg)
 

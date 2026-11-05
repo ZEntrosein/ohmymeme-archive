@@ -17,9 +17,12 @@ from . import __version__
 
 logger = logging.getLogger(__name__)
 
-_GITHUB_LATEST = "https://api.github.com/repos/OhMyMeme/OhMyMeme/releases/latest"
-_GITHUB_LIST = "https://api.github.com/repos/OhMyMeme/OhMyMeme/releases?per_page=5"
-STORE_URL = "https://apps.microsoft.com/detail/9PD2TD8H8ZH0"
+_GITHUB_LATEST = (
+    "https://api.github.com/repos/ZEntrosein/ohmymeme-notion/releases/latest"
+)
+_GITHUB_LIST = (
+    "https://api.github.com/repos/ZEntrosein/ohmymeme-notion/releases?per_page=5"
+)
 
 # GitHub 镜像（按顺序逐个尝试）
 _GH_MIRRORS = [
@@ -54,9 +57,10 @@ def _pick_asset_url(assets: list) -> str:
                 fallback = url
         return fallback
     elif platform.system() == "Linux":
+        arch = _linux_arch()
         for a in assets:
             name = a.get("name", "")
-            if name.endswith(".AppImage"):
+            if name.endswith(f"-{arch}.AppImage"):
                 return a.get("browser_download_url", "")
     elif platform.system() == "Darwin":
         for a in assets:
@@ -324,16 +328,19 @@ def reset_check_cache():
         _check_generation += 1
 
 
-# 版本检查 + 构建来源：msstore 构建把更新入口指向 Microsoft Store
+# 定制版所有包格式均从本仓库检查更新
 def update_info(force=False) -> dict:
-    from . import __build_source__, __version__
+    from . import __version__
 
     info = check_latest_cached(force=force)
     info["current"] = __version__
-    if __build_source__ == "msstore":
-        info["store"] = True
-        info["store_url"] = STORE_URL
     return info
+
+
+def _linux_arch() -> str:
+    """当前 Linux 机器架构（aarch64 / x86_64）"""
+    machine = platform.machine().lower()
+    return "aarch64" if machine in ("arm64", "aarch64") else "x86_64"
 
 
 def _macos_arch() -> str:
@@ -347,7 +354,7 @@ def _macos_arch() -> str:
 def _default_asset_name() -> str:
     """URL 无文件名时的平台默认资产名"""
     if platform.system() == "Linux":
-        return f"OhMyMeme-v{__version__}-x86_64.AppImage"
+        return f"OhMyMeme-v{__version__}-{_linux_arch()}.AppImage"
     if platform.system() == "Darwin":
         return f"OhMyMeme-v{__version__}-{_macos_arch()}.dmg"
     return "OhMyMeme-setup.exe"

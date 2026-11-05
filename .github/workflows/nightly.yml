@@ -5,21 +5,26 @@ on:
     - cron: "0 20 * * *"
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly
+  cancel-in-progress: false
+
 jobs:
   ffmpeg-win64:
-    if: ${{ github.repository == 'OhMyMeme/OhMyMeme' }}
     uses: ./.github/workflows/ffmpeg-win64.yml
     with:
-      ref: dev
+      ref: ${{ github.sha }}
 
   nightly-windows:
-    if: ${{ github.repository == 'OhMyMeme/OhMyMeme' }}
     needs: ffmpeg-win64
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: dev
+          ref: ${{ github.sha }}
           fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
@@ -48,12 +53,12 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: nightly-windows
+          if-no-files-found: error
           path: |
             dist/OhMyMeme-nightly-setup.exe
             dist/OhMyMeme-nightly.msix
 
   nightly-linux:
-    if: ${{ github.repository == 'OhMyMeme/OhMyMeme' }}
     strategy:
       matrix:
         include:
@@ -65,7 +70,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: dev
+          ref: ${{ github.sha }}
           fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
@@ -83,13 +88,13 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: nightly-linux-${{ matrix.arch }}
+          if-no-files-found: error
           path: |
             dist/OhMyMeme-v*-${{ matrix.arch }}.AppImage
             dist/OhMyMeme-v*-${{ matrix.arch == 'x86_64' && 'amd64' || 'arm64' }}.deb
             dist/OhMyMeme-v*-${{ matrix.arch }}.rpm
 
   nightly-macos:
-    if: ${{ github.repository == 'OhMyMeme/OhMyMeme' }}
     strategy:
       matrix:
         include:
@@ -101,7 +106,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: dev
+          ref: ${{ github.sha }}
           fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
@@ -116,10 +121,10 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: nightly-macos-${{ matrix.arch }}
+          if-no-files-found: error
           path: dist/OhMyMeme-v*-${{ matrix.arch }}.dmg
 
   publish-nightly:
-    if: ${{ github.repository == 'OhMyMeme/OhMyMeme' }}
     needs: [nightly-windows, nightly-linux, nightly-macos]
     runs-on: ubuntu-latest
     permissions:
@@ -132,9 +137,14 @@ jobs:
       - name: Publish nightly release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
         run: |
-          gh release delete nightly --repo OhMyMeme/OhMyMeme --yes 2>/dev/null || true
-          gh release create nightly --repo OhMyMeme/OhMyMeme --prerelease \
+          set -euo pipefail
+          if gh release view nightly >/dev/null 2>&1; then
+            gh release delete nightly --cleanup-tag --yes
+          fi
+          gh release create nightly --target "$SHA" --prerelease \
             --title "Nightly Build ($(date -u +'%Y-%m-%d'))" \
             --notes "# 非正式版（Nightly Build）
 
@@ -144,5 +154,5 @@ jobs:
           > - 不代表最终发布质量，功能与界面可能随时变动
           > - 软件内的更新检查 **不会** 提示此版本，请勿将其用于日常更新路径
           >
-          > 正式版请从 [Releases](https://github.com/OhMyMeme/OhMyMeme/releases) 下载。"
-          gh release upload nightly --repo OhMyMeme/OhMyMeme artifacts/* --clobber
+          > 正式版请从 [Releases](https://github.com/${GH_REPO}/releases) 下载。"
+          gh release upload nightly artifacts/* --clobber

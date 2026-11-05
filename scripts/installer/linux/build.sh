@@ -161,7 +161,7 @@ Version: 0.1.0
 Release: 1%{?dist}
 Summary: 轻量化跨平台表情包管理系统
 License: MIT
-URL: https://github.com/OhMyMeme/OhMyMeme
+URL: https://github.com/ZEntrosein/ohmymeme-notion
 Source0: ohmymeme-0.1.0.tar.gz
 
 %description

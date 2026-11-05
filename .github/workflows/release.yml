@@ -1,11 +1,18 @@
 name: Release
 
-# 手动触发的正式版发布：从 main 分支构建三平台产物并创建 GitHub Release。
+# 手动触发的正式版发布：从所选分支的触发提交构建三平台产物并创建 GitHub Release。
 # 版本号取自 src/__init__.py 的 __version__；tag 与 release 标题均为该版本号（不带 v），
-# tag 指向 main 当前 HEAD。正文仅含下载表格，更新内容由维护者随后手动编辑。
+# tag 指向同一构建提交。正文仅含下载表格，更新内容由维护者随后手动编辑。
 
 on:
   workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 jobs:
   prepare:
@@ -16,7 +23,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: main
+          ref: ${{ github.sha }}
           fetch-depth: 0
       - name: Resolve version
         id: resolve
@@ -31,7 +38,7 @@ jobs:
             echo "ERROR: 版本号格式非法: $version" >&2
             exit 1
           fi
-          git fetch --tags -q || true
+          git fetch --tags -q
           if git rev-parse -q --verify "refs/tags/$version" >/dev/null; then
             echo "ERROR: tag $version 已存在，放弃发布" >&2
             exit 1
@@ -45,15 +52,15 @@ jobs:
     needs: prepare
     uses: ./.github/workflows/ffmpeg-win64.yml
     with:
-      ref: main
+      ref: ${{ needs.prepare.outputs.sha }}
 
   build-windows:
-    needs: ffmpeg-win64
+    needs: [prepare, ffmpeg-win64]
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: main
+          ref: ${{ needs.prepare.outputs.sha }}
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -81,6 +88,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: OhMyMeme-Windows
+          if-no-files-found: error
           path: |
             dist/OhMyMeme-*-setup.exe
             dist/OhMyMeme-*.msix
@@ -98,7 +106,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: main
+          ref: ${{ needs.prepare.outputs.sha }}
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -115,6 +123,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: OhMyMeme-Linux-${{ matrix.arch }}
+          if-no-files-found: error
           path: |
             dist/OhMyMeme-v*-${{ matrix.arch }}.AppImage
             dist/OhMyMeme-v*-${{ matrix.arch == 'x86_64' && 'amd64' || 'arm64' }}.deb
@@ -133,7 +142,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: main
+          ref: ${{ needs.prepare.outputs.sha }}
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -147,6 +156,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: OhMyMeme-macOS-${{ matrix.arch }}
+          if-no-files-found: error
           path: dist/OhMyMeme-v*-${{ matrix.arch }}.dmg
 
   publish:

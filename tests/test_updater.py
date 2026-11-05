@@ -197,6 +197,49 @@ class TestCheckLatestCached(unittest.TestCase):
 
 
 class TestPickAssetUrl(unittest.TestCase):
+    # 双架构发布时按本机架构选包，不受资产上传顺序影响
+    def test_linux_selects_matching_architecture(self):
+        assets = [
+            {
+                "name": "OhMyMeme-v0.7.0-aarch64.AppImage",
+                "browser_download_url": "http://x/arm.AppImage",
+            },
+            {
+                "name": "OhMyMeme-v0.7.0-x86_64.AppImage",
+                "browser_download_url": "http://x/intel.AppImage",
+            },
+        ]
+        with mock.patch.object(updater.platform, "system", return_value="Linux"):
+            for machine, expected in (
+                ("x86_64", "intel"),
+                ("aarch64", "arm"),
+                ("arm64", "arm"),
+            ):
+                with self.subTest(machine=machine):
+                    with mock.patch.object(
+                        updater.platform, "machine", return_value=machine
+                    ):
+                        self.assertEqual(
+                            updater._pick_asset_url(assets),
+                            f"http://x/{expected}.AppImage",
+                        )
+                        self.assertTrue(
+                            updater._default_asset_name().endswith(
+                                f"-{'x86_64' if machine == 'x86_64' else 'aarch64'}.AppImage"
+                            )
+                        )
+
+    # 只有其他架构的包时不推荐错误安装包
+    def test_linux_without_matching_asset(self):
+        with mock.patch.object(updater.platform, "system", return_value="Linux"):
+            with mock.patch.object(updater.platform, "machine", return_value="aarch64"):
+                self.assertEqual(
+                    updater._pick_asset_url(
+                        [{"name": "OhMyMeme-v0.7.0-x86_64.AppImage"}]
+                    ),
+                    "",
+                )
+
     # 发布资产按上传顺序返回：ffmpeg.exe 排在安装包前面时不得被选为更新包
     def test_prefers_setup_exe_over_other_exes(self):
         assets = [
@@ -230,6 +273,55 @@ class TestPickAssetUrl(unittest.TestCase):
         assets = [{"name": "ffmpeg.exe", "browser_download_url": "http://x/ffmpeg"}]
         with mock.patch.object(updater.platform, "system", return_value="Darwin"):
             self.assertEqual(updater._pick_asset_url(assets), "")
+
+
+class TestForkUpdates(unittest.TestCase):
+    # 最新版接口失败时仍只从定制仓库回退，跳过 nightly 和预发布
+    def test_fallback_stays_in_fork_and_selects_stable_release(self):
+        stable_url = (
+            "https://github.com/ZEntrosein/ohmymeme-notion/"
+            "releases/download/9.0.0/OhMyMeme-9.0.0-setup.exe"
+        )
+        assets = [
+            {"name": "OhMyMeme-9.0.0-setup.exe", "browser_download_url": stable_url}
+        ]
+        releases = [
+            {"tag_name": "nightly", "prerelease": True, "assets": assets},
+            {"tag_name": "10.0.0", "prerelease": True, "assets": assets},
+            {"tag_name": "9.0.0", "assets": assets, "body": "定制版更新"},
+        ]
+        with mock.patch.object(updater.platform, "system", return_value="Windows"):
+            with mock.patch.object(
+                updater, "_fetch_json", side_effect=[OSError("not found"), releases]
+            ) as fetch:
+                result = updater.check_latest()
+        self.assertEqual(
+            fetch.call_args_list,
+            [
+                mock.call(
+                    "https://api.github.com/repos/ZEntrosein/ohmymeme-notion/releases/latest"
+                ),
+                mock.call(
+                    "https://api.github.com/repos/ZEntrosein/ohmymeme-notion/releases?per_page=5"
+                ),
+            ],
+        )
+        self.assertEqual(result["latest"], "9.0.0")
+        self.assertEqual(result["download_url"], stable_url)
+        self.assertTrue(result["has_update"])
+
+    # 历史 msstore 构建标记也不能把定制版用户引导回上游商店
+    def test_all_build_sources_use_github_updates(self):
+        for source in ("dev", "github", "nightly", "msstore"):
+            with self.subTest(source=source):
+                with mock.patch("src.__build_source__", source):
+                    with mock.patch.object(
+                        updater, "check_latest_cached", return_value=dict(_SLOW_RESULT)
+                    ) as check:
+                        result = updater.update_info(force=True)
+                check.assert_called_once_with(force=True)
+                self.assertNotIn("store_url", result)
+                self.assertNotIn("store", result)
 
 
 class TestRunInstaller(unittest.TestCase):

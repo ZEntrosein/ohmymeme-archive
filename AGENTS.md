@@ -285,7 +285,7 @@ tests/
 - 远端旧 manifest 缺 sha256 的条目跳过不显示（`cloud_missing` 计日志）；测试 `tests/test_cloud_direct.py`
 
 ### 更新
-- GitHub API 查询: `/releases/latest` → `/releases?per_page=5` 回退
+- GitHub API 查询: 固定 `ZEntrosein/ohmymeme-notion` 的 `/releases/latest` → `/releases?per_page=5` 回退，合并上游时保留 fork 更新地址
 - **仅检查稳定版**：`_parse_release` 跳过 prerelease 与含 `nightly` 的 tag（保证软件更新绝不指向非正式版）；`_parse_version` 跳过非数字段（如 `0.6.0-nightly`）
 - **非阻塞检查**：`check_latest_cached(force=False)` 是唯一入口——**`_ensure_check_started` 先查 `_check_running`（在跑则一律返回 `pending`，含 force 刷新未完成时，绝不命中旧 `_check_result`），再对非 force + 新鲜缓存（`_CHECK_TTL`=24h）直接返回**；无缓存/缓存过期/`force=True` 触发后台 daemon 线程跑 `check_latest()` 填 `_check_result`+`_check_result_at`（`_check_lock` 保护，幂等只启动一次），立即返回 `pending: true`（永不阻塞网络 3.8s~20s+）。**generation token**：`reset_check_cache()` 推进 `_check_generation`，后台 `_task` 完成时仅当代号匹配才写结果，防在途旧任务覆盖 reset 后新状态。`webui.py` 的 `JsApi.check_update`/`SettingsApi.check_update` 支持 `(debug, force)` 透传；前端 `App.vue` 的 `checkUpdateAndPrompt`（onMounted/24h 定时）首发 `force=true`、pending 时转 `checkUpdateResult` 非 force 轮询，settings legacy 的 `checkUpdate` 首发 force、while 轮询暂取非 force——避免完成后再次 force 触发新检查造成永久 pending。**这解决了启动期间 `check_update` 同步阻塞曾导致的界面交互卡顿，及缓存不失效时 24h 定时器形同虚设的问题**
 - 镜像并发: `_urlopen_mirror` / `_urlretrieve_mirror` 用 `ThreadPoolExecutor` + `as_completed`
@@ -295,8 +295,8 @@ tests/
 - Windows 启动安装: `run_installer` 先 `_is_windows_executable` 校验 PE `MZ` 头（镜像返回的 HTML 错误页不会被当安装包），再 `_shell_execute` 经 `ctypes` 调 `ShellExecuteW`（保留 `PrivilegesRequired=admin` 的 UAC 提权；`Popen`/`CreateProcess` 无法提权，会以 740 失败），返回码 ≤32 时记 `lasterror` 并判失败
 - 退出时序: `WebUI._schedule_quit(watch_path)` 先 `updater.wait_installer_started`（Windows `tasklist /FI IMAGENAME`，8s 内未出现即放弃退出并保留程序运行，便于「重新运行安装程序」），确认进程存在后 sleep 1.5s 再 `TerminateProcess`+`os._exit(0)`
 - 启动失败重试: `updater.last_downloaded_path()` 保留已下载安装包路径，`JsApi/SettingsApi.rerun_installer()` 直接重跑该文件（不重新下载）；`UpdateDialog` 与设置页更新弹窗在启动失败时展示「重新运行安装程序」
-- 构建来源: `updater.update_info()` 在 `check_latest_cached` 结果上补 `current`，`__build_source__ == "msstore"` 时加 `store: true` / `store_url`（`STORE_URL`），前端据此把「更新」按钮换成「前往 Microsoft Store」（`JsApi.open_url` 仅放行 http(s)）
-- Linux 更新: `_pick_asset_url` 选取 `.AppImage` 资产；`run_installer` Linux 分支 chmod +x 后直接 `Popen`（AppImage 是 ELF 非 shell 脚本），无 `/dev/fuse` 时追加 `--appimage-extract-and-run` 回退（`_needs_appimage_fallback`）；下载默认文件名走 `_default_asset_name()`（Linux 为 `OhMyMeme-v{version}-x86_64.AppImage`）
+- 构建来源: `updater.update_info()` 在 `check_latest_cached` 结果上补 `current`，所有来源均使用本 fork 的稳定版更新，不返回上游 Store 入口。`build_msix` 稳定版使用 `github`，nightly 仍为 `nightly`；MSIX 模板使用本 fork 独立侧载身份。
+- Linux 更新: `_pick_asset_url` 经 `_linux_arch()` 按本机架构选取 `-x86_64.AppImage` 或 `-aarch64.AppImage`，缺匹配包不推荐其他架构；`run_installer` Linux 分支 chmod +x 后直接 `Popen`（AppImage 是 ELF 非 shell 脚本），无 `/dev/fuse` 时追加 `--appimage-extract-and-run` 回退（`_needs_appimage_fallback`）；下载默认文件名同样使用本机架构。
 - macOS 更新: `_pick_asset_url` 按当前架构选取 `.dmg` 资产（arm64/x86_64）；`run_installer` 走 `_install_dmg_macos`（`hdiutil attach` → `ditto` 复制 `.app` 到 `/Applications` → 打开应用程序目录）；`_default_asset_name()` 为 `OhMyMeme-v{version}-{arch}.dmg`
 
 ### 局域网互联 (lan.py)
@@ -621,7 +621,7 @@ python scripts/build.py --lang en  # 指定语言构建
 ### Windows MSIX 打包（Microsoft Store）
 - **触发**：`--msix`（三个 workflow 的 windows job 均以 `--installer-only --msix` 调用；nightly 额外带 `--nightly`）
 - **工具定位**（缺失仅告警跳过，不中断）：`find_makeappx()` = `MAKEAPPX_DIR`/`MAKEAPPX` → 扫描 `C:\Program Files (x86)\Windows Kits\10\bin\<ver>\x64\makeappx.exe` 取最高版本（runner 预装 Windows SDK）
-- **MSIX**（`build_msix`）：`scripts/installer/msix/AppxManifest.xml` 为模板，**已填入本项目 Store 身份**（`Name=TNTXZ.OhMyMeme` / `Publisher=CN=4215BB25-0E28-400F-94EF-AF09583E9BCF` / `PublisherDisplayName=TNTXZ`；公开标识，非密钥，可安全入库）。`build_msix` 用正则取 `<Identity>` 标签内 `Name`/`Publisher`，env `OHMYMEME_MSIX_IDENTITY_NAME`/`OHMYMEME_MSIX_PUBLISHER`/`OHMYMEME_MSIX_PUBLISHER_DISPLAY_NAME` 覆盖后整体重写标签（值仍含 `REPLACE-WITH-STORE` 占位串时告警）；`Version` 由 `_msix_four_part` 转四段式 `X.Y.Z.0`（Revision 必须 0）；`_msix_assets` 由 `src/resources/icon.png`（PIL）生成 `Assets/` 的 `StoreLogo.png`(50)/`Square44x44Logo.png`(44)/`Square150x150Logo.png`(150)；staging = `dist/msix-staging`（整目录拷贝 `dist/OhMyMeme` + 清单 + 资产）→ `makeappx pack /d <staging> /p <out.msix> /o` → 清理 staging；**清单为 full-trust 桌面应用**（`EntryPoint="windows.fullTrustApplication"` + `rescap:Capability Name="runFullTrust"`，`TargetDeviceFamily=Windows.Desktop`）；**不做签名**（Store 上架时重签，本地侧载需开发者模式 `Add-AppxPackage -AllowUnsigned`）；**刻意不禁用 AppData/注册表虚拟化**——`desktop6:FileSystemWriteVirtualization`/`RegistryWriteVirtualization` 需 `unvirtualizedResources` restricted capability 且官方限定「仅部分 Microsoft 及合作方游戏」，商店上架会被拒；代价是 MSIX 版的 `%APPDATA%`/`%LOCALAPPDATA%` 写入被重定向到包容器（与 `.exe` 安装的配置/data 目录不互通）
+- **MSIX**（`build_msix`）：模板 `scripts/installer/msix/AppxManifest.xml` 使用本 fork 的独立侧载身份（`Name=ZEntrosein.OhMyMemeNotion` / `Publisher=CN=ZEntrosein` / `PublisherDisplayName=ZEntrosein`），稳定包来源为 `github`。`OHMYMEME_MSIX_IDENTITY_NAME`/`OHMYMEME_MSIX_PUBLISHER`/`OHMYMEME_MSIX_PUBLISHER_DISPLAY_NAME` 可覆盖身份，上架时须使用自己的 Store 产品标识和证书。`Version` 由 `_msix_four_part` 转四段式 `X.Y.Z.0`；`_msix_assets` 从图标生成资产，`dist/msix-staging` 汇总 onedir 与清单，调用 `makeappx pack` 后清理暂存目录。保持 full-trust、未签名侧载和 AppData/注册表虚拟化；MSIX 与 exe 的配置/data 目录不互通。回归测试在 `tests/test_build_verify.py` 检查交给 makeappx 的实际清单与更新渠道。
 - 产物命名 `OhMyMeme-<filename_version>.msix`（nightly 即 `OhMyMeme-nightly.msix`）
 - **Store 上架配套**：Partner Center「隐私策略 URL」指向仓库内 `docs/privacy.md`（中英双语，逐条列出全部主动联网目标：GitHub 更新检查/镜像、用户自建 FTP/S3/R2/WebDAV、抖音 `douyin.com`、微信 CDN、`googledownloads.cn`、`contributor.starsfire.top`、`uapis.cn`）。**新增任何联网功能时须同步更新该文件**（Store 会核对声明与实际行为是否一致）
 
@@ -650,8 +650,8 @@ python scripts/build.py --lang en  # 指定语言构建
   - `build-windows`: InnoSetup 安装包 `dist/OhMyMeme-*-setup.exe` + MSIX `dist/OhMyMeme-*.msix`（`choco install innosetup`，`python scripts/build.py --installer-only --msix` 一次产出；打包前 download-artifact 取 ffmpeg-win64 到工作区 `ffmpeg-win64/`，打包后 `python scripts/build.py --verify-ffmpeg` 校验内置 ffmpeg）
   - `build-linux`: AppImage/deb/rpm（`--linux`）
   - `build-macos`: `.app` + `.dmg`（`--macos`，PyInstaller `--windowed` + iconutil 生成 icns）；矩阵双架构 `arm64`（macos-latest）+ `x86_64`（macos-15-intel），产物 `OhMyMeme-v*-{arch}.dmg`
-- **release.yml**: 手动触发的正式版发布——`prepare` job 从 `main` 的 `src/__init__.py` 读 `__version__`（校验格式、tag 不存在），三平台 job 构建（同 build.yml），`publish` job 汇总 artifact、生成三列下载表格正文、`gh release create <version> --target <main HEAD> --title <version>` 创建 Release，随后 `gh release upload <version> artifacts/* --clobber` 上传全部构建产物（tag 与标题均不带 v）；正文仅下载表格，更新内容由维护者随后手动编辑
-- **nightly.yml**: Windows + Linux + macOS 三平台每日定时（UTC 20:00）+ `workflow_dispatch`，从 `dev` 分支构建非正式版（`--nightly`，版本号为 `nightly`）并发布为 `nightly` prerelease；`updater.py` 的 `_parse_release` 跳过 prerelease 与含 `nightly` 的 tag，**软件更新绝不会指向 nightly**；windows job 同样依赖 ffmpeg-win64 并跑 `--verify-ffmpeg`
+- **release.yml**: 手动触发的正式版发布——`prepare` job 从所选分支触发时的 `github.sha` 读取 `__version__`（校验 `X.Y.Z` 格式、tag 不存在），三平台及 ffmpeg 均检出该 SHA，`publish` job 汇总 artifact、生成三列下载表格正文，在 `github.repository` 创建指向该 SHA 的版本 tag 和 Release（标题不带 v）。使用 `release` concurrency 串行发布，只有 publish 有 contents:write。合并上游后不得恢复 `main` 硬编码。
+- **nightly.yml**: Windows + Linux + macOS 三平台每日定时（UTC 20:00，默认分支）+ `workflow_dispatch`（所选分支），全部检出触发时的 `github.sha`；移除原仓库专属条件，使用 `GH_REPO=github.repository`，构建成功后重新创建当前仓库的 `nightly` tag 并指定构建 SHA。使用 `nightly` concurrency 串行发布，只有 publish 有 contents:write。`updater.py` 跳过 prerelease 与含 `nightly` 的 tag，软件更新不会指向 nightly。
 - 上传 `dist/OhMyMeme-*-setup.exe` / `dist/OhMyMeme-v*-x86_64.AppImage` 等作为 artifact
 
 ## QQNT 外层宿主句柄兼容

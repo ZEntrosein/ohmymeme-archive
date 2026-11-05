@@ -1,14 +1,12 @@
-# OhMyMeme
+# OhMyMeme Notion
 
 轻量化跨平台表情包管理系统 — 突破表情包上限，快捷键呼出、搜索即复制。
 
 ### **QQ交流群：891636253**
 
-<a href="https://apps.microsoft.com/detail/9PD2TD8H8ZH0?referrer=appbadge&mode=full" target="_blank"  rel="noopener noreferrer">
-	<img src="https://get.microsoft.com/images/zh-cn%20dark.svg" width="200"/>
-</a>
+本仓库是 [OhMyMeme/OhMyMeme](https://github.com/OhMyMeme/OhMyMeme) 的定制 fork，包含 Notion 导入、聊天记录归档与虚拟盘支持。文中 QQ 群与演示来自上游项目。
 
-[**从Release下载**](https://github.com/OhMyMeme/OhMyMeme/releases/latest)
+[**从本定制版 Release 下载**](https://github.com/ZEntrosein/ohmymeme-notion/releases)
 
 ![picture](https://raw.githubusercontent.com/OhMyMeme/OhMyMeme/refs/heads/dev/resource/picture.gif)
 
@@ -84,19 +82,15 @@
 - **微信表情导入** — 从微信电脑版缓存提取收藏表情（Windows，需微信正在运行）：随包内置的 C++ 辅助二进制提取进程内存密钥（只读访问）→ AES-CBC 解密表情数据库 → CDN 下载并校验 MD5；支持多账号选择。辅助二进制随安装包分发、不在运行时下载，执行前校验 SHA-256 防篡改（不匹配即拒绝执行）
 - **危险操作** — 设置页一键清空本地或云端全部数据（需双重确认）
 - **无边框窗口** — 自定义标题栏，鼠标拖拽移动；点击标题栏「OhMyMeme」logo 返回主页（清空搜索/标签/分组筛选）
-- **自动更新** — 启动时检测新版本，运行期间每日自动检测，下载安装包后一键升级
+- **自动更新** — 启动时检测本定制仓库的稳定版，运行期间每日自动检测，下载安装包后一键升级；不会安装回上游版本，也不会自动更新到 Nightly
 
 ## 快速开始
 
 ### 下载
 
-<a href="https://apps.microsoft.com/detail/9PD2TD8H8ZH0?referrer=appbadge&mode=full" target="_blank"  rel="noopener noreferrer">
-	<img src="https://get.microsoft.com/images/zh-cn%20dark.svg" width="200"/>
-</a>
+从 [本定制版 Releases](https://github.com/ZEntrosein/ohmymeme-notion/releases) 下载对应系统的安装包或可执行文件，直接运行。正式版由维护者手动发布；Nightly 是默认分支的每日测试构建。
 
-从 [Releases](https://github.com/OhMyMeme/OhMyMeme/releases/latest) 下载对应系统的安装包或可执行文件，直接运行。
-
-Windows 除 `.exe` 安装包外另提供 `.msix`（Microsoft Store 上架 / 侧载）格式。
+Windows 提供 `.exe` 安装包及使用独立身份的未签名 `.msix` 侧载包；本定制版尚未上架 Microsoft Store，通常使用 `.exe`。
 
 隐私策略见 [docs/privacy.md](docs/privacy.md)。
 
@@ -105,8 +99,8 @@ Windows 除 `.exe` 安装包外另提供 `.msix`（Microsoft Store 上架 / 侧�
 **环境要求**: Python 3.10+
 
 ```bash
-git clone https://github.com/OhMyMeme/OhMyMeme.git
-cd ohmymeme
+git clone https://github.com/ZEntrosein/ohmymeme-notion.git
+cd ohmymeme-notion
 pip install -r requirements.txt
 python -m src
 ```

@@ -1,7 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- OhMyMeme MSIX manifest (Microsoft Store / sideload) -->
+<!-- OhMyMeme Notion MSIX manifest (sideload) -->
 <!--
-  Identity 字段来自 Partner Center（产品 → 产品标识），均为公开标识（非密钥）：
+  定制版使用独立侧载身份，不复用上游 Microsoft Store 产品身份。
+  如需上架，Identity 字段须替换为自己的 Partner Center 产品标识：
     Name               = Package/Identity/Name
     Publisher          = Package/Identity/Publisher
     PublisherDisplayName = Package/Properties/PublisherDisplayName
@@ -17,13 +18,13 @@
   IgnorableNamespaces="uap rescap">
 
   <Identity
-    Name="TNTXZ.OhMyMeme"
-    Publisher="CN=4215BB25-0E28-400F-94EF-AF09583E9BCF"
+    Name="ZEntrosein.OhMyMemeNotion"
+    Publisher="CN=ZEntrosein"
     Version="0.0.0.0" />
 
   <Properties>
     <DisplayName>OhMyMeme</DisplayName>
-    <PublisherDisplayName>TNTXZ</PublisherDisplayName>
+    <PublisherDisplayName>ZEntrosein</PublisherDisplayName>
     <Logo>Assets\StoreLogo.png</Logo>
     <Description>轻量化跨平台表情包管理系统</Description>
   </Properties>

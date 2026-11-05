@@ -4,7 +4,7 @@
 #define MyAppName "OhMyMeme"
 #define MyAppVersion "0.1.0"
 #define MyAppPublisher "OhMyMeme"
-#define MyAppURL "https://github.com/OhMyMeme/OhMyMeme"
+#define MyAppURL "https://github.com/ZEntrosein/ohmymeme-notion"
 #define MyAppExeName "OhMyMeme.exe"
 #define SourceDir "..\..\dist\src.dist"
 

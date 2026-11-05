@@ -7,8 +7,8 @@
 **要求**: Python 3.10+（推荐 3.12）、Node.js（构建 Vue 前端）；Linux 额外需要 GTK/WebKit 依赖（见下）。
 
 ```bash
-git clone https://github.com/OhMyMeme/OhMyMeme.git
-cd ohmymeme
+git clone https://github.com/ZEntrosein/ohmymeme-notion.git
+cd ohmymeme-notion
 pip install -r requirements.txt
 npm install
 python -m src
@@ -154,11 +154,11 @@ python scripts/build.py --linux --installer-only --package deb  # Linux 包类�
 ```
 
 - **PyInstaller 不支持交叉编译**，各平台需在对应系统上构建；跨平台构建用 GitHub Actions
-- **构建来源标记**：打包前重写 `src/__init__.py` 的 `__build_source__`（源码运行恒为 `dev`；CI 构建 `github`、nightly 工作流 `nightly`、MSIX 稳定版 `msstore`，nightly MSIX 保持 `nightly`），构建结束恢复 `dev`；`msstore` 构建的更新入口指向 Microsoft Store（见 AGENTS.md「更新」）
+- **构建来源标记**：打包前重写 `src/__init__.py` 的 `__build_source__`（源码运行恒为 `dev`；CI 稳定版含 MSIX 为 `github`，nightly 工作流为 `nightly`），构建结束恢复 `dev`。所有格式的更新检查均指向 `ZEntrosein/ohmymeme-notion`，仅接收稳定版。
 - Windows 安装包需 [InnoSetup 6/7](https://jrsoftware.org/isdl.php)
 - Windows 追加格式（`--msix`，在 `.exe` 之外追加，工具缺失时仅告警跳过）：
   - `--msix`：Windows SDK 的 `makeappx.exe` 生成 `dist/OhMyMeme-<版本>.msix`（Microsoft Store 上架 / 侧载）。模板 `scripts/installer/msix/AppxManifest.xml`，产物不签名（Store 会重签）
-  - MSIX 身份信息（`Name`/`Publisher`/`PublisherDisplayName`）来自 Partner Center，模板内已填入本项目 Store 身份（`TNTXZ.OhMyMeme` / `CN=4215BB25-0E28-400F-94EF-AF09583E9BCF` / `TNTXZ`）；**这些是公开标识（每个已发布包内都可见），可安全提交**，非密钥，无法据以冒充发布（发布需 Partner Center 账号 + 签名证书私钥）；CI 可用环境变量覆盖：`OHMYMEME_MSIX_IDENTITY_NAME`/`OHMYMEME_MSIX_PUBLISHER`/`OHMYMEME_MSIX_PUBLISHER_DISPLAY_NAME`
+  - MSIX 模板使用本 fork 的独立侧载身份（`ZEntrosein.OhMyMemeNotion` / `CN=ZEntrosein` / `ZEntrosein`），不复用上游 Store 身份。如需上架或签名，须使用自己的 Partner Center 产品信息及证书；可用环境变量覆盖：`OHMYMEME_MSIX_IDENTITY_NAME`/`OHMYMEME_MSIX_PUBLISHER`/`OHMYMEME_MSIX_PUBLISHER_DISPLAY_NAME`
   - Microsoft Store 上架时的「隐私策略 URL」填写仓库内 [docs/privacy.md](docs/privacy.md) 的公开链接；该文件须与实际网络行为保持一致（新增联网功能时同步更新）
 - Linux 包支持 .deb / .rpm / .AppImage，构建机需装 GTK/WebKit 依赖（见 AGENTS.md「Linux 打包（GTK）」）
 - 输出目录: `dist/`
@@ -170,8 +170,12 @@ python scripts/build.py --linux --installer-only --package deb  # Linux 包类�
 | `check.yml` | push/PR 到任意分支 | Ubuntu lint + test（含 `keyfinder-tests` C++ 测试 job，Windows） |
 | `ffmpeg-win64.yml` | 被 build/nightly/release 以 `needs` 拉起 | 交叉编译裁剪版 ffmpeg，artifact 上传（按脚本内容哈希缓存） |
 | `build.yml` | 手动 | Windows 安装包（exe + msix，含 ffmpeg/helper 校验）+ Linux 三格式 + macOS 双架构 `.dmg` |
-| `release.yml` | 手动 | 从 `main` 构建三平台产物、创建正式 Release 并上传全部产物（tag/标题为 `src/__init__.py` 的版本号，正文仅下载表格） |
-| `nightly.yml` | 每日 UTC 20:00 + 手动 | 从 `dev` 分支构建非正式版，发布为 `nightly` prerelease（软件更新不会指向 nightly） |
+| `release.yml` | 手动 | 从所选分支的触发提交构建三平台产物、在当前仓库创建正式 Release 并上传全部产物（tag/标题为 `src/__init__.py` 的版本号，正文仅下载表格） |
+| `nightly.yml` | 每日 UTC 20:00 + 手动 | 定时构建默认分支，手动构建所选分支，发布到当前仓库的 `nightly` prerelease（软件更新不会指向 nightly） |
+
+在本 fork 的 Actions 页面运行 `Release`，分支选择 `feat/notion-import`（当前默认分支）。正式版本号仍由 `src/__init__.py` 的 `__version__` 管理，格式为 `X.Y.Z`，发布下一版前须递增；已存在的 tag 会中止发布。`Build` 只生成 Actions artifacts，不创建 Release。三个入口均把各平台和 ffmpeg 固定到同一个提交，避免构建中途分支前进导致包与 tag 不一致；正式发布与 Nightly 各自串行运行，只有发布 job 获得写权限。Nightly 会重建当前仓库的 `nightly` tag，使其指向实际构建提交。
+
+本地 `upstream` 继续指向原项目，可照常 fetch / merge 上游 `dev`。后续合并若涉及 workflow、更新地址或 MSIX 身份，保留以上 fork 设置；不必改写上游历史。
 
 ## 数据与配置路径
 
